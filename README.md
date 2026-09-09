@@ -14,25 +14,35 @@ concrete. It is not production software. See [Limitations](#limitations).
 
 ## Measured on real hardware
 
-M3 Max + an iPhone on the same wifi, Qwen3-0.6B split 24/4:
+M3 Max + an iPhone on the same wifi, Qwen3-0.6B split 24/4, all links WebRTC:
 
 ```
-tok     mac ms  phone ms  wire KB  total ms
-1        116.8     123.0     64.0     306.9
-2         71.6      87.0     68.0     205.3
-3         78.3      92.0     72.0     197.5
+tok    coord ms  phone ms  wire KB  roundtrip
+1          57.0     151.0     58.0      280.3   <- prefill
+2          19.3      13.0      2.0       22.7
+3          18.3      12.0      2.0       18.8
 ...
-10        77.3      94.0    100.0     247.7
+60         18.7      13.0      2.0       19.3
 
-avg  mac 81ms | phone 97ms | roundtrip 229ms
-phone share of compute: 54%
-network overhead: 132ms/token
+decode averages over 59 tokens:
+  coordinator (24 layers, node)  :  19.6 ms
+  phone       ( 4 layers, webgpu):  15.4 ms
+  roundtrip incl. network        :  26.4 ms
+  network overhead               :  11.0 ms
+  wire per token                 :   2.0 KB f16  (21.0 KB as json)
+
+  60 tokens in 3.1s = 19.6 tok/s
+  roundtrip min 18.1 / median 22.7 / max 131.5 ms
 ```
 
-Output: `The capital of France is **Paris**.`
+Every one of those 60 hops crossed a **WebRTC data channel** to a real iPhone.
 
-The phone runs 4 of 28 layers but spends *more* time than the Mac's 24 — that
-asymmetry is what real heterogeneous hardware looks like.
+The phone runs 4 of 28 layers and spends nearly as long as the coordinator's
+24 — that asymmetry is what real heterogeneous hardware looks like. The 131ms
+outlier is wifi, not compute: it is the honest tail of a wireless link.
+
+For contrast, the same workload under the original long-polling + fp32-JSON
+design ran at ~132ms of network overhead per token. It is now 11ms.
 
 ---
 

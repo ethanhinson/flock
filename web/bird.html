@@ -30,7 +30,8 @@
   <div class="row"><span>frame in</span><b id="kb">—</b></div>
   <div class="row"><span>backend</span><b id="backend">—</b></div>
   <div class="row"><span>my kv cache</span><b id="cache">—</b></div>
-  <div class="row"><span>forwards to</span><b id="link">coordinator</b></div>
+  <div class="row"><span>link</span><b id="link">connecting…</b></div>
+  <div class="row"><span>frames via webrtc</span><b id="rtccount">0</b></div>
 </div>
 
 <button id="join" disabled>join the flock</button>
@@ -45,7 +46,7 @@ const $ = id => document.getElementById(id);
 const log = (m, cls='') => $('status').innerHTML += `<div class="${cls}">${m}</div>`;
 
 let session = null, meta = null, running = false, count = 0, past = null;
-let ws = null, rtc = null, chan = null, inChan = null, chain = null;
+let ws = null, rtc = null, chan = null, inChan = null, chain = null, rtcFrames = 0;
 const empty = () => new ort.Tensor('float32', new Float32Array(0),
                                    [1, meta.kv_heads, 0, meta.head_dim]);
 
@@ -90,6 +91,17 @@ let peerId = localStorage.getItem('flock_peer') || null;
 })().catch(e => log('load failed: ' + e, 'bad'));
 
 // --- the actual work ------------------------------------------------------
+// One source of truth for the link label: whichever channel is really open.
+// (A stale "last bird" string used to overwrite the webrtc label here, which
+// made the UI claim websocket while every frame went over the data channel.)
+function showLink() {
+  const up = inChan && inChan.readyState === 'open';
+  const nxt = chain && chain.next_peer;
+  $('link').textContent = nxt
+    ? `bird ${nxt} (${chan && chan.readyState === 'open' ? 'webrtc' : 'ws'})`
+    : `coordinator (${up ? 'webrtc' : 'websocket'})`;
+}
+
 async function runFrame(floats, m) {
   if (m.reset) past = null;
   const seq = m.seq;
@@ -153,10 +165,11 @@ async function onSignal(from, d) {
     rtc.ondatachannel = e => {
       inChan = e.channel; inChan.binaryType = 'arraybuffer';
       inChan.onopen = () => {
-        $('link').textContent = 'coordinator (webrtc)';
+        showLink();
         log('direct link open — websocket is signaling-only now', 'ok');
       };
       inChan.onmessage = async ev => {
+        rtcFrames++; $('rtccount').textContent = rtcFrames;
         const {data, meta: m} = unpack(ev.data);
         const {out, ms} = await runFrame(data, m);
         const reply = pack(out, {seq: m.seq, hidden: meta.hidden, offset: m.offset});
@@ -197,7 +210,7 @@ function connect() {
       if (m.t === 'chain') {
         chain = m;
         if (m.next_peer && !chan) openRTC(m.next_peer);
-        if (!m.next_peer) $('link').textContent = 'coordinator (last bird)';
+        showLink();
       }
       return;
     }
@@ -209,7 +222,8 @@ function connect() {
     } else {
       ws.send(pack(out, {seq: m.seq, hidden: meta.hidden, offset: m.offset}));
     }
-    ws.send(JSON.stringify({t:'stats', ms, transport: chan && chan.readyState==='open' ? 'webrtc' : 'ws'}));
+    ws.send(JSON.stringify({t:'stats', ms,
+      transport: (inChan && inChan.readyState === 'open') ? 'webrtc' : 'ws'}));
   };
   ws.onclose = () => { if (running) { log('socket closed — reconnecting…', 'bad'); setTimeout(connect, 1500); } };
 }

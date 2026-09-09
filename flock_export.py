@@ -151,6 +151,9 @@ json.dump(meta, open(meta_path, "w"), indent=2)
 # the graph file stays small and the phone can stream weights separately.
 import onnx as _onnx
 _m = _onnx.load(args.out)
+_stale = args.out + ".data"          # else old bytes linger and the file grows
+if os.path.exists(_stale):
+    os.remove(_stale)
 _onnx.save(_m, args.out, save_as_external_data=True, all_tensors_to_one_file=True,
            location=os.path.basename(args.out) + ".data", size_threshold=1024)
 

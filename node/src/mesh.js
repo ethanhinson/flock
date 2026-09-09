@@ -33,9 +33,11 @@ export class Bird {
   send(floats, seq, hidden, offset, timeout = 120000) {
     const frame = pack(floats, {seq, hidden, offset, reset: this.resetPending});
     this.resetPending = false;
-    const link = (this.chan && this.chan.isOpen()) ? this.chan : this.ws;
+    const viaRTC = !!(this.chan && this.chan.isOpen());
+    const link = viaRTC ? this.chan : this.ws;
     if (!link) return Promise.reject(new Error(
       `no device holding layers ${this.start}-${this.end}`));
+    this.transport = viaRTC ? 'webrtc' : 'ws';   // observed, not self-reported
     return new Promise((res, rej) => {
       const timer = setTimeout(() => {
         this._waiter = null;
@@ -59,6 +61,10 @@ export class Bird {
 
   /** Offer a direct data channel to this bird, signalled over its websocket. */
   openRTC(onOpen) {
+    // A reloaded bird signals again; drop the previous connection or stale
+    // PeerConnections accumulate and the wrong one wins.
+    try { this.chan?.close(); this.pc?.close(); } catch {}
+    this.chan = null;
     this.pc = new nodeDataChannel.PeerConnection(`coord-${this.slot}`, {iceServers: ICE});
     this.pc.onLocalDescription((sdp, type) =>
       this.ws?.send(JSON.stringify({t: 'signal', data: {kind: type, sdp: {sdp, type}}})));

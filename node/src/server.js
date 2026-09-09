@@ -147,6 +147,8 @@ wss.on('connection', ws => {
       if (!bird) return;
       if (m.t === 'signal') bird.onSignal(m.data);
       else if (m.t === 'stats') { bird.lastMs = m.ms; bird.lastSeen = Date.now(); }
+      // note: transport is set from the send path in mesh.js, not from here --
+      // what actually carried the frame is the only honest answer.
       else if (m.t === 'pull') bird.lastSeen = Date.now();
     } else if (bird) {
       bird.deliver(data);

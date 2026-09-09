@@ -43,6 +43,9 @@ def save(m, path, args_, in_names, out_names, dyn):
                       do_constant_folding=True, dynamo=False)
     import onnx
     g = onnx.load(path)
+    stale = path + ".data"           # else old bytes linger and the file grows
+    if os.path.exists(stale):
+        os.remove(stale)
     onnx.save(g, path, save_as_external_data=True, all_tensors_to_one_file=True,
               location=os.path.basename(path) + ".data", size_threshold=1024)
 
