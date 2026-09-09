@@ -1,0 +1,20 @@
+{
+  "name": "flock",
+  "version": "0.1.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "express": "^5.2.1",
+    "node-datachannel": "^0.33.3",
+    "onnxruntime-node": "^1.29.0",
+    "ws": "^8.21.3"
+  },
+  "type": "module"
+}

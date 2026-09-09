@@ -45,7 +45,7 @@ const $ = id => document.getElementById(id);
 const log = (m, cls='') => $('status').innerHTML += `<div class="${cls}">${m}</div>`;
 
 let session = null, meta = null, running = false, count = 0, past = null;
-let ws = null, rtc = null, chan = null, chain = null;
+let ws = null, rtc = null, chan = null, inChan = null, chain = null;
 const empty = () => new ort.Tensor('float32', new Float32Array(0),
                                    [1, meta.kv_heads, 0, meta.head_dim]);
 
@@ -144,32 +144,39 @@ async function openRTC(toPeer) {
   ws.send(JSON.stringify({t:'signal', to: toPeer, data: {kind:'offer', sdp: offer}}));
 }
 
+// The coordinator is itself a WebRTC peer and offers US a channel. Once it
+// opens, activations never touch the websocket again -- it carries only
+// signaling, exactly like PeerJS does for swarmllm.
 async function onSignal(from, d) {
   if (d.kind === 'offer') {
-    // We're the callee: answer, and serve frames that arrive on this channel.
     rtc = new RTCPeerConnection({iceServers: [{urls: 'stun:stun.l.google.com:19302'}]});
     rtc.ondatachannel = e => {
-      const ch = e.channel; ch.binaryType = 'arraybuffer';
-      ch.onmessage = async ev => {
+      inChan = e.channel; inChan.binaryType = 'arraybuffer';
+      inChan.onopen = () => {
+        $('link').textContent = 'coordinator (webrtc)';
+        log('direct link open — websocket is signaling-only now', 'ok');
+      };
+      inChan.onmessage = async ev => {
         const {data, meta: m} = unpack(ev.data);
         const {out, ms} = await runFrame(data, m);
-        // Last bird replies to the coordinator; middle birds would forward on.
-        ws.send(pack(out, {seq: m.seq, hidden: meta.hidden, offset: m.offset}));
+        const reply = pack(out, {seq: m.seq, hidden: meta.hidden, offset: m.offset});
+        if (inChan.readyState === 'open') inChan.send(reply);
+        else ws.send(reply);
         ws.send(JSON.stringify({t:'stats', ms, transport:'webrtc'}));
       };
     };
     rtc.onicecandidate = e => {
-      if (e.candidate) ws.send(JSON.stringify({t:'signal', to: from,
-        data: {kind:'ice', candidate: e.candidate}}));
+      if (e.candidate) ws.send(JSON.stringify({t:'signal',
+        data: {kind:'ice', candidate: e.candidate.candidate, mid: e.candidate.sdpMid}}));
     };
-    await rtc.setRemoteDescription(d.sdp);
+    await rtc.setRemoteDescription({type: 'offer', sdp: d.sdp.sdp});
     const ans = await rtc.createAnswer();
     await rtc.setLocalDescription(ans);
-    ws.send(JSON.stringify({t:'signal', to: from, data: {kind:'answer', sdp: ans}}));
+    ws.send(JSON.stringify({t:'signal', data: {kind:'answer', sdp: ans}}));
   } else if (d.kind === 'answer') {
     await rtc.setRemoteDescription(d.sdp);
   } else if (d.kind === 'ice' && rtc) {
-    try { await rtc.addIceCandidate(d.candidate); } catch {}
+    try { await rtc.addIceCandidate({candidate: d.candidate, sdpMid: d.mid || '0'}); } catch {}
   }
 }
 

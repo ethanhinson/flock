@@ -8,3 +8,7 @@ __pycache__/
 *.pyc
 .DS_Store
 .venv/
+
+# Node
+node/node_modules/
+web/coord/

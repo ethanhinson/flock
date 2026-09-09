@@ -50,23 +50,24 @@ download in full.
 
 ## Two demos
 
-### 1. Mac + phone (the real distributed one)
+### 1. Coordinator + phones (the real distributed one)
 
 ```bash
-pip install -r requirements-phone.txt
-python3 build_shards.py --start 24 --end 27 --peers 1   # once, ~252MB ONNX
-python3 swarm_phone.py
+pip install -r requirements-phone.txt              # export tooling only
+python3 build_shards.py --start 24 --end 27 --birds 1
+python3 flock_export_coordinator.py --cut 24
+cd node && npm install && npm start
 ```
 
-Two phones? `--peers 2` splits the same range in half (126MB each) and each
+Two phones? `--birds 2` splits the same range in half (126MB each) and each
 device claims a free slot when it joins:
 
 ```bash
-python3 build_shards.py --start 24 --end 27 --peers 2
+python3 build_shards.py --start 24 --end 27 --birds 2
 ```
 
-- **phone** → `http://<mac-ip>:8000/phone` → tap **join the swarm**
-- **any browser** → `http://<mac-ip>:8000` → chat
+- **phone** → `http://<your-ip>:8000/flock` → tap **join the flock**
+- **any browser** → `http://<your-ip>:8000` → chat
 
 Mac holds the embedding, layers 0–23, and the vocab projection. The phone holds
 layers 24–27 and the final norm, executed by **ONNX Runtime Web on WebGPU**
@@ -85,6 +86,29 @@ layer split without a second device — but note it is **not** a distributed
 test: one GPU, loopback traffic.
 
 ---
+
+## Transport: f16 frames over WebRTC
+
+Activations cross the network as **f16 binary frames**, not JSON floats:
+
+```
+fp32 JSON    21.0 KB per decode step
+f16 binary    2.0 KB per decode step
+```
+
+On real activation values (|x| < 0.1, derived from bf16 weights) the f16 round
+trip is effectively lossless. The Python and JS implementations are
+byte-compatible and verified against each other in both directions.
+
+The coordinator runs on **Node**, so it is itself a WebRTC peer: it offers a
+data channel to each bird, and once that opens the websocket carries nothing
+but offers/answers/ICE — the same role PeerJS plays for swarmllm. Replacing
+long-polling with event-driven sockets took the roundtrip through two birds
+from **132ms to ~5ms**.
+
+Python survives only as the export and verification tool: PyTorch is the
+reference every ONNX graph is checked against, so a bad export can't be
+silently wrong.
 
 ## The KV cache is sharded too
 
@@ -147,13 +171,16 @@ Read these before drawing conclusions from it.
 
 | file | role |
 |---|---|
-| `build_shards.py` | splits a layer range across N devices, writes `web/swarm.json` |
-| `export_phone_shard.py` | carves one layer range into ONNX; verifies vs PyTorch |
-| `swarm_phone.py` | Mac side: embedding, layers 0–23, vocab projection, SSE chat |
-| `phone_bridge.py` | work queue that lets a browser act as a pipeline peer |
-| `web/phone.html` | the phone node — ONNX Runtime Web on WebGPU |
-| `web/chat.html` | chat UI showing the per-token hop |
-| `shard.py` / `swarm.py` / `run.sh` | the Mac-only MLX demo |
+| `build_shards.py` | splits a layer range across N birds, writes `web/flock.json` |
+| `flock_export.py` | carves one layer range into ONNX; verifies vs PyTorch |
+| `flock_export_coordinator.py` | exports the coordinator's embed/layers/head graphs |
+| `node/src/server.js` | the coordinator: chat loop, signaling, HTTP |
+| `node/src/coordinator.js` | embedding + layers 0–23 + vocab projection |
+| `node/src/mesh.js` | the flock, slot claiming, WebRTC links |
+| `node/src/wire.js` · `web/js/wire.js` · `flock/wire.py` | the f16 frame format |
+| `web/bird.html` | a bird — ONNX Runtime Web on WebGPU |
+| `web/chat.html` | chat UI showing the per-token lap |
+| `flock_mlx_*.py` / `run.sh` | the Mac-only MLX demo |
 
 ## Things to try
 

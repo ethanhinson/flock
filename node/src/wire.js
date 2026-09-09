@@ -1,0 +1,51 @@
+// flock wire format — byte-compatible with web/js/wire.js and flock_export's
+// Python counterpart. See web/js/wire.js for the format rationale.
+const MAGIC = 0x314b4c46; // "FLK1"
+
+export function f32to16(v) {
+  const b = new DataView(new ArrayBuffer(4));
+  b.setFloat32(0, v);
+  const x = b.getUint32(0);
+  const sign = (x >>> 16) & 0x8000;
+  let exp = (x >>> 23) & 0xff, man = x & 0x7fffff;
+  if (exp === 255) return sign | 0x7c00 | (man ? 0x200 : 0);
+  exp = exp - 127 + 15;
+  if (exp >= 31) return sign | 0x7c00;
+  if (exp <= 0) {
+    if (exp < -10) return sign;
+    man |= 0x800000;
+    return sign | (man >> (14 - exp));
+  }
+  return sign | (exp << 10) | (man >> 13);
+}
+
+export function f16to32(h) {
+  const sign = (h & 0x8000) ? -1 : 1;
+  const exp = (h >>> 10) & 0x1f, man = h & 0x3ff;
+  if (exp === 0) return sign * man * Math.pow(2, -24);
+  if (exp === 31) return man ? NaN : sign * Infinity;
+  return sign * (1 + man / 1024) * Math.pow(2, exp - 15);
+}
+
+export function pack(floats, {seq, hidden, offset = 0, reset = false}) {
+  const out = new ArrayBuffer(20 + floats.length * 2);
+  const dv = new DataView(out);
+  dv.setUint32(0, MAGIC, true);
+  dv.setUint32(4, seq, true);
+  dv.setUint32(8, hidden, true);
+  dv.setUint32(12, offset, true);
+  dv.setUint32(16, reset ? 1 : 0, true);
+  for (let i = 0; i < floats.length; i++) dv.setUint16(20 + i * 2, f32to16(floats[i]), true);
+  return out;
+}
+
+export function unpack(buf) {
+  const dv = new DataView(buf);
+  if (dv.getUint32(0, true) !== MAGIC) throw new Error('not a flock frame');
+  const meta = {seq: dv.getUint32(4, true), hidden: dv.getUint32(8, true),
+                offset: dv.getUint32(12, true), reset: !!dv.getUint32(16, true)};
+  const n = (buf.byteLength - 20) / 2;
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) out[i] = f16to32(dv.getUint16(20 + i * 2, true));
+  return {data: out, meta};
+}
