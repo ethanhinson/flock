@@ -29,6 +29,7 @@
   <div class="row"><span>last compute</span><b id="ms">—</b></div>
   <div class="row"><span>activation in</span><b id="kb">—</b></div>
   <div class="row"><span>backend</span><b id="backend">—</b></div>
+  <div class="row"><span>my kv cache</span><b id="cache">—</b></div>
 </div>
 
 <button id="join" disabled>join the swarm</button>
@@ -41,7 +42,9 @@ ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/di
 const $ = id => document.getElementById(id);
 const log = (m, cls='') => $('status').innerHTML += `<div class="${cls}">${m}</div>`;
 
-let session = null, meta = null, running = false, count = 0;
+let session = null, meta = null, running = false, count = 0, past = null;
+const empty = () => new ort.Tensor('float32', new Float32Array(0),
+                                   [1, meta.kv_heads, 0, meta.head_dim]);
 
 // 1. Can this phone actually compute? iOS 26+ ships WebGPU on by default.
 const hasGPU = !!navigator.gpu;
@@ -93,14 +96,34 @@ async function loop() {
     } catch { await new Promise(r => setTimeout(r, 400)); continue; }
 
     $('card').classList.add('live');
+    if (job.reset) past = null;                // new conversation, drop our K/V
     const seq = job.hidden.length / meta.hidden;
     const t0 = performance.now();
 
-    const out = await session.run({
+    const feed = {
       hidden: new ort.Tensor('float32', Float32Array.from(job.hidden), [1, seq, meta.hidden]),
       position_ids: new ort.Tensor('int64',
         BigInt64Array.from({length: seq}, (_, i) => BigInt(job.offset + i)), [1, seq]),
-    });
+    };
+
+    // Feed back the K/V we produced last step. THIS is the cache: the phone
+    // owns the conversation state for its own layers, and nobody else has it.
+    if (meta.kv_cache) {
+      for (let i = 0; i < meta.n_layers; i++) {
+        feed[`past_k${i}`] = past ? past[`new_k${i}`] : empty();
+        feed[`past_v${i}`] = past ? past[`new_v${i}`] : empty();
+      }
+    }
+
+    const out = await session.run(feed);
+    if (meta.kv_cache) {
+      past = {};
+      for (let i = 0; i < meta.n_layers; i++) {
+        past[`new_k${i}`] = out[`new_k${i}`];
+        past[`new_v${i}`] = out[`new_v${i}`];
+      }
+      $('cache').textContent = out.new_k0.dims[2] + ' tokens';
+    }
 
     const ms = (performance.now() - t0).toFixed(1);
     await fetch('/result', {

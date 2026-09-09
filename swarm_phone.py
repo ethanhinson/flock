@@ -26,6 +26,7 @@ if not os.path.exists("web/phone_shard.json"):
 META = json.load(open("web/phone_shard.json"))
 MODEL = META["model"]
 CUT = META["start"]                     # phone owns CUT..n_total-1
+USE_CACHE = META.get("kv_cache", False)
 
 print(f"loading {MODEL} on the Mac (layers 0-{CUT-1}) ...")
 tok = AutoTokenizer.from_pretrained(MODEL)
@@ -37,22 +38,54 @@ full.model.layers = torch.nn.ModuleList(mac_layers)
 embed, rotary, lm_head = full.model.embed_tokens, full.model.rotary_emb, full.lm_head
 HEAD_DIM = full.config.head_dim
 print(f"Mac holds layers 0-{CUT-1}; phone will hold {CUT}-{META['end']}")
+print(f"kv cache: {'ON' if USE_CACHE else 'OFF (re-runs whole sequence each step)'}")
 
 phone = PhoneNode(META)
 app = Flask(__name__, static_folder="web")
 register(app, phone)
 
 
-def mac_forward(ids):
-    """Embedding + our layers -> hidden state to hand to the phone."""
-    pids = torch.arange(len(ids))[None, :]
+class MacCache:
+    """Per-layer K/V for the Mac's own layers. Same contract HF attention wants.
+
+    Note this is HALF a cache: the phone independently keeps K/V for its four
+    layers. Conversation state is sharded exactly like the weights are -- no
+    single device holds the whole thing.
+    """
+    def __init__(self):
+        self.k = self.v = None
+
+    def update(self, k, v, layer_idx, cache_kwargs=None):
+        if self.k is not None:
+            k = torch.cat([self.k, k], dim=2)
+            v = torch.cat([self.v, v], dim=2)
+        self.k, self.v = k, v
+        return k, v
+
+
+def mac_forward(ids, caches=None, offset=0):
+    """Embedding + our layers -> hidden state to hand to the phone.
+
+    With a cache, `ids` is just the NEW tokens (usually one) and `offset` says
+    where they sit in the sequence, so we do O(1) work per step instead of
+    re-running the whole prompt every time.
+    """
+    q = len(ids)
+    pids = torch.arange(offset, offset + q)[None, :]
     h = embed(torch.tensor([ids]))
     pos = rotary(h, pids)
-    seq = len(ids)
-    m = torch.triu(torch.full((seq, seq), torch.finfo(torch.float32).min), 1)[None, None]
+    kv = offset + q
+    m = torch.full((q, kv), torch.finfo(torch.float32).min)
+    m = torch.triu(m, diagonal=1 + (kv - q))[None, None]
     with torch.no_grad():
-        for lyr in full.model.layers:
-            out = lyr(h, attention_mask=m, position_ids=pids, position_embeddings=pos)
+        for i, lyr in enumerate(full.model.layers):
+            if caches is not None:
+                out = lyr(h, attention_mask=m, position_ids=pids,
+                          past_key_values=caches[i], use_cache=True,
+                          position_embeddings=pos)
+            else:
+                out = lyr(h, attention_mask=m, position_ids=pids,
+                          position_embeddings=pos)
             h = out[0] if isinstance(out, tuple) else out
     return h
 
@@ -84,15 +117,17 @@ def chat():
             yield sse({"type": "error", "text": "no phone connected — open /phone on your phone and tap join"})
             return
         out_ids = []
+        caches = [MacCache() for _ in full.model.layers] if USE_CACHE else None
+        phone.reset()                                # clear the phone's K/V too
+        step_ids, offset = ids, 0                    # prefill: the whole prompt
         for step in range(max_new):
-            seq = ids + out_ids
             t0 = time.perf_counter()
-            h = mac_forward(seq)                     # Mac's 24 layers
+            h = mac_forward(step_ids, caches, offset)   # Mac's 24 layers
             mac_ms = (time.perf_counter() - t0) * 1000
 
             t1 = time.perf_counter()
             try:
-                r = phone.call(h.flatten().tolist(), offset=0)   # -> PHONE's 4 layers
+                r = phone.call(h.flatten().tolist(), offset=offset)  # -> PHONE's 4 layers
             except TimeoutError:
                 yield sse({"type": "error", "text":
                            "phone stopped responding mid-generation — is the screen "
@@ -100,7 +135,7 @@ def chat():
                 return
             net_ms = (time.perf_counter() - t1) * 1000
 
-            h2 = torch.tensor(r["output"], dtype=torch.float32).view(1, len(seq), -1)
+            h2 = torch.tensor(r["output"], dtype=torch.float32).view(1, len(step_ids), -1)
             nxt = project(h2[:, -1])                 # Mac projects to vocab
 
             yield sse({"type": "hop", "mac_ms": round(mac_ms, 1),
@@ -109,6 +144,11 @@ def chat():
             if nxt in (tok.eos_token_id,):
                 break
             out_ids.append(nxt)
+            # Next round we feed ONLY the new token; the caches hold the rest.
+            offset += len(step_ids)
+            step_ids = [nxt] if USE_CACHE else ids + out_ids
+            if not USE_CACHE:
+                offset = 0
             yield sse({"type": "token", "text": tok.decode([nxt])})
         yield sse({"type": "done", "text": tok.decode(out_ids)})
 

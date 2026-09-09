@@ -24,12 +24,15 @@ class PhoneNode:
         self.connected = False
         self.last_seen = 0.0
         self.last_ms = None
+        self.reset_pending = False
 
     # --- coordinator side --------------------------------------------------
     def call(self, hidden_flat, offset, timeout=120):
         """Send activations to the phone, block until it sends them back."""
         jid = uuid.uuid4().hex[:8]
-        self.jobs.put({"id": jid, "hidden": hidden_flat, "offset": offset})
+        self.jobs.put({"id": jid, "hidden": hidden_flat, "offset": offset,
+                       "reset": self.reset_pending})
+        self.reset_pending = False
         deadline = time.time() + timeout
         with self.cv:
             while jid not in self.results:
@@ -46,6 +49,14 @@ class PhoneNode:
             return self.jobs.get(timeout=wait)
         except Empty:
             return None
+
+    def reset(self):
+        """New generation: tell the phone to drop its K/V cache.
+
+        Sent as a flag on the next job rather than its own round trip, since
+        the phone is long-polling and has no inbound channel of its own.
+        """
+        self.reset_pending = True
 
     def submit(self, jid, output, ms):
         self.last_ms = ms
