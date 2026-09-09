@@ -1,0 +1,144 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>flock · phone node</title>
+<style>
+  :root{--bg:#0b0d10;--fg:#e6edf3;--dim:#7d8590;--line:#21262d;--hot:#2f81f7;--ok:#3fb950;--bad:#f85149}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:15px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;padding:16px}
+  h1{font-size:16px;margin:0 0 2px}
+  .sub{color:var(--dim);font-size:12px}
+  .card{border:1px solid var(--line);border-radius:10px;padding:14px;margin-top:14px}
+  .card.live{border-color:var(--hot);background:#0d2137}
+  .big{font-size:30px;font-weight:600;margin:6px 0}
+  .row{display:flex;justify-content:space-between;color:var(--dim);font-size:12px;padding:3px 0}
+  .row b{color:var(--fg);font-weight:600}
+  button{width:100%;background:var(--hot);border:0;color:#fff;border-radius:9px;
+         padding:15px;font:inherit;font-weight:600;margin-top:14px}
+  button:disabled{background:#21262d;color:var(--dim)}
+  #status{color:var(--dim);font-size:12px;margin-top:10px;white-space:pre-wrap}
+  .ok{color:var(--ok)}.bad{color:var(--bad)}
+</style>
+
+<h1>🕊 flock · phone node</h1>
+<div class="sub" id="sub">checking WebGPU…</div>
+
+<div class="card" id="card">
+  <div class="row"><span>my layers</span><b id="layers">—</b></div>
+  <div class="big"><span id="count">0</span> <span style="font-size:14px;color:var(--dim)">forwards run</span></div>
+  <div class="row"><span>last compute</span><b id="ms">—</b></div>
+  <div class="row"><span>activation in</span><b id="kb">—</b></div>
+  <div class="row"><span>backend</span><b id="backend">—</b></div>
+</div>
+
+<button id="join" disabled>join the swarm</button>
+<div id="status"></div>
+
+<script type="module">
+import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.min.mjs';
+ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
+
+const $ = id => document.getElementById(id);
+const log = (m, cls='') => $('status').innerHTML += `<div class="${cls}">${m}</div>`;
+
+let session = null, meta = null, running = false, count = 0;
+
+// 1. Can this phone actually compute? iOS 26+ ships WebGPU on by default.
+const hasGPU = !!navigator.gpu;
+$('sub').innerHTML = hasGPU
+  ? '<span class="ok">WebGPU available — this phone can run real layers</span>'
+  : '<span class="bad">no WebGPU — will fall back to CPU/wasm (slower)</span>';
+
+// 2. Pull our slice of the model. This is the ONLY big download.
+(async () => {
+  meta = await (await fetch('/phone_shard.json')).json();
+  $('layers').textContent = `${meta.start}–${meta.end} of ${meta.n_total}`;
+  log(`fetching my ${meta.end - meta.start + 1} layers…`);
+  const t0 = performance.now();
+  const buf = await (await fetch('/phone_shard.onnx')).arrayBuffer();
+  log(`got ${(buf.byteLength/1e6).toFixed(0)}MB in ${((performance.now()-t0)/1000).toFixed(1)}s`, 'ok');
+
+  // The weights live in a SEPARATE .data sidecar. ORT Web will not go looking
+  // for it on its own -- we must hand it the bytes explicitly, or the graph
+  // loads with no weights and session creation fails.
+  log('fetching weights (252MB, one time)…');
+  const t1 = performance.now();
+  const wbuf = await (await fetch('/phone_shard.onnx.data')).arrayBuffer();
+  log(`weights ${(wbuf.byteLength/1e6).toFixed(0)}MB in ${((performance.now()-t1)/1000).toFixed(1)}s`, 'ok');
+
+  const providers = hasGPU ? ['webgpu','wasm'] : ['wasm'];
+  session = await ort.InferenceSession.create(buf, {
+    executionProviders: providers,
+    externalData: [{path: 'phone_shard.onnx.data', data: new Uint8Array(wbuf)}],
+  });
+  $('backend').textContent = hasGPU ? 'webgpu' : 'wasm';
+  log('model ready — tap join', 'ok');
+  $('join').disabled = false;
+})().catch(e => log('load failed: ' + e, 'bad'));
+
+// 3. Long-poll the coordinator for work. A browser can't accept inbound
+//    connections, so the phone ASKS for activations instead of receiving them.
+//    That's the one real concession to running a node inside a web page.
+async function loop() {
+  while (running) {
+    let job;
+    try {
+      const r = await fetch('/work', {method:'POST'});
+      if (r.status === 204) {                  // no work right now, ask again
+        $('sub').innerHTML = `<span class="ok">idle · polled ${new Date()
+          .toLocaleTimeString()}</span>`;
+        continue;
+      }
+      job = await r.json();
+    } catch { await new Promise(r => setTimeout(r, 400)); continue; }
+
+    $('card').classList.add('live');
+    const seq = job.hidden.length / meta.hidden;
+    const t0 = performance.now();
+
+    const out = await session.run({
+      hidden: new ort.Tensor('float32', Float32Array.from(job.hidden), [1, seq, meta.hidden]),
+      position_ids: new ort.Tensor('int64',
+        BigInt64Array.from({length: seq}, (_, i) => BigInt(job.offset + i)), [1, seq]),
+    });
+
+    const ms = (performance.now() - t0).toFixed(1);
+    await fetch('/result', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({id: job.id, output: Array.from(out.output.data), ms: +ms}),
+    });
+
+    count++; $('count').textContent = count; $('ms').textContent = ms + ' ms';
+    $('kb').textContent = (job.hidden.length * 4 / 1024).toFixed(1) + ' KB';
+    setTimeout(() => $('card').classList.remove('live'), 120);
+  }
+}
+
+// iOS suspends a backgrounded/locked tab: timers stop, fetches never return,
+// and the node silently vanishes from the swarm. A wake lock keeps the screen
+// on while we're a member. This is the real cost of running a compute node in
+// a phone browser -- swarmllm.ai has exactly the same constraint.
+let wake = null;
+async function keepAwake(on) {
+  try {
+    if (on && 'wakeLock' in navigator) { wake = await navigator.wakeLock.request('screen'); }
+    else if (wake) { await wake.release(); wake = null; }
+  } catch (e) { log('wake lock unavailable: ' + e.message); }
+}
+// Re-acquire after the user returns to the tab (iOS drops it on hide).
+document.addEventListener('visibilitychange', async () => {
+  if (document.visibilityState === 'visible' && running) {
+    await keepAwake(true);
+    log('tab active again — rejoining', 'ok');
+  } else if (document.visibilityState === 'hidden' && running) {
+    log('tab hidden — iOS may pause me until you come back', 'bad');
+  }
+});
+
+$('join').onclick = async () => {
+  running = !running;
+  $('join').textContent = running ? 'leave the swarm' : 'join the swarm';
+  await keepAwake(running);
+  if (running) { log('joined — waiting for activations', 'ok'); loop(); }
+};
+</script>

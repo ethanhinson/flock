@@ -1,0 +1,78 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>flock · chat</title>
+<style>
+  :root{--bg:#0b0d10;--fg:#e6edf3;--dim:#7d8590;--line:#21262d;--hot:#2f81f7;--ok:#3fb950;--bad:#f85149}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 ui-monospace,Menlo,monospace;padding-bottom:80px}
+  header{padding:14px 16px;border-bottom:1px solid var(--line)}
+  h1{margin:0;font-size:15px}
+  .sub{color:var(--dim);font-size:12px;margin-top:3px}
+  .pipe{display:flex;gap:8px;padding:14px 16px;align-items:center}
+  .n{flex:1;border:1px solid var(--line);border-radius:9px;padding:10px;transition:.12s}
+  .n.live{border-color:var(--hot);background:#0d2137}
+  .n b{font-size:12px}.n div{color:var(--dim);font-size:11px;margin-top:2px}
+  .arrow{color:var(--dim);font-size:18px}
+  #out{padding:0 16px;white-space:pre-wrap;min-height:20vh}
+  #log{padding:8px 16px;color:var(--dim);font-size:11px}
+  form{position:fixed;bottom:0;left:0;right:0;display:flex;gap:8px;padding:10px;background:var(--bg);border-top:1px solid var(--line)}
+  input{flex:1;background:#0d1117;border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:12px;font:inherit;min-width:0}
+  button{background:var(--hot);border:0;color:#fff;border-radius:8px;padding:12px 16px;font:inherit}
+</style>
+<header><h1>🕊 flock · mac + phone</h1><div class="sub" id="sub">…</div></header>
+<div class="pipe">
+  <div class="n" id="mac"><b>💻 mac</b><div id="macl">—</div><div id="macms">idle</div></div>
+  <div class="arrow">→</div>
+  <div class="n" id="ph"><b>📱 phone</b><div id="phl">—</div><div id="phms">idle</div></div>
+</div>
+<div id="out"></div><div id="log"></div>
+<form onsubmit="go(event)">
+  <input id="q" value="What is the capital of France?" autocomplete="off">
+  <button>send</button>
+</form>
+<script>
+const $=id=>document.getElementById(id);
+async function poll(){
+  const s=await (await fetch('/status')).json();
+  $('macl').textContent='layers '+s.mac_layers;
+  $('phl').textContent='layers '+s.phone_layers;
+  $('sub').innerHTML=s.phone_connected
+    ? `<span style="color:var(--ok)">phone connected · ${s.n_total} layers split across 2 devices</span>`
+    : `<span style="color:var(--bad)">no phone — open /phone on your phone and tap join</span>`;
+}
+poll(); setInterval(poll,3000);
+
+function go(e){
+  e.preventDefault(); $('out').textContent=''; $('log').innerHTML='';
+  let n=0, t0=Date.now();
+  fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({prompt:$('q').value})}).then(res=>{
+    const rd=res.body.getReader(), dec=new TextDecoder(); let buf='';
+    (function pump(){return rd.read().then(({done,value})=>{
+      if(done) return;
+      buf+=dec.decode(value,{stream:true});
+      const parts=buf.split('\n\n'); buf=parts.pop();
+      for(const p of parts){
+        if(!p.startsWith('data: '))continue;
+        const m=JSON.parse(p.slice(6));
+        if(m.type==='token') $('out').textContent+=m.text;
+        if(m.type==='error') $('out').innerHTML=`<span style="color:var(--bad)">${m.text}</span>`;
+        if(m.type==='hop'){
+          n++;
+          $('mac').classList.add('live'); setTimeout(()=>$('mac').classList.remove('live'),100);
+          setTimeout(()=>{$('ph').classList.add('live');setTimeout(()=>$('ph').classList.remove('live'),100)},110);
+          $('macms').textContent=m.mac_ms+' ms';
+          $('phms').textContent=m.phone_ms+' ms (on phone GPU)';
+          $('log').insertAdjacentHTML('afterbegin',
+            `<div>tok ${n} · mac ${m.mac_ms}ms → ${m.kb}KB over wifi → phone ${m.phone_ms}ms · roundtrip ${m.roundtrip_ms}ms</div>`);
+        }
+        if(m.type==='done'){
+          const s=(Date.now()-t0)/1000;
+          $('log').insertAdjacentHTML('afterbegin',`<div><b>${n} tokens in ${s.toFixed(1)}s</b></div>`);
+        }
+      }
+      return pump();
+    })})();
+  });
+}
+</script>

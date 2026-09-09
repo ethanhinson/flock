@@ -1,0 +1,6 @@
+# For the Mac-only multi-process demo (run.sh -> shard.py + swarm.py).
+# MLX is Apple-silicon only.
+mlx-lm>=0.31
+flask>=3.0
+requests>=2.31
+numpy>=1.26

@@ -1,0 +1,9 @@
+# Build artifacts — regenerate with export_phone_shard.py
+web/*.onnx
+web/*.onnx.data
+web/phone_shard.json
+
+__pycache__/
+*.pyc
+.DS_Store
+.venv/

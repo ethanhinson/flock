@@ -1,0 +1,105 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>flock</title>
+<style>
+  :root{--bg:#0b0d10;--fg:#e6edf3;--dim:#7d8590;--line:#21262d;--hot:#2f81f7;--ok:#3fb950}
+  *{box-sizing:border-box;-webkit-text-size-adjust:100%}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+  header{padding:14px 16px;border-bottom:1px solid var(--line)}
+  h1{margin:0;font-size:15px;letter-spacing:.06em}
+  .sub{color:var(--dim);font-size:12px;margin-top:3px}
+  #ring{display:flex;gap:6px;padding:14px 16px;overflow-x:auto}
+  .node{flex:0 0 auto;border:1px solid var(--line);border-radius:8px;padding:9px 11px;min-width:104px;transition:.12s}
+  .node.live{border-color:var(--hot);background:#0d2137;transform:translateY(-2px)}
+  .node b{font-size:12px}.node div{color:var(--dim);font-size:11px;margin-top:3px}
+  #out{padding:0 16px 16px;white-space:pre-wrap;min-height:22vh}
+  #log{padding:0 16px 90px;color:var(--dim);font-size:11px}
+  .lap{border-top:1px solid var(--line);padding:5px 0}
+  form{position:fixed;bottom:0;left:0;right:0;display:flex;gap:8px;padding:10px;
+       background:var(--bg);border-top:1px solid var(--line)}
+  input{flex:1;background:#0d1117;border:1px solid var(--line);color:var(--fg);
+        border-radius:8px;padding:12px;font:inherit;min-width:0}
+  button{background:var(--hot);border:0;color:#fff;border-radius:8px;padding:12px 16px;font:inherit}
+  .stat{color:var(--ok)}
+</style>
+
+<header>
+  <h1>🕊 flock</h1>
+  <div class="sub" id="sub">connecting…</div>
+</header>
+<div id="ring"></div>
+<div id="out"></div>
+<div id="log"></div>
+
+<form onsubmit="go(event)">
+  <input id="q" placeholder="ask the swarm…" autocomplete="off" value="Explain pipeline parallelism in two sentences.">
+  <button>send</button>
+</form>
+
+<script>
+let NODES = [];
+
+// Draw the ring of shards so you can watch the activation move through it.
+fetch('/topology').then(r => r.json()).then(t => {
+  NODES = t.shards;
+  const total = NODES[0].n_total;
+  document.getElementById('sub').textContent =
+    `${NODES.length} nodes · ${total} layers · hidden ${NODES[0].hidden}`;
+  document.getElementById('ring').innerHTML = NODES.map((n, i) => `
+    <div class="node" id="n${i}">
+      <b>node ${i}</b>
+      <div>layers ${n.start}–${n.end}</div>
+      <div>${Math.round((n.end - n.start + 1) / total * 100)}% of model</div>
+      <div id="t${i}">idle</div>
+    </div>`).join('');
+});
+
+function flash(i, ms, kb) {
+  const el = document.getElementById('n' + i);
+  if (!el) return;
+  el.classList.add('live');
+  document.getElementById('t' + i).innerHTML =
+    `<span class="stat">${ms}ms</span>` + (kb ? ` · ${kb}KB out` : ' · token');
+  setTimeout(() => el.classList.remove('live'), 160);
+}
+
+function go(e) {
+  e.preventDefault();
+  const out = document.getElementById('out'), log = document.getElementById('log');
+  out.textContent = ''; log.innerHTML = '';
+  let laps = 0, t0 = Date.now();
+
+  fetch('/chat', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({prompt: document.getElementById('q').value})
+  }).then(res => {
+    const rd = res.body.getReader(), dec = new TextDecoder();
+    let buf = '';
+    (function pump() {
+      return rd.read().then(({done, value}) => {
+        if (done) return;
+        buf += dec.decode(value, {stream: true});
+        const parts = buf.split('\n\n'); buf = parts.pop();
+        for (const p of parts) {
+          if (!p.startsWith('data: ')) continue;
+          const m = JSON.parse(p.slice(6));
+          if (m.type === 'token') out.textContent += m.text;
+          if (m.type === 'hops') {
+            laps++;
+            m.hops.forEach((h, i) => setTimeout(() => flash(h.node, h.compute_ms, h.kb), i * 40));
+            const line = m.hops.map(h => `n${h.node}(${h.shard}) ${h.compute_ms}ms`).join('  →  ');
+            log.insertAdjacentHTML('afterbegin',
+              `<div class="lap">lap ${laps} · ${m.phase} · ${line}</div>`);
+          }
+          if (m.type === 'done') {
+            const s = (Date.now() - t0) / 1000;
+            log.insertAdjacentHTML('afterbegin',
+              `<div class="lap"><b>${laps} laps in ${s.toFixed(1)}s · ${(laps/s).toFixed(1)} tok/s</b></div>`);
+          }
+        }
+        return pump();
+      });
+    })();
+  });
+}
+</script>
