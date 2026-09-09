@@ -4,7 +4,7 @@
 // The websocket exists ONLY to carry offers/answers/ICE. Once a channel opens,
 // no activation touches it again.
 import nodeDataChannel from 'node-datachannel';
-import {pack, unpack} from './wire.js';
+import {pack, unpack} from '../../web/js/wire.mjs';
 
 const ICE = ['stun:stun.l.google.com:19302'];
 
@@ -15,12 +15,18 @@ export class Bird {
     this.lastSeen = 0; this.lastMs = null;
     this.transport = 'none';
     this.resetPending = false;
+    this.forwardsDirectly = false;   // set when the bird reports a live peer link
     this.ws = null; this.pc = null; this.chan = null;
     this._waiter = null;
   }
 
   alive(grace = 40000) {
-    return (this.chan || this.ws) && (Date.now() - this.lastSeen) < grace;
+    const linked = !!(this.chanOpen() || this.ws);
+    return linked && (Date.now() - this.lastSeen) < grace;
+  }
+
+  chanOpen() {
+    try { return !!(this.chan && this.chan.isOpen()); } catch { return false; }
   }
 
   info() {
@@ -33,7 +39,7 @@ export class Bird {
   send(floats, seq, hidden, offset, timeout = 120000) {
     const frame = pack(floats, {seq, hidden, offset, reset: this.resetPending});
     this.resetPending = false;
-    const viaRTC = !!(this.chan && this.chan.isOpen());
+    const viaRTC = this.chanOpen();
     const link = viaRTC ? this.chan : this.ws;
     if (!link) return Promise.reject(new Error(
       `no device holding layers ${this.start}-${this.end}`));
@@ -45,7 +51,28 @@ export class Bird {
                       `responding — is its screen on and the tab in front?`));
       }, timeout);
       this._waiter = v => { clearTimeout(timer); this._waiter = null; res(v); };
-      if (this.chan && this.chan.isOpen()) this.chan.sendMessageBinary(Buffer.from(frame));
+      if (this.chanOpen()) this.chan.sendMessageBinary(Buffer.from(frame));
+      else this.ws.send(Buffer.from(frame));
+    });
+  }
+
+  /** Push into this bird but wait for `awaitOn` to answer (the chain's tail). */
+  sendChained(floats, seq, hidden, offset, awaitOn, timeout = 120000) {
+    const frame = pack(floats, {seq, hidden, offset, reset: this.resetPending});
+    this.resetPending = false;
+    const viaRTC = this.chanOpen();
+    const link = viaRTC ? this.chan : this.ws;
+    if (!link) return Promise.reject(new Error(
+      `no device holding layers ${this.start}-${this.end}`));
+    this.transport = viaRTC ? 'webrtc' : 'ws';
+    return new Promise((res, rej) => {
+      const timer = setTimeout(() => {
+        awaitOn._waiter = null;
+        rej(new Error(`the flock stopped responding — is every device awake ` +
+                      `with its tab in front?`));
+      }, timeout);
+      awaitOn._waiter = v => { clearTimeout(timer); awaitOn._waiter = null; res(v); };
+      if (viaRTC) this.chan.sendMessageBinary(Buffer.from(frame));
       else this.ws.send(Buffer.from(frame));
     });
   }
@@ -59,12 +86,24 @@ export class Bird {
 
   reset() { this.resetPending = true; }
 
+  /** Drop every link to this bird. Called when its websocket goes away, so a
+   *  refresh starts from a clean slate instead of leaking a PeerConnection. */
+  teardown() {
+    try { this.chan?.close(); } catch {}
+    try { this.pc?.close(); } catch {}
+    this.chan = null; this.pc = null; this.ws = null;
+    this.transport = 'none';
+    if (this._waiter) { const w = this._waiter; this._waiter = null;
+      try { w(null); } catch {} }
+  }
+
   /** Offer a direct data channel to this bird, signalled over its websocket. */
   openRTC(onOpen) {
     // A reloaded bird signals again; drop the previous connection or stale
     // PeerConnections accumulate and the wrong one wins.
-    try { this.chan?.close(); this.pc?.close(); } catch {}
-    this.chan = null;
+    try { this.chan?.close(); } catch {}
+    try { this.pc?.close(); } catch {}
+    this.chan = null; this.pc = null;
     this.pc = new nodeDataChannel.PeerConnection(`coord-${this.slot}`, {iceServers: ICE});
     this.pc.onLocalDescription((sdp, type) =>
       this.ws?.send(JSON.stringify({t: 'signal', data: {kind: type, sdp: {sdp, type}}})));
@@ -96,6 +135,50 @@ export class Bird {
 export class Flock {
   constructor(ranges) {
     this.birds = ranges.map(([s, e], i) => new Bird(s, e, i));
+  }
+
+  /** Who each bird forwards to. The last one replies to the coordinator. */
+  chainFor(peerId) {
+    const b = this.byPeer(peerId);
+    if (!b) return null;
+    const next = this.birds[b.slot + 1] || null;
+    return {t: 'chain', slot: b.slot,
+            next_peer: next ? next.peerId : null,
+            next_range: next ? `${next.start}-${next.end}` : null,
+            is_last: !next};
+  }
+
+  /** Tell every bird its successor — call whenever membership changes. */
+  announce() {
+    for (const b of this.birds) {
+      if (!b.ws) continue;
+      const c = this.chainFor(b.peerId);
+      if (c) try { b.ws.send(JSON.stringify(c)); } catch {}
+    }
+  }
+
+  /** Send one lap through every bird, in layer order.
+   *
+   *  Two shapes, decided by whether a bird can reach its successor directly:
+   *
+   *    chained   coord -> A -> B -> coord      (one round trip; B answers)
+   *    relayed   coord -> A -> coord -> B ...  (fallback, one trip per bird)
+   *
+   *  A bird forwards peer-to-peer when it has an open channel to the next one,
+   *  so we can only await the tail for the longest chained run from the head.
+   */
+  async lap(floats, seq, hidden, offset) {
+    let flat = floats, i = 0;
+    while (i < this.birds.length) {
+      // How far does the direct chain reach from bird i?
+      let j = i;
+      while (j + 1 < this.birds.length && this.birds[j].forwardsDirectly) j++;
+      const {data} = await this.birds[i].sendChained(
+        flat, seq, hidden, offset, this.birds[j]);
+      flat = data;
+      i = j + 1;
+    }
+    return {data: flat};
   }
   claim(peerId, label) {
     for (const b of this.birds) if (b.peerId === peerId) { b.lastSeen = Date.now(); return b; }

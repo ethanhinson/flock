@@ -1,0 +1,8 @@
+# Export tooling only. The runtime is Node (see node/) — nothing here is
+# imported at inference time. PyTorch stays the reference implementation that
+# every ONNX graph is verified against.
+torch>=2.6
+transformers>=4.51
+onnx>=1.17
+onnxscript>=0.1
+onnxruntime>=1.20

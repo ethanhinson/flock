@@ -1,8 +1,0 @@
-# For the Mac+phone demo (swarm_phone.py + export_phone_shard.py).
-# Plain PyTorch, so this half also runs on Linux/Windows.
-torch>=2.6
-transformers>=4.51
-onnx>=1.17
-onnxscript>=0.1
-onnxruntime>=1.20
-flask>=3.0

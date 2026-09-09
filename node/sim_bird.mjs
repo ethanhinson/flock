@@ -1,7 +1,7 @@
 // Stand-in bird against the Node coordinator (websocket path).
 import ort from 'onnxruntime-node';
 import WebSocket from 'ws';
-import {pack, unpack} from './src/wire.js';
+import {pack, unpack} from '../web/js/wire.mjs';
 process.chdir('/Users/ethanhinson/dev/flock');
 const label = process.argv[2] || 'sim';
 const j = await (await fetch('http://127.0.0.1:8000/join', {

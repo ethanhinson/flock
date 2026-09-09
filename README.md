@@ -63,7 +63,7 @@ download in full.
 ### 1. Coordinator + phones (the real distributed one)
 
 ```bash
-pip install -r requirements-phone.txt              # export tooling only
+pip install -r requirements-export.txt          # export tooling only
 python3 build_shards.py --start 24 --end 27 --birds 1
 python3 flock_export_coordinator.py --cut 24
 cd node && npm install && npm start
@@ -186,8 +186,8 @@ Read these before drawing conclusions from it.
 | `flock_export_coordinator.py` | exports the coordinator's embed/layers/head graphs |
 | `node/src/server.js` | the coordinator: chat loop, signaling, HTTP |
 | `node/src/coordinator.js` | embedding + layers 0–23 + vocab projection |
-| `node/src/mesh.js` | the flock, slot claiming, WebRTC links |
-| `node/src/wire.js` · `web/js/wire.js` · `flock/wire.py` | the f16 frame format |
+| `node/src/mesh.js` | the flock, slot claiming, chain topology, WebRTC links |
+| `web/js/wire.js` | the f16 frame format — one copy, imported by node and browsers |
 | `web/bird.html` | a bird — ONNX Runtime Web on WebGPU |
 | `web/chat.html` | chat UI showing the per-token lap |
 | `flock_mlx_*.py` / `run.sh` | the Mac-only MLX demo |

@@ -39,16 +39,50 @@
 
 <script type="module">
 import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.min.mjs';
-import {pack, unpack} from '/js/wire.js';
+import {pack, unpack} from '/js/wire.mjs';
 ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
 
 const $ = id => document.getElementById(id);
 const log = (m, cls='') => $('status').innerHTML += `<div class="${cls}">${m}</div>`;
 
 let session = null, meta = null, running = false, count = 0, past = null;
-let ws = null, rtc = null, chan = null, inChan = null, chain = null, rtcFrames = 0;
+let ws = null, chan = null, inChan = null, chain = null, rtcFrames = 0;
+let rtc = null;      // link FROM the coordinator (or previous bird)
+let outRtc = null;   // link TO the next bird, if we have a successor
 const empty = () => new ort.Tensor('float32', new Float32Array(0),
                                    [1, meta.kv_heads, 0, meta.head_dim]);
+
+// --- shard cache (IndexedDB; works over plain http, unlike the Cache API) ---
+function idbOpen() {
+  return new Promise(res => {
+    let req;
+    try { req = indexedDB.open('flock', 1); } catch { return res(null); }
+    req.onupgradeneeded = () => req.result.createObjectStore('shards');
+    req.onsuccess = () => res(req.result);
+    req.onerror = () => res(null);         // no cache is survivable
+  });
+}
+function idbGet(db, key) {
+  return new Promise(res => {
+    if (!db) return res(null);
+    try {
+      const r = db.transaction('shards').objectStore('shards').get(key);
+      r.onsuccess = () => res(r.result || null);
+      r.onerror = () => res(null);
+    } catch { res(null); }
+  });
+}
+function idbPut(db, key, val) {
+  return new Promise((res, rej) => {
+    if (!db) return res();
+    try {
+      const tx = db.transaction('shards', 'readwrite');
+      tx.objectStore('shards').put(val, key);
+      tx.oncomplete = () => res();
+      tx.onerror = () => rej(tx.error || new Error('idb write failed'));
+    } catch (e) { rej(e); }
+  });
+}
 
 const hasGPU = !!navigator.gpu;
 $('sub').innerHTML = hasGPU
@@ -69,25 +103,47 @@ let peerId = localStorage.getItem('flock_peer') || null;
   $('layers').textContent = `${meta.start}–${meta.end} of ${meta.n_total}`;
   log(`joined as bird ${meta.slot} — I own layers ${meta.start}–${meta.end}`, 'ok');
 
-  log(`fetching my ${meta.n_layers} layers…`);
-  const t0 = performance.now();
-  const buf = await (await fetch(`/shard/${meta.slot}.onnx`)).arrayBuffer();
-  log(`graph ${(buf.byteLength/1e6).toFixed(1)}MB in ${((performance.now()-t0)/1000).toFixed(1)}s`, 'ok');
-
-  // Weights live in a SEPARATE .data sidecar. ORT Web won't go looking for it
-  // on its own — we must hand it the bytes, or the graph loads with no weights.
-  log('fetching weights (one time)…');
-  const t1 = performance.now();
-  const wbuf = await (await fetch(`/shard/${meta.slot}.onnx.data`)).arrayBuffer();
-  log(`weights ${(wbuf.byteLength/1e6).toFixed(0)}MB in ${((performance.now()-t1)/1000).toFixed(1)}s`, 'ok');
+  // Cache the shard so a refresh doesn't re-download 252MB.
+  //
+  // NOT the Cache API: `caches` only exists in a secure context, and a phone
+  // on a LAN reaches us over plain http://, so it is undefined there. IndexedDB
+  // has no such restriction and holds blobs of this size fine.
+  //
+  // Weights live in a SEPARATE .data sidecar — ORT Web won't go looking for it
+  // on its own, so we hand it the bytes explicitly below.
+  const db = await idbOpen();
+  async function grab(url, label) {
+    const hit = await idbGet(db, url);
+    if (hit) {
+      log(`${label} ${(hit.byteLength/1e6).toFixed(0)}MB from cache`, 'ok');
+      return hit;
+    }
+    const t = performance.now();
+    const buf = await (await fetch(url)).arrayBuffer();
+    log(`${label} ${(buf.byteLength/1e6).toFixed(0)}MB in ${((performance.now()-t)/1000).toFixed(1)}s`, 'ok');
+    idbPut(db, url, buf).catch(e => log('cache write failed: ' + e.message));
+    return buf;
+  }
+  log(`loading my ${meta.n_layers} layers…`);
+  const buf  = await grab(`/shard/${meta.slot}.onnx`, 'graph');
+  const wbuf = await grab(`/shard/${meta.slot}.onnx.data`, 'weights');
 
   session = await ort.InferenceSession.create(buf, {
     executionProviders: hasGPU ? ['webgpu','wasm'] : ['wasm'],
     externalData: [{path: `shard${meta.slot}.onnx.data`, data: new Uint8Array(wbuf)}],
   });
   $('backend').textContent = hasGPU ? 'webgpu' : 'wasm';
-  log('model ready — tap join', 'ok');
   $('join').disabled = false;
+  // A refresh shouldn't drop us out of the flock: if we were a member, rejoin.
+  if (localStorage.getItem('flock_joined') === '1') {
+    running = true;
+    $('join').textContent = 'leave the flock';
+    await keepAwake(true);
+    connect();
+    log('rejoined automatically after refresh', 'ok');
+  } else {
+    log('model ready — tap join', 'ok');
+  }
 })().catch(e => log('load failed: ' + e, 'bad'));
 
 // --- the actual work ------------------------------------------------------
@@ -100,6 +156,17 @@ function showLink() {
   $('link').textContent = nxt
     ? `bird ${nxt} (${chan && chan.readyState === 'open' ? 'webrtc' : 'ws'})`
     : `coordinator (${up ? 'webrtc' : 'websocket'})`;
+}
+
+// Where does our output go? To the next bird if we have a link to it, else
+// back to the coordinator. Only the LAST bird answers the coordinator, so a
+// lap costs one round trip no matter how many devices are in the chain.
+function forward(out, m) {
+  const frame = pack(out, {seq: m.seq, hidden: meta.hidden, offset: m.offset});
+  if (chan && chan.readyState === 'open') { chan.send(frame); return 'bird'; }
+  if (inChan && inChan.readyState === 'open') { inChan.send(frame); return 'coord'; }
+  ws.send(frame);
+  return 'coord';
 }
 
 async function runFrame(floats, m) {
@@ -138,21 +205,34 @@ async function runFrame(floats, m) {
 }
 
 // --- WebRTC: forward straight to the next bird, skipping the coordinator ---
+// Open a link to the NEXT bird. This is a SEPARATE PeerConnection from `rtc`
+// (the coordinator's) -- a bird in the middle of the chain holds both.
 async function openRTC(toPeer) {
-  rtc = new RTCPeerConnection({iceServers: [{urls: 'stun:stun.l.google.com:19302'}]});
-  chan = rtc.createDataChannel('flock', {ordered: true});
+  outRtc = new RTCPeerConnection({iceServers: [{urls: 'stun:stun.l.google.com:19302'}]});
+  chan = outRtc.createDataChannel('flock', {ordered: true});
   chan.binaryType = 'arraybuffer';
   chan.onopen = () => {
-    $('link').textContent = `bird ${toPeer} (webrtc)`;
-    log('direct link to next bird open — coordinator is out of the path', 'ok');
-    ws.send(JSON.stringify({t:'stats', transport:'webrtc'}));
+    showLink();
+    log('direct link to next bird open — coordinator is out of that hop', 'ok');
+    ws.send(JSON.stringify({t: 'forwards', direct: true}));
   };
-  rtc.onicecandidate = e => {
+  chan.onclose = () => {
+    chan = null; showLink();
+    ws.send(JSON.stringify({t: 'forwards', direct: false}));
+  };
+  chan.onmessage = ev => {
+    // The tail of the chain answered. Relay it back the way it came.
+    const {data, meta: m} = unpack(ev.data);
+    const frame = pack(data, {seq: m.seq, hidden: meta.hidden, offset: m.offset});
+    if (inChan && inChan.readyState === 'open') inChan.send(frame);
+    else ws.send(frame);
+  };
+  outRtc.onicecandidate = e => {
     if (e.candidate) ws.send(JSON.stringify({t:'signal', to: toPeer,
-      data: {kind:'ice', candidate: e.candidate}}));
+      data: {kind:'ice', candidate: e.candidate.candidate, mid: e.candidate.sdpMid}}));
   };
-  const offer = await rtc.createOffer();
-  await rtc.setLocalDescription(offer);
+  const offer = await outRtc.createOffer();
+  await outRtc.setLocalDescription(offer);
   ws.send(JSON.stringify({t:'signal', to: toPeer, data: {kind:'offer', sdp: offer}}));
 }
 
@@ -172,9 +252,7 @@ async function onSignal(from, d) {
         rtcFrames++; $('rtccount').textContent = rtcFrames;
         const {data, meta: m} = unpack(ev.data);
         const {out, ms} = await runFrame(data, m);
-        const reply = pack(out, {seq: m.seq, hidden: meta.hidden, offset: m.offset});
-        if (inChan.readyState === 'open') inChan.send(reply);
-        else ws.send(reply);
+        forward(out, m);
         ws.send(JSON.stringify({t:'stats', ms, transport:'webrtc'}));
       };
     };
@@ -187,9 +265,13 @@ async function onSignal(from, d) {
     await rtc.setLocalDescription(ans);
     ws.send(JSON.stringify({t:'signal', data: {kind:'answer', sdp: ans}}));
   } else if (d.kind === 'answer') {
-    await rtc.setRemoteDescription(d.sdp);
-  } else if (d.kind === 'ice' && rtc) {
-    try { await rtc.addIceCandidate({candidate: d.candidate, sdpMid: d.mid || '0'}); } catch {}
+    // An answer to OUR offer always belongs to the outgoing link.
+    await (outRtc || rtc).setRemoteDescription(d.sdp);
+  } else if (d.kind === 'ice') {
+    const pc = from ? outRtc : rtc;   // from a bird => our outgoing link
+    if (pc) try {
+      await pc.addIceCandidate({candidate: d.candidate, sdpMid: d.mid || '0'});
+    } catch {}
   }
 }
 
@@ -249,6 +331,7 @@ document.addEventListener('visibilitychange', async () => {
 $('join').onclick = async () => {
   running = !running;
   $('join').textContent = running ? 'leave the flock' : 'join the flock';
+  localStorage.setItem('flock_joined', running ? '1' : '0');
   await keepAwake(running);
   if (running) connect(); else if (ws) ws.close();
 };

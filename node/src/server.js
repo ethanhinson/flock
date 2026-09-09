@@ -95,19 +95,19 @@ app.post('/chat', async (req, res) => {
     const coordMs = +(performance.now() - t0).toFixed(1);
 
     const t1 = performance.now();
-    const stats = [];
     try {
-      // The lap: each bird's output is the next one's input.
-      for (const bird of flock.birds) {
-        const {data, meta} = await bird.send(flat, stepIds.length, META.hidden, offset);
-        flat = data;
-        stats.push({range: `${bird.start}-${bird.end}`, ms: bird.lastMs,
-                    label: bird.label, transport: bird.transport});
-      }
+      // One lap: into the first bird, out of the last. Birds forward to each
+      // other directly, so the coordinator sees a single round trip no matter
+      // how many devices are in the chain.
+      const {data} = await flock.lap(flat, stepIds.length, META.hidden, offset);
+      flat = data;
     } catch (e) {
       sse({type: 'error', text: e.message});
       return res.end();
     }
+    const stats = flock.birds.map(b => ({
+      range: `${b.start}-${b.end}`, ms: b.lastMs,
+      label: b.label, transport: b.transport}));
     const netMs = +(performance.now() - t1).toFixed(1);
 
     const nxt = await coord.project(flat, stepIds.length);
@@ -142,11 +142,25 @@ wss.on('connection', ws => {
         // Offer the bird a direct data channel; the websocket then only
         // carries signaling.
         bird.openRTC(b => console.log(`webrtc link open to ${b.label} (${b.start}-${b.end})`));
+        flock.announce();          // tell everyone who their successor is
         return;
       }
       if (!bird) return;
-      if (m.t === 'signal') bird.onSignal(m.data);
+      if (m.t === 'signal') {
+        // `to` means bird->bird: we are only the introducer, exactly the role
+        // PeerJS plays for swarmllm. No `to` means it is meant for us.
+        if (m.to) {
+          const dst = flock.byPeer(m.to);
+          if (dst?.ws) dst.ws.send(JSON.stringify(
+            {t: 'signal', from: bird.peerId, data: m.data}));
+        } else {
+          bird.onSignal(m.data);
+        }
+      }
       else if (m.t === 'stats') { bird.lastMs = m.ms; bird.lastSeen = Date.now(); }
+      // Whether this bird can hand off peer-to-peer decides how far the
+      // coordinator's chained wait should reach.
+      else if (m.t === 'forwards') bird.forwardsDirectly = !!m.direct;
       // note: transport is set from the send path in mesh.js, not from here --
       // what actually carried the frame is the only honest answer.
       else if (m.t === 'pull') bird.lastSeen = Date.now();
@@ -156,8 +170,9 @@ wss.on('connection', ws => {
   });
   ws.on('close', () => {
     if (!bird) return;
-    bird.ws = null;
-    if (!bird.chan) bird.transport = 'none';
+    // A refresh closes the websocket; the data channel it signalled is dead
+    // too, so tear the whole link down rather than leaving chan dangling.
+    if (bird.ws === ws) { bird.teardown(); flock.announce(); }
   });
 });
 
