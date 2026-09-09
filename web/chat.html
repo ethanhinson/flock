@@ -20,7 +20,7 @@
   input{flex:1;background:#0d1117;border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:12px;font:inherit;min-width:0}
   button{background:var(--hot);border:0;color:#fff;border-radius:8px;padding:12px 16px;font:inherit}
 </style>
-<header><h1>🕊 flock · mac + phone</h1><div class="sub" id="sub">…</div></header>
+<header><h1>🕊 flock</h1><div class="sub" id="sub">…</div></header>
 <div class="pipe" id="pipe"></div>
 <div id="out"></div><div id="log"></div>
 <form onsubmit="go(event)">
@@ -31,17 +31,18 @@
 const $=id=>document.getElementById(id);
 async function poll(){
   const s=await (await fetch('/status')).json();
-  const cells=[`<div class="n" id="mac"><b>💻 mac</b><div>layers ${s.mac_layers}</div><div id="macms">idle</div></div>`];
-  s.peers.forEach(p=>{
+  const cells=[`<div class="n" id="mac"><b>💻 coordinator</b><div>layers ${s.coord_layers}</div><div id="macms">idle</div></div>`];
+  s.birds.forEach(p=>{
     cells.push('<div class="arrow">→</div>');
     cells.push(`<div class="n${p.alive?'':' dead'}" id="p${p.slot}">`+
-      `<b>📱 ${p.label||'peer '+p.slot}</b><div>layers ${p.start}–${p.end}</div>`+
+      `<b>🕊 ${p.label||'bird '+p.slot}</b><div>layers ${p.start}–${p.end}</div>`+
+      `<div>${p.transport||''}</div>`+
       `<div id="pms${p.slot}">${p.alive?(p.last_ms?p.last_ms+' ms':'ready'):'waiting…'}</div></div>`);
   });
   $('pipe').innerHTML=cells.join('');
   $('sub').innerHTML=s.ready
-    ? `<span style="color:var(--ok)">${s.n_total} layers across ${s.peers.length+1} devices · kv cache ${s.kv_cache?'on':'off'}</span>`
-    : `<span style="color:var(--bad)">waiting for layers ${s.missing.join(', ')} — open /phone on each device</span>`;
+    ? `<span style="color:var(--ok)">${s.n_total} layers across ${s.birds.length+1} devices · kv cache ${s.kv_cache?'on':'off'} · wire ${s.wire}</span>`
+    : `<span style="color:var(--bad)">waiting for layers ${s.missing.join(', ')} — open /flock on each phone</span>`;
 }
 poll(); setInterval(poll,3000);
 
@@ -65,14 +66,14 @@ function go(e){
           const flash=(el,d)=>{if(!el)return;setTimeout(()=>{el.classList.add('live');
             setTimeout(()=>el.classList.remove('live'),100)},d)};
           flash($('mac'),0);
-          if($('macms')) $('macms').textContent=m.mac_ms+' ms';
-          m.peers.forEach((p,i)=>{
+          if($('macms')) $('macms').textContent=m.coord_ms+' ms';
+          m.birds.forEach((p,i)=>{
             flash($('p'+i),110*(i+1));
             const el=$('pms'+i); if(el) el.textContent=p.ms+' ms (on device GPU)';
           });
-          const chain=m.peers.map(p=>`${p.range} ${p.ms}ms`).join(' → ');
+          const chain=m.birds.map(p=>`${p.range} ${p.ms}ms${p.transport==='webrtc'?' ⚡':''}`).join(' → ');
           $('log').insertAdjacentHTML('afterbegin',
-            `<div>tok ${n} · mac ${m.mac_ms}ms → ${m.kb}KB → ${chain} · roundtrip ${m.roundtrip_ms}ms</div>`);
+            `<div>tok ${n} · coord ${m.coord_ms}ms → ${m.kb}KB f16 (${m.kb_json}KB as json) → ${chain} · roundtrip ${m.roundtrip_ms}ms</div>`);
         }
         if(m.type==='done'){
           const s=(Date.now()-t0)/1000;

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run.sh — start a 2-node swarm on this Mac, reachable from your phone.
+# run.sh — the Mac-only MLX demo: split a model across N local processes.
 #   ./run.sh          two nodes, 28 layers split 14/14
 #   ./run.sh 3        three nodes
 #   ./run.sh 2 remote add a second machine: see README
@@ -36,7 +36,7 @@ for i in $(seq 0 $((N-1))); do
   end=$(( i == N-1 ? LAYERS-1 : start + per - 1 ))
   port=$(( 8001 + i ))
   echo "node $i -> layers $start-$end on :$port"
-  $PY shard.py --start $start --end $end --port $port >"/tmp/flock-shard$i.log" 2>&1 &
+  $PY flock_mlx_shard.py --start $start --end $end --port $port >"/tmp/flock-shard$i.log" 2>&1 &
   SHARDS+=("$IP:$port")
 done
 
@@ -52,4 +52,4 @@ echo "  │  open on your PHONE (same wifi):           │"
 echo "  │    http://$IP:8000"
 echo "  └────────────────────────────────────────────┘"
 echo
-$PY swarm.py --shards "${SHARDS[@]}" --port 8000
+$PY flock_mlx_server.py --shards "${SHARDS[@]}" --port 8000

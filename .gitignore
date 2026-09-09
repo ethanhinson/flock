@@ -2,8 +2,7 @@
 web/*.onnx
 web/*.onnx.data
 web/shard*.json
-web/swarm.json
-web/phone_shard.json
+web/flock.json
 
 __pycache__/
 *.pyc

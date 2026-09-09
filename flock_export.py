@@ -1,6 +1,7 @@
 """
-export_phone_shard.py — carve N transformer layers out of a model and write an
-ONNX file the PHONE can run in its browser via ONNX Runtime Web + WebGPU.
+flock_export.py — carve N transformer layers out of a model and write an ONNX
+file a BIRD (a phone in the flock) can run in its browser via ONNX Runtime Web
++ WebGPU.
 
 Why ONNX and not MLX: MLX is Apple-native and can't run in Safari. ONNX Runtime
 Web ships a WebGPU backend, so the phone's GPU executes the same math your Mac
@@ -10,11 +11,11 @@ swarmllm.ai that costs thousands of lines).
 KV CACHE (--cache, default on):
 An ONNX graph is static, so a cache can't live inside it as hidden state. We
 make it explicit: past K/V come in as inputs, new K/V go out as outputs, and
-the caller (the phone JS) holds them between steps. That turns each decode step
+the caller (the bird's JS) holds them between steps. That turns each decode step
 from "re-run the whole sequence" into "run one token", which is the difference
 between O(n^2) and O(n) work over a generation.
 
-Run:  python3 export_phone_shard.py --start 24 --end 27
+Run:  python3 flock_export.py --start 24 --end 27
 """
 import argparse, json, os
 import torch
@@ -24,7 +25,7 @@ p = argparse.ArgumentParser()
 p.add_argument("--model", default="Qwen/Qwen3-0.6B")
 p.add_argument("--start", type=int, default=24)
 p.add_argument("--end", type=int, default=27)
-p.add_argument("--out", default="web/phone_shard.onnx")
+p.add_argument("--out", default="web/shard0.onnx")
 p.add_argument("--peers", type=int, default=1,
                help="split the range across N devices (one .onnx each)")
 p.add_argument("--no-cache", dest="cache", action="store_false",
@@ -62,11 +63,11 @@ class OneLayerCache:
         return k, v
 
 
-class PhoneShard(torch.nn.Module):
+class BirdShard(torch.nn.Module):
     """Stateless slice: hidden state in, hidden state out.
 
     With --cache the past/new K/V tensors ride along as explicit graph inputs
-    and outputs, so the phone keeps the conversation state for its own layers.
+    and outputs, so the bird keeps the conversation state for its own layers.
     Nobody holds the whole model's cache -- it's sharded exactly like the
     weights are.
     """
@@ -101,12 +102,12 @@ class PhoneShard(torch.nn.Module):
         # NOTE: we deliberately stop before the vocab projection. lm_head is
         # 151936x1024 (~600MB fp32) and is TIED to the embedding matrix the Mac
         # already holds -- shipping it to the phone would quadruple the download
-        # to buy nothing. The phone returns a hidden state; the Mac projects it.
+        # to buy nothing. A bird returns a hidden state; the coordinator projects it.
         hidden = self.norm(hidden) if self.is_last else hidden
         return (hidden, *outs) if self.use_cache else hidden
 
 
-shard = PhoneShard(layers, model.model.rotary_emb, model.model.norm,
+shard = BirdShard(layers, model.model.rotary_emb, model.model.norm,
                    is_last, args.cache).eval()
 
 H, KVH, HD = cfg.hidden_size, cfg.num_key_value_heads, cfg.head_dim
@@ -155,10 +156,10 @@ _onnx.save(_m, args.out, save_as_external_data=True, all_tensors_to_one_file=Tru
 
 mb = (os.path.getsize(args.out) +
       (os.path.getsize(args.out + ".data") if os.path.exists(args.out + ".data") else 0)) / 1e6
-print(f"wrote {args.out}  ({mb:.0f} MB total -> this is your phone download)")
+print(f"wrote {args.out}  ({mb:.0f} MB total -> this is the per-bird download)")
 print(f"wrote {meta_path}  {meta}")
 
-# --- verify the ONNX graph matches torch, so the phone can't be silently wrong
+# --- verify the ONNX graph matches torch, so a bird can't be silently wrong
 import onnxruntime as ort, numpy as np
 sess = ort.InferenceSession(args.out, providers=["CPUExecutionProvider"])
 feed = {"hidden": dummy_h.numpy(), "position_ids": dummy_p.numpy().astype(np.int64)}
