@@ -53,12 +53,22 @@ $('sub').innerHTML = hasGPU
   : '<span class="bad">no WebGPU — will fall back to CPU/wasm (slower)</span>';
 
 // 2. Pull our slice of the model. This is the ONLY big download.
+// Claim a slot FIRST -- the coordinator decides which layers we own, so two
+// phones joining the same swarm get different slices automatically.
+let peerId = localStorage.getItem('flock_peer') || null;
 (async () => {
-  meta = await (await fetch('/phone_shard.json')).json();
+  const j = await (await fetch('/join', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({peer_id: peerId, label: navigator.platform || 'phone'}),
+  })).json();
+  if (j.error) { log(j.error, 'bad'); return; }
+  meta = j; peerId = j.peer_id;
+  localStorage.setItem('flock_peer', peerId);
   $('layers').textContent = `${meta.start}–${meta.end} of ${meta.n_total}`;
-  log(`fetching my ${meta.end - meta.start + 1} layers…`);
+  log(`joined as peer ${meta.slot} — I own layers ${meta.start}–${meta.end}`, 'ok');
+  log(`fetching my ${meta.n_layers} layers…`);
   const t0 = performance.now();
-  const buf = await (await fetch('/phone_shard.onnx')).arrayBuffer();
+  const buf = await (await fetch(`/shard/${meta.slot}.onnx`)).arrayBuffer();
   log(`got ${(buf.byteLength/1e6).toFixed(0)}MB in ${((performance.now()-t0)/1000).toFixed(1)}s`, 'ok');
 
   // The weights live in a SEPARATE .data sidecar. ORT Web will not go looking
@@ -66,13 +76,13 @@ $('sub').innerHTML = hasGPU
   // loads with no weights and session creation fails.
   log('fetching weights (252MB, one time)…');
   const t1 = performance.now();
-  const wbuf = await (await fetch('/phone_shard.onnx.data')).arrayBuffer();
+  const wbuf = await (await fetch(`/shard/${meta.slot}.onnx.data`)).arrayBuffer();
   log(`weights ${(wbuf.byteLength/1e6).toFixed(0)}MB in ${((performance.now()-t1)/1000).toFixed(1)}s`, 'ok');
 
   const providers = hasGPU ? ['webgpu','wasm'] : ['wasm'];
   session = await ort.InferenceSession.create(buf, {
     executionProviders: providers,
-    externalData: [{path: 'phone_shard.onnx.data', data: new Uint8Array(wbuf)}],
+    externalData: [{path: `shard${meta.slot}.onnx.data`, data: new Uint8Array(wbuf)}],
   });
   $('backend').textContent = hasGPU ? 'webgpu' : 'wasm';
   log('model ready — tap join', 'ok');
@@ -86,7 +96,9 @@ async function loop() {
   while (running) {
     let job;
     try {
-      const r = await fetch('/work', {method:'POST'});
+      const r = await fetch('/work', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({peer_id: peerId})});
       if (r.status === 204) {                  // no work right now, ask again
         $('sub').innerHTML = `<span class="ok">idle · polled ${new Date()
           .toLocaleTimeString()}</span>`;
@@ -128,7 +140,8 @@ async function loop() {
     const ms = (performance.now() - t0).toFixed(1);
     await fetch('/result', {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({id: job.id, output: Array.from(out.output.data), ms: +ms}),
+      body: JSON.stringify({peer_id: peerId, id: job.id,
+                            output: Array.from(out.output.data), ms: +ms}),
     });
 
     count++; $('count').textContent = count; $('ms').textContent = ms + ' ms';

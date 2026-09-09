@@ -54,8 +54,15 @@ download in full.
 
 ```bash
 pip install -r requirements-phone.txt
-python3 export_phone_shard.py --start 24 --end 27   # once, ~252MB ONNX
+python3 build_shards.py --start 24 --end 27 --peers 1   # once, ~252MB ONNX
 python3 swarm_phone.py
+```
+
+Two phones? `--peers 2` splits the same range in half (126MB each) and each
+device claims a free slot when it joins:
+
+```bash
+python3 build_shards.py --start 24 --end 27 --peers 2
 ```
 
 - **phone** → `http://<mac-ip>:8000/phone` → tap **join the swarm**
@@ -78,6 +85,21 @@ layer split without a second device — but note it is **not** a distributed
 test: one GPU, loopback traffic.
 
 ---
+
+## The KV cache is sharded too
+
+Each device caches K/V for **only its own layers**, so conversation state is
+sharded exactly like the weights are — no single device holds all of it.
+
+An ONNX graph is static, so the phone's cache can't live inside it as hidden
+state. Past K/V come in as explicit graph inputs, new K/V go out as outputs,
+and the phone's JS holds them between steps. Measured effect per decode step:
+
+```
+              before          after
+wire      64→100KB growing    flat 4.0KB
+mac ms         ~81             ~28
+```
 
 ## Design decisions worth understanding
 
@@ -105,18 +127,16 @@ so a phone can't be silently wrong.
 
 Read these before drawing conclusions from it.
 
-- **No KV cache on the phone.** Each step re-runs the whole sequence — watch
-  `wire KB` climb 64 → 68 → 72 → 100 as it generates. This is why it slows as
-  output lengthens. Fixing it is ~10x faster and ~80 more lines on both sides;
-  it was left out to keep the phone client ~150 readable lines.
 - **This is slower than either device alone.** Pipeline parallelism buys
   capacity, not throughput. Only one node computes at a time. That is the
   single most misunderstood thing about distributed inference, and you can feel
   it here in ~30 seconds.
 - **Flask dev servers, no auth, no TLS, no input validation.** LAN-only toy.
   Do not expose to the internet.
-- **No fault tolerance.** Kill any node and generation stops. Real P2P swarms
-  re-shard on peer loss, which is most of their actual complexity.
+- **No re-sharding on peer loss.** If a device leaves, generation stops with a
+  message naming the uncovered layers, and resumes when *some* device claims
+  that slot. It does not redistribute those layers onto the survivors — that
+  redistribution is most of the real complexity in production P2P swarms.
 - **fp32 weights.** No quantization on the phone shard, so the download is
   bigger than it needs to be.
 - **Single conversation, no batching, no concurrency.**
@@ -127,7 +147,8 @@ Read these before drawing conclusions from it.
 
 | file | role |
 |---|---|
-| `export_phone_shard.py` | carves N layers into ONNX for the phone; verifies vs PyTorch |
+| `build_shards.py` | splits a layer range across N devices, writes `web/swarm.json` |
+| `export_phone_shard.py` | carves one layer range into ONNX; verifies vs PyTorch |
 | `swarm_phone.py` | Mac side: embedding, layers 0–23, vocab projection, SSE chat |
 | `phone_bridge.py` | work queue that lets a browser act as a pipeline peer |
 | `web/phone.html` | the phone node — ONNX Runtime Web on WebGPU |
@@ -136,9 +157,11 @@ Read these before drawing conclusions from it.
 
 ## Things to try
 
-- Move the split: `--start 20 --end 27` gives the phone 8 layers — watch it
+- Move the split: `--start 20 --end 27` gives the phones 8 layers — watch them
   become the bottleneck.
-- Kill a node mid-generation and see the swarm stop.
+- Kill a peer mid-generation: the swarm reports exactly which layers are
+  uncovered, and recovers when a device claims that slot.
+- Export with `--no-cache` and compare `wire KB` growth against the cached run.
 - Compare `./run.sh 2` vs `./run.sh 3` tok/s. It gets *slower*.
 
 ## Prior art

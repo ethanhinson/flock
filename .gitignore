@@ -1,6 +1,8 @@
-# Build artifacts — regenerate with export_phone_shard.py
+# Build artifacts — regenerate with build_shards.py
 web/*.onnx
 web/*.onnx.data
+web/shard*.json
+web/swarm.json
 web/phone_shard.json
 
 __pycache__/

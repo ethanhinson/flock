@@ -16,16 +16,17 @@ import json, os, time, threading
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from flask import Flask, request, Response, send_from_directory, jsonify
-from phone_bridge import PhoneNode, register
+from phone_bridge import Swarm, register
 
-if not os.path.exists("web/phone_shard.json"):
+if not os.path.exists("web/swarm.json"):
     raise SystemExit(
-        "No phone shard found. Build one first:\n"
-        "    python3 export_phone_shard.py --start 24 --end 27")
+        "No shards found. Build them first:\n"
+        "    python3 build_shards.py --start 24 --end 27 --peers 1")
 
-META = json.load(open("web/phone_shard.json"))
+META = json.load(open("web/swarm.json"))
 MODEL = META["model"]
-CUT = META["start"]                     # phone owns CUT..n_total-1
+RANGES = [(p["start"], p["end"]) for p in META["peers"]]
+CUT = RANGES[0][0]                      # peers own CUT..n_total-1
 USE_CACHE = META.get("kv_cache", False)
 
 print(f"loading {MODEL} on the Mac (layers 0-{CUT-1}) ...")
@@ -37,12 +38,13 @@ mac_layers = full.model.layers[:CUT]
 full.model.layers = torch.nn.ModuleList(mac_layers)
 embed, rotary, lm_head = full.model.embed_tokens, full.model.rotary_emb, full.lm_head
 HEAD_DIM = full.config.head_dim
-print(f"Mac holds layers 0-{CUT-1}; phone will hold {CUT}-{META['end']}")
+print(f"Mac holds layers 0-{CUT-1}; peers hold " +
+      ", ".join(f"{s}-{e}" for s, e in RANGES))
 print(f"kv cache: {'ON' if USE_CACHE else 'OFF (re-runs whole sequence each step)'}")
 
-phone = PhoneNode(META)
+swarm = Swarm(RANGES)
 app = Flask(__name__, static_folder="web")
-register(app, phone)
+register(app, swarm, META)
 
 
 class MacCache:
@@ -113,12 +115,15 @@ def chat():
     ids = [int(i) for i in ids]
 
     def stream():
-        if not phone.is_alive():
-            yield sse({"type": "error", "text": "no phone connected — open /phone on your phone and tap join"})
+        if not swarm.ready():
+            yield sse({"type": "error", "text":
+                       "waiting for peers to cover layers " +
+                       ", ".join(swarm.missing()) +
+                       " — open /phone on each device and tap join"})
             return
         out_ids = []
         caches = [MacCache() for _ in full.model.layers] if USE_CACHE else None
-        phone.reset()                                # clear the phone's K/V too
+        swarm.reset()                                # clear every peer's K/V too
         step_ids, offset = ids, 0                    # prefill: the whole prompt
         for step in range(max_new):
             t0 = time.perf_counter()
@@ -126,20 +131,25 @@ def chat():
             mac_ms = (time.perf_counter() - t0) * 1000
 
             t1 = time.perf_counter()
+            # The activation hops through every peer in layer order. This loop
+            # is the whole pipeline: one device's output is the next one's input.
+            flat, peer_stats = h.flatten().tolist(), []
             try:
-                r = phone.call(h.flatten().tolist(), offset=offset)  # -> PHONE's 4 layers
-            except TimeoutError:
-                yield sse({"type": "error", "text":
-                           "phone stopped responding mid-generation — is the screen "
-                           "still on and the tab in front?"})
+                for node in swarm.nodes:
+                    r = node.call(flat, offset=offset)
+                    flat = r["output"]
+                    peer_stats.append({"range": f"{node.start}-{node.end}",
+                                       "ms": r["ms"], "label": node.label})
+            except TimeoutError as e:
+                yield sse({"type": "error", "text": str(e)})
                 return
             net_ms = (time.perf_counter() - t1) * 1000
 
-            h2 = torch.tensor(r["output"], dtype=torch.float32).view(1, len(step_ids), -1)
+            h2 = torch.tensor(flat, dtype=torch.float32).view(1, len(step_ids), -1)
             nxt = project(h2[:, -1])                 # Mac projects to vocab
 
             yield sse({"type": "hop", "mac_ms": round(mac_ms, 1),
-                       "phone_ms": r["ms"], "roundtrip_ms": round(net_ms, 1),
+                       "peers": peer_stats, "roundtrip_ms": round(net_ms, 1),
                        "kb": round(h.numel() * 4 / 1024, 1)})
             if nxt in (tok.eos_token_id,):
                 break
@@ -167,11 +177,11 @@ def index():
 
 @app.get("/status")
 def status():
-    return jsonify({"phone_connected": phone.is_alive(),
+    return jsonify({"ready": swarm.ready(), "missing": swarm.missing(),
                     "mac_layers": f"0-{CUT-1}",
-                    "phone_layers": f"{META['start']}-{META['end']}",
+                    "peers": [n.info() for n in swarm.nodes],
                     "n_total": META["n_total"], "hidden": META["hidden"],
-                    "phone_last_ms": phone.last_ms})
+                    "kv_cache": USE_CACHE})
 
 
 if __name__ == "__main__":

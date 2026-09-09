@@ -25,6 +25,8 @@ p.add_argument("--model", default="Qwen/Qwen3-0.6B")
 p.add_argument("--start", type=int, default=24)
 p.add_argument("--end", type=int, default=27)
 p.add_argument("--out", default="web/phone_shard.onnx")
+p.add_argument("--peers", type=int, default=1,
+               help="split the range across N devices (one .onnx each)")
 p.add_argument("--no-cache", dest="cache", action="store_false",
                help="export the simple stateless graph (slower, easier to read)")
 args = p.parse_args()
@@ -141,7 +143,8 @@ meta = {"start": args.start, "end": args.end, "hidden": H, "n_layers": n_my,
         "kv_heads": KVH, "head_dim": HD, "kv_cache": args.cache,
         "needs_lm_head": is_last, "is_last": is_last,
         "n_total": cfg.num_hidden_layers, "model": args.model}
-json.dump(meta, open("web/phone_shard.json", "w"), indent=2)
+meta_path = args.out.replace(".onnx", ".json")
+json.dump(meta, open(meta_path, "w"), indent=2)
 
 # The legacy tracer embeds weights inline; split them into the .data sidecar so
 # the graph file stays small and the phone can stream weights separately.
@@ -153,7 +156,7 @@ _onnx.save(_m, args.out, save_as_external_data=True, all_tensors_to_one_file=Tru
 mb = (os.path.getsize(args.out) +
       (os.path.getsize(args.out + ".data") if os.path.exists(args.out + ".data") else 0)) / 1e6
 print(f"wrote {args.out}  ({mb:.0f} MB total -> this is your phone download)")
-print(f"wrote web/phone_shard.json  {meta}")
+print(f"wrote {meta_path}  {meta}")
 
 # --- verify the ONNX graph matches torch, so the phone can't be silently wrong
 import onnxruntime as ort, numpy as np

@@ -11,6 +11,7 @@
   .pipe{display:flex;gap:8px;padding:14px 16px;align-items:center}
   .n{flex:1;border:1px solid var(--line);border-radius:9px;padding:10px;transition:.12s}
   .n.live{border-color:var(--hot);background:#0d2137}
+  .n.dead{opacity:.45;border-style:dashed}
   .n b{font-size:12px}.n div{color:var(--dim);font-size:11px;margin-top:2px}
   .arrow{color:var(--dim);font-size:18px}
   #out{padding:0 16px;white-space:pre-wrap;min-height:20vh}
@@ -20,11 +21,7 @@
   button{background:var(--hot);border:0;color:#fff;border-radius:8px;padding:12px 16px;font:inherit}
 </style>
 <header><h1>🕊 flock · mac + phone</h1><div class="sub" id="sub">…</div></header>
-<div class="pipe">
-  <div class="n" id="mac"><b>💻 mac</b><div id="macl">—</div><div id="macms">idle</div></div>
-  <div class="arrow">→</div>
-  <div class="n" id="ph"><b>📱 phone</b><div id="phl">—</div><div id="phms">idle</div></div>
-</div>
+<div class="pipe" id="pipe"></div>
 <div id="out"></div><div id="log"></div>
 <form onsubmit="go(event)">
   <input id="q" value="What is the capital of France?" autocomplete="off">
@@ -34,11 +31,17 @@
 const $=id=>document.getElementById(id);
 async function poll(){
   const s=await (await fetch('/status')).json();
-  $('macl').textContent='layers '+s.mac_layers;
-  $('phl').textContent='layers '+s.phone_layers;
-  $('sub').innerHTML=s.phone_connected
-    ? `<span style="color:var(--ok)">phone connected · ${s.n_total} layers split across 2 devices</span>`
-    : `<span style="color:var(--bad)">no phone — open /phone on your phone and tap join</span>`;
+  const cells=[`<div class="n" id="mac"><b>💻 mac</b><div>layers ${s.mac_layers}</div><div id="macms">idle</div></div>`];
+  s.peers.forEach(p=>{
+    cells.push('<div class="arrow">→</div>');
+    cells.push(`<div class="n${p.alive?'':' dead'}" id="p${p.slot}">`+
+      `<b>📱 ${p.label||'peer '+p.slot}</b><div>layers ${p.start}–${p.end}</div>`+
+      `<div id="pms${p.slot}">${p.alive?(p.last_ms?p.last_ms+' ms':'ready'):'waiting…'}</div></div>`);
+  });
+  $('pipe').innerHTML=cells.join('');
+  $('sub').innerHTML=s.ready
+    ? `<span style="color:var(--ok)">${s.n_total} layers across ${s.peers.length+1} devices · kv cache ${s.kv_cache?'on':'off'}</span>`
+    : `<span style="color:var(--bad)">waiting for layers ${s.missing.join(', ')} — open /phone on each device</span>`;
 }
 poll(); setInterval(poll,3000);
 
@@ -59,12 +62,17 @@ function go(e){
         if(m.type==='error') $('out').innerHTML=`<span style="color:var(--bad)">${m.text}</span>`;
         if(m.type==='hop'){
           n++;
-          $('mac').classList.add('live'); setTimeout(()=>$('mac').classList.remove('live'),100);
-          setTimeout(()=>{$('ph').classList.add('live');setTimeout(()=>$('ph').classList.remove('live'),100)},110);
-          $('macms').textContent=m.mac_ms+' ms';
-          $('phms').textContent=m.phone_ms+' ms (on phone GPU)';
+          const flash=(el,d)=>{if(!el)return;setTimeout(()=>{el.classList.add('live');
+            setTimeout(()=>el.classList.remove('live'),100)},d)};
+          flash($('mac'),0);
+          if($('macms')) $('macms').textContent=m.mac_ms+' ms';
+          m.peers.forEach((p,i)=>{
+            flash($('p'+i),110*(i+1));
+            const el=$('pms'+i); if(el) el.textContent=p.ms+' ms (on device GPU)';
+          });
+          const chain=m.peers.map(p=>`${p.range} ${p.ms}ms`).join(' → ');
           $('log').insertAdjacentHTML('afterbegin',
-            `<div>tok ${n} · mac ${m.mac_ms}ms → ${m.kb}KB over wifi → phone ${m.phone_ms}ms · roundtrip ${m.roundtrip_ms}ms</div>`);
+            `<div>tok ${n} · mac ${m.mac_ms}ms → ${m.kb}KB → ${chain} · roundtrip ${m.roundtrip_ms}ms</div>`);
         }
         if(m.type==='done'){
           const s=(Date.now()-t0)/1000;
