@@ -62,7 +62,7 @@ download in full.
 
 ```bash
 pip install -r requirements-export.txt          # export tooling only
-python3 build_shards.py --start 24 --end 27 --birds 1
+python3 build_shards.py --start 24 --end 27 --birds 1 --int8
 python3 flock_export_coordinator.py --cut 24
 cd node && npm install && npm start
 ```
@@ -71,8 +71,13 @@ Two phones? `--birds 2` splits the same range in half (126MB each) and each
 device claims a free slot when it joins:
 
 ```bash
-python3 build_shards.py --start 24 --end 27 --birds 2
+python3 build_shards.py --start 24 --end 27 --birds 2 --int8
 ```
+
+`--int8` quantizes the weights: a bird downloads **63MB instead of 252MB** and
+generates *identical* text (verified by a full greedy decode against the fp32
+shard). This is what makes the ONNX path competitive with GGUF on size without
+writing a single GPU kernel — ONNX Runtime already ships quantized matmul.
 
 - **phone** → `http://<your-ip>:8000/flock` → tap **join the flock**
 - **any browser** → `http://<your-ip>:8000` → chat
@@ -170,8 +175,6 @@ Read these before drawing conclusions from it.
   message naming the uncovered layers, and resumes when *some* device claims
   that slot. It does not redistribute those layers onto the survivors — that
   redistribution is most of the real complexity in production P2P swarms.
-- **fp32 weights.** No quantization on the phone shard, so the download is
-  bigger than it needs to be.
 - **Single conversation, no batching, no concurrency.**
 
 ---

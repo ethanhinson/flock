@@ -14,6 +14,8 @@ p.add_argument("--model", default="Qwen/Qwen3-0.6B")
 p.add_argument("--start", type=int, default=24)
 p.add_argument("--end", type=int, default=27)
 p.add_argument("--birds", type=int, default=1)
+p.add_argument("--int8", action="store_true",
+               help="quantize weights: ~4x smaller per-bird download")
 a = p.parse_args()
 
 total = a.end - a.start + 1
@@ -32,8 +34,11 @@ os.makedirs("web", exist_ok=True)
 for i, (s, e) in enumerate(ranges):
     out = f"web/shard{i}.onnx"
     print(f"\n=== bird {i}: layers {s}-{e} -> {out} ===")
-    r = subprocess.run([sys.executable, "flock_export.py", "--model", a.model,
-                        "--start", str(s), "--end", str(e), "--out", out])
+    cmd = [sys.executable, "flock_export.py", "--model", a.model,
+           "--start", str(s), "--end", str(e), "--out", out]
+    if a.int8:
+        cmd.append("--int8")
+    r = subprocess.run(cmd)
     if r.returncode:
         sys.exit(f"export failed for peer {i}")
 
