@@ -12,6 +12,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@huggingface/gguf": "^0.4.6",
     "@huggingface/transformers": "^4.2.0",
     "express": "^5.2.1",
     "node-datachannel": "^0.33.3",
