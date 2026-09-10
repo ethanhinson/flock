@@ -58,9 +58,7 @@ download in full.
 
 ---
 
-## Two demos
-
-### 1. Coordinator + phones (the real distributed one)
+## Run it
 
 ```bash
 pip install -r requirements-export.txt          # export tooling only
@@ -83,17 +81,6 @@ Mac holds the embedding, layers 0–23, and the vocab projection. The phone hold
 layers 24–27 and the final norm, executed by **ONNX Runtime Web on WebGPU**
 (iOS 26+ enables WebGPU by default; older iOS falls back to WASM, slower but
 working — the page tells you which backend it got).
-
-### 2. Mac only, N processes (the concept, no phone needed)
-
-```bash
-uv tool install --with flask --with requests --with numpy mlx-lm
-./run.sh 2      # or ./run.sh 3
-```
-
-Splits Qwen3-1.7B across N local processes via MLX. Useful for seeing the
-layer split without a second device — but note it is **not** a distributed
-test: one GPU, loopback traffic.
 
 ---
 
@@ -157,6 +144,18 @@ so a phone can't be silently wrong.
 
 ---
 
+## Why there is any Python
+
+Only at build time, and only because there is no alternative: `torch.onnx.export`
+has no JavaScript equivalent. ONNX Runtime *runs* models in every language, but
+Python is the only thing that *produces* them from PyTorch weights.
+
+Keeping it also buys something real — PyTorch is the reference every exported
+graph is checked against (`max abs err ~1e-4` on every build), which is what
+catches an export that would otherwise produce plausible-looking garbage.
+
+Nothing Python runs at inference time. Export once, then `npm start`.
+
 ## Limitations
 
 Read these before drawing conclusions from it.
@@ -190,7 +189,6 @@ Read these before drawing conclusions from it.
 | `web/js/wire.js` | the f16 frame format — one copy, imported by node and browsers |
 | `web/bird.html` | a bird — ONNX Runtime Web on WebGPU |
 | `web/chat.html` | chat UI showing the per-token lap |
-| `flock_mlx_*.py` / `run.sh` | the Mac-only MLX demo |
 
 ## Things to try
 
@@ -199,7 +197,8 @@ Read these before drawing conclusions from it.
 - Kill a peer mid-generation: the swarm reports exactly which layers are
   uncovered, and recovers when a device claims that slot.
 - Export with `--no-cache` and compare `wire KB` growth against the cached run.
-- Compare `./run.sh 2` vs `./run.sh 3` tok/s. It gets *slower*.
+- Add a second device with `--birds 2` and watch tok/s go *down* — pipeline
+  parallelism buys capacity, not speed.
 
 ## Prior art
 
