@@ -4,7 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "test": "node test/gguf.test.mjs",
+    "plan": "node plan.mjs"
   },
   "keywords": [],
   "author": "",
