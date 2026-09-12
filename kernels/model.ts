@@ -43,7 +43,10 @@ import {
   attnSource, coopSource, probeUnpack, probeUnpackF16, splitQ8, storageBuffer,
   uniformBuffer,
 } from "./lib.ts";
-import { Layer, QWEN3_06B, type LayerConfig, type LayerWeights } from "./layer.ts";
+import {
+  Layer, QWEN3_06B, wgslSource, type GpuTensor, type LayerBuffers,
+  type LayerConfig, type LayerWeights,
+} from "./layer.ts";
 import type { RealModel } from "./real_weights.ts";
 
 const ROWS_PER_WG = 4;      // must match q8_coop.wgsl
@@ -72,15 +75,42 @@ export class Model {
   private pipeKey = new Map<GPUComputePipeline, string>();
   /** Absolute position of the next token; the KV cache length. */
   pos = 0;
+  /** How many layers this instance actually holds; `nLayers` unless cut. */
+  held = 0;
 
   private constructor(dev: GPUDevice, cfg: ModelConfig) {
     this.dev = dev;
     this.cfg = cfg;
   }
 
+  /**
+   * Build the model, optionally holding only the FIRST `cut` layers.
+   *
+   * `cut` is what makes this class serve as flock's coordinator as well as the
+   * whole-model engine the tests validate. The coordinator holds the embedding,
+   * layers 0..cut-1, output_norm and the tied head; the birds hold layers
+   * cut..n-1 and send the hidden state back. So the coordinator is this same
+   * Model with the middle removed, driven through `encodePartial()` and
+   * `projectHidden()` instead of `step()`.
+   *
+   * Deliberately the same class rather than a second engine: the pieces the
+   * coordinator needs -- the embedding gather, output_norm placement, the tied
+   * projection, the argmax -- are exactly the pieces test_model.ts validates token
+   * for token against ONNX. A separate coordinator engine would be a copy of all
+   * of that with none of the proof.
+   *
+   * Only the layers actually held are uploaded, so a cut-24 coordinator spends
+   * ~430 MB on layers instead of ~500 MB, plus the 155.6 MB tied matrix it needs
+   * either way for the embedding and the head.
+   */
   static async create(
     dev: GPUDevice, m: RealModel, base: LayerConfig = QWEN3_06B,
+    opts: { cut?: number } = {},
   ): Promise<Model> {
+    const cut = opts.cut ?? m.nLayers;
+    if (!Number.isInteger(cut) || cut < 0 || cut > m.nLayers) {
+      throw new Error(`cut ${cut} is not in 0..${m.nLayers}`);
+    }
     const cfg: ModelConfig = { ...base, vocab: m.vocab, nLayers: m.nLayers };
     if (m.hidden !== cfg.hidden) {
       throw new Error(`model hidden ${m.hidden} != config ${cfg.hidden}`);
@@ -91,7 +121,7 @@ export class Model {
     const M = new Model(dev, cfg);
     const unpack8 = await probeUnpack(dev);
     const unpackF16 = await probeUnpackF16(dev);
-    const src = (f: string) => Deno.readTextFile(new URL("./" + f, import.meta.url));
+    const src = wgslSource;
     const mk = (code: string, entryPoint = "main") => dev.createComputePipeline({
       layout: "auto", compute: { module: dev.createShaderModule({ code }), entryPoint },
     });
@@ -149,9 +179,10 @@ export class Model {
     M.buf.dAm1 = uniformBuffer(dev, [cfg.vocab, ARGMAX_GROUPS, 0, 0]);
     M.buf.dAm2 = uniformBuffer(dev, [ARGMAX_GROUPS, ARGMAX_GROUPS, 0, 0]);
 
-    for (let i = 0; i < m.nLayers; i++) {
+    for (let i = 0; i < cut; i++) {
       M.layers.push(await Layer.create(dev, m.layers[i], cfg));
     }
+    M.held = cut;
     return M;
   }
 
@@ -337,6 +368,80 @@ export class Model {
   async hiddenState(ids: number[]): Promise<Float32Array> {
     this.encodeTokens(ids);
     return await this.readF32(this.buf.lastRow, this.cfg.hidden);
+  }
+
+  // ------------------------------------------------------ the coordinator's half
+  //
+  // flock splits the model across devices: this process holds the embedding and
+  // layers 0..cut-1, the birds hold the rest, and the hidden state makes one lap
+  // per token. That needs the forward pass broken in two, at the cut -- which is
+  // the ONE place the sharded engine differs from the whole-model one, so both
+  // halves below are thin wrappers over the same encodeTokens/encodeHead the
+  // token-for-token ONNX comparison already covers.
+  //
+  // The KV cache lives where its layers live: `this.pos` tracks only these layers,
+  // and each bird tracks its own. Nothing here has to know that.
+
+  /**
+   * Embedding + the layers this instance holds, for EVERY position, not just the
+   * last.
+   *
+   * Returns `n * hidden` floats, because the next device in the chain needs every
+   * position's hidden state to fill its own KV cache -- unlike the whole-model
+   * path, where only the last row is projected and the rest exist to fill the
+   * cache locally. So this reads back the full prefill rather than `lastRow`.
+   *
+   * One readback per lap, which is what the wire costs anyway.
+   */
+  async encodePartial(ids: number[], offset?: number): Promise<Float32Array> {
+    if (offset !== undefined && offset !== this.pos) {
+      // A mismatch means the caller's idea of the conversation and this cache have
+      // diverged -- continuing would compute against keys for other positions,
+      // which is silently wrong text rather than an error.
+      throw new Error(
+        `offset ${offset} does not match this cache's position ${this.pos}`);
+    }
+    const n = ids.length;
+    if (n > this.cfg.maxPrefill) {
+      throw new Error(
+        `a lap of ${n} tokens exceeds maxPrefill ${this.cfg.maxPrefill}`);
+    }
+    this.encodeTokens(ids);
+    // The layers' output, all n rows. encodeTokens chunks at maxPrefill and leaves
+    // the LAST chunk in the final layer's output buffer, which is why n is capped
+    // above rather than chunked here: a partial forward has to hand back every row.
+    const last = this.layers[this.layers.length - 1];
+    return await this.readF32(last.outputBuffer(), n * this.cfg.hidden);
+  }
+
+  /**
+   * A hidden state that came back from the birds -> the next token id.
+   *
+   * This is output_norm, the tied projection and the argmax -- the same
+   * `encodeHead` the whole-model path uses, fed from the wire instead of from a
+   * local layer. `seq` rows arrive and the LAST one is projected, because that is
+   * the position whose next token is being predicted.
+   *
+   * The final RMSNorm is applied HERE, exactly once. Worth restating because the
+   * ONNX pipeline this replaces put it somewhere else entirely -- in the last
+   * SHARD, not in head.onnx (see the note at the top of this file) -- so a port
+   * that copied the ONNX layout would either double it or drop it, and both are
+   * fluent wrong text rather than a crash.
+   */
+  async projectHidden(flat: Float32Array, seq: number): Promise<number> {
+    const H = this.cfg.hidden;
+    if (flat.length < seq * H) {
+      throw new Error(`hidden state is ${flat.length} floats, want ${seq * H}`);
+    }
+    // Only the last row is projected. Copied out rather than viewed: writeBuffer
+    // ignores a view's byteOffset on this backend, which lands the WRONG row
+    // silently -- see writeView in layer.ts, the same trap.
+    const lastRow = flat.slice((seq - 1) * H, seq * H);
+    this.dev.queue.writeBuffer(this.buf.lastRow, 0, lastRow);
+    const enc = this.dev.createCommandEncoder();
+    this.encodeHead(enc);
+    this.dev.queue.submit([enc.finish()]);
+    return (await this.readU32(this.buf.tokIdx, 1))[0];
   }
 
   /** The last position's hidden state AFTER output_norm, before the projection. */

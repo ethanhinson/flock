@@ -111,9 +111,9 @@
 <div class="foot"><a href="/">← chat with the flock</a></div>
 
 <script type="module">
-import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.min.mjs';
 import {pack, unpack} from '/js/wire.mjs';
-ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
+import {loadBirdWeights} from '/js/gguf-stream.mjs';
+import {Layer, QWEN3_06B} from '/kernels/layer.ts.js';
 
 const $ = id => document.getElementById(id);
 const log = (m, cls = '') => {
@@ -128,12 +128,14 @@ const set = (id, v, cls) => {
   n.className = 'v' + (cls ? ' ' + cls : '');
 };
 
-let session = null, meta = null, running = false, count = 0, past = null;
+// `layers` are this bird's Layer objects, in order, each holding its own slice of
+// the K/V cache on the GPU. There is no session and no `past`: the cache lives in
+// device memory inside the layers, which is why nothing here marshals tensors.
+let device = null, layers = null, meta = null, running = false, count = 0;
+let cachedTokens = 0;
 let ws = null, chan = null, inChan = null, chain = null;
 let rtc = null;      // link FROM the coordinator (or previous bird)
 let outRtc = null;   // link TO the next bird, if we have a successor
-const empty = () => new ort.Tensor('float32', new Float32Array(0),
-                                   [1, meta.kv_heads, 0, meta.head_dim]);
 
 /** A failure a person can act on, not a stack trace. */
 function problem(title, detail, fix) {
@@ -144,37 +146,12 @@ function problem(title, detail, fix) {
 }
 const clearProblem = () => $('problem').classList.remove('on');
 
-// --- shard cache (IndexedDB; works over plain http, unlike the Cache API) ---
-function idbOpen() {
-  return new Promise(res => {
-    let req;
-    try { req = indexedDB.open('flock', 1); } catch { return res(null); }
-    req.onupgradeneeded = () => req.result.createObjectStore('shards');
-    req.onsuccess = () => res(req.result);
-    req.onerror = () => res(null);         // no cache is survivable
-  });
-}
-function idbGet(db, key) {
-  return new Promise(res => {
-    if (!db) return res(null);
-    try {
-      const r = db.transaction('shards').objectStore('shards').get(key);
-      r.onsuccess = () => res(r.result || null);
-      r.onerror = () => res(null);
-    } catch { res(null); }
-  });
-}
-function idbPut(db, key, val) {
-  return new Promise((res, rej) => {
-    if (!db) return res();
-    try {
-      const tx = db.transaction('shards', 'readwrite');
-      tx.objectStore('shards').put(val, key);
-      tx.oncomplete = () => res();
-      tx.onerror = () => rej(tx.error || new Error('idb write failed'));
-    } catch (e) { rej(e); }
-  });
-}
+// NOTE: there is no shard cache here any more. Caching is web/js/gguf-stream.mjs's
+// job now -- it stores the RAW GGUF byte ranges in IndexedDB, which is the same
+// artifact the reference path reads, so one cached thing serves both. (Still
+// IndexedDB and not the Cache API, for the same reason as before: `caches` only
+// exists in a secure context and a phone reaches the coordinator over plain
+// http:// on a LAN, so it is undefined there.)
 
 // Send diagnostics to the coordinator: a phone or tablet has no console we can
 // read, so failures have to travel back over HTTP to be debuggable at all.
@@ -187,14 +164,16 @@ async function report(stage, detail) {
   } catch {}
 }
 
-// What this device can do, named without reference to any particular runtime --
-// the engine behind it is expected to change.
+// WebGPU is now REQUIRED, not preferred. The layers are WGSL compute kernels, so
+// there is no CPU fallback to degrade to -- the previous wasm path was ONNX
+// Runtime's, and ONNX is gone from the inference path entirely. Saying so plainly
+// here beats failing later with a shader error.
 const hasGPU = !!navigator.gpu;
-const capability = {gpu: hasGPU, backend: hasGPU ? 'webgpu' : 'wasm'};
+const capability = {gpu: hasGPU, backend: hasGPU ? 'webgpu' : 'none'};
 $('sub').innerHTML = hasGPU
   ? '<span class="ok">WebGPU available</span> — this device runs real transformer layers'
-  : '<span class="warn">no WebGPU</span> — falling back to CPU (works, slower)';
-set('backend', capability.backend, hasGPU ? 'ok' : 'warn');
+  : '<span class="bad">no WebGPU</span> — this device cannot be a bird';
+set('backend', capability.backend, hasGPU ? 'ok' : 'bad');
 
 // --- download progress ---------------------------------------------------
 function progress(what, at, total) {
@@ -251,169 +230,86 @@ let peerId = localStorage.getItem('flock_peer') || null;
                         (meta.n_layers === 1 ? '' : 's');
   log(`joined as bird ${meta.slot} — I own layers ${meta.start}–${meta.end}`, 'ok');
 
-  // Cache the shard so a refresh doesn't re-download 252MB.
+  // --- weights: streamed from the model host straight into GPU buffers -----
   //
-  // NOT the Cache API: `caches` only exists in a secure context, and a phone
-  // on a LAN reaches us over plain http://, so it is undefined there. IndexedDB
-  // has no such restriction and holds blobs of this size fine.
+  // A bird fetches its OWN layers by byte range out of a GGUF file that already
+  // sits on HuggingFace. There is no exported shard, no host build step, and the
+  // coordinator never moves 67MB per bird -- the split is just a choice about
+  // which byte ranges this device asks for, decided when it joined.
   //
-  // Weights live in a SEPARATE sidecar file — the runtime won't go looking for
-  // it on its own, so we hand it the bytes explicitly below.
-  const db = await idbOpen();
-  const pendingCache = [];
-  // Stream the response into ONE preallocated buffer instead of calling
-  // .arrayBuffer(), which materialises a second copy of the whole tensor and is
-  // what made an iPad run out of memory on a 126MB shard. Peak extra memory here
-  // is one network chunk, not one shard. (swarmllm does the same thing, staging
-  // ~4MB at a time straight into GPU buffers.)
-  async function grab(url, label) {
-    const hit = await idbGet(db, url);
-    if (hit) {
-      log(`${label} ${(hit.byteLength/1e6).toFixed(0)}MB from cache`, 'ok');
-      progress(label + ' (cached)', hit.byteLength, hit.byteLength);
-      return hit;
-    }
-    const t = performance.now();
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`${label} fetch failed: ${res.status}`);
-    const total = +res.headers.get('content-length') || 0;
-
-    let out;
-    if (total && res.body) {
-      out = new Uint8Array(total);           // exact size known: one allocation
-      let at = 0, lastPct = -1, lastWhole = -1;
-      const reader = res.body.getReader();
-      for (;;) {
-        const {value, done} = await reader.read();
-        if (done) break;
-        if (at + value.length > total) throw new Error(`${label}: longer than declared`);
-        out.set(value, at);
-        at += value.length;
-        const pct = Math.floor(at / total * 100);
-        // Only touch the DOM when the number a person would read changes: this
-        // loop runs ~1000 times for one shard, and a write per chunk competes
-        // with the very allocations we are being careful about.
-        if (pct !== lastWhole) { lastWhole = pct; progress(label, at, total); }
-        if (pct >= lastPct + 20) {
-          lastPct = pct;
-          log(`${label} ${pct}% (${(at/1e6).toFixed(0)}/${(total/1e6).toFixed(0)}MB)`);
-        }
-        // Yield so WebKit can hand buffers to the GPU process and reclaim pages
-        // before we ask for more -- without this a tight device still dies.
-        await new Promise(r => setTimeout(r, 0));
-      }
-      if (at !== total) throw new Error(`${label}: short read ${at}/${total}`);
-    } else {
-      progress(label, 0, 0);
-      out = new Uint8Array(await res.arrayBuffer());   // no content-length
-    }
-
-    const secs = (performance.now() - t) / 1000;
-    log(`${label} ${(out.byteLength/1e6).toFixed(0)}MB in ${secs.toFixed(1)}s`, 'ok');
-    pendingCache.push([url, out.buffer]);
-    return out.buffer;
+  // It STREAMS: each ~4MB chunk goes into its GPU buffer as it arrives, so peak
+  // JS heap is one staging chunk rather than one shard. That is the whole reason
+  // this path exists -- the old ONNX route held a 126MB shard in the heap while
+  // the runtime made its own copy, ~250MB peak, and that is what killed an iPad.
+  // See web/js/gguf-stream.mjs.
+  if (!hasGPU) {
+    problem('this device has no WebGPU',
+      'A bird runs transformer layers as WebGPU compute shaders, so there is ' +
+      'nothing to fall back to on this device.',
+      'Try a current Safari, Chrome or Edge. On iOS, WebGPU needs iOS 17 or newer.');
+    await report('no-webgpu', navigator.userAgent);
+    return;
+  }
+  if (!meta.gguf) {
+    problem('the coordinator did not say where the weights are',
+      'It sent no GGUF url, so there is nothing to download.',
+      'Restart the coordinator; it serves one by default.');
+    return;
   }
 
-  // Hand the runtime the bytes, then drop OUR reference immediately. Keeping
-  // `wbuf` alive alongside its own copy doubles peak usage for no benefit.
-  async function build(graph, weights, slot) {
-    const view = new Uint8Array(weights);
-    try {
-      return await ort.InferenceSession.create(graph, {
-        executionProviders: hasGPU ? ['webgpu', 'wasm'] : ['wasm'],
-        externalData: [{path: `shard${slot}.onnx.data`, data: view}],
-      });
-    } finally {
-      // Release the transferable so the GC can reclaim it while the runtime
-      // holds its own.
-      try { structuredClone(weights, {transfer: [weights]}); } catch {}
-    }
-  }
-  // --- GGUF weights, straight from the model host ------------------------
-  //
-  // The ONNX path below needs a host build step (export, quantize, write 63MB to
-  // disk per bird) and the coordinator then serves those bytes. The GGUF path
-  // needs neither: layer ranges are just byte ranges in a file already sitting on
-  // HuggingFace, so a bird range-fetches its own ~67MB directly and the split is
-  // decided at join time rather than baked into exported files.
-  //
-  // It runs ALONGSIDE the ONNX path, not instead of it, and deliberately so. The
-  // WGSL engine that will consume these buffers is still being finished, and the
-  // ONNX session is the reference it is validated against -- so flipping birds
-  // over before that engine lands would remove the only thing proving it right.
-  // What this does today is prove the LOADING is right on real hardware: it
-  // builds the GPU buffers, reports what they cost, and hands them to
-  // window.flockWeights for the engine to pick up.
-  //
-  // Gated on three things, all of which have to be true at once: a coordinator
-  // that handed out a GGUF url (FLOCK_GGUF), a device with WebGPU, and either
-  // ?gguf=1 or a remembered opt-in. Nothing here can break a bird that has none
-  // of them.
-  const wantGGUF = new URLSearchParams(location.search).get('gguf')
-                 ?? localStorage.getItem('flock_gguf');
-  if (meta.gguf && hasGPU && wantGGUF === '1') {
-    localStorage.setItem('flock_gguf', '1');
-    try {
-      const {loadBirdWeights} = await import('/js/gguf-stream.mjs');
-      const ad = await navigator.gpu.requestAdapter();
-      const device = await ad.requestDevice();
-      log(`streaming layers ${meta.start}–${meta.end} from GGUF…`, 'ok');
-      const t = performance.now();
-      const got = await loadBirdWeights(device, meta.gguf, meta.start, meta.end, {
-        onNote: m => log('gguf: ' + m),
-        // One DOM write per whole percent, not per staging chunk: this fires
-        // thousands of times for 67MB and a write per call competes with the
-        // very allocations the streaming is being careful about.
-        onProgress: (() => {
-          let lastPct = -1;
-          return p => {
-            const pct = Math.floor(p.bytesDone / p.bytesTotal * 100);
-            if (pct === lastPct) return;
-            lastPct = pct;
-            progress(`gguf ${p.tensor.replace(/^blk\./, 'blk ')}`,
-                     p.bytesDone, p.bytesTotal);
-          };
-        })(),
-      });
-      const secs = (performance.now() - t) / 1000;
-      const s = got.stats;
-      log(`gguf: ${(s.bytesTotal / 1e6).toFixed(0)}MB in ${secs.toFixed(1)}s, ` +
-          `${s.tensors} tensors, ${s.requests} range request` +
-          `${s.requests === 1 ? '' : 's'}` +
-          `${s.fromCache ? ' (from cache)' : ''}`, 'ok');
-      // Handed off rather than used: whoever finishes the WGSL engine picks these
-      // up without this page having to know anything about kernels.
-      window.flockWeights = {device, model: got.model, layers: got.layers, stats: s};
-      await report('gguf-loaded', {
-        mb: +(s.bytesTotal / 1e6).toFixed(1), secs: +secs.toFixed(1),
-        tensors: s.tensors, requests: s.requests, cached: s.fromCache,
-      });
-    } catch (e) {
-      // A GGUF failure must not cost the bird its slot: the ONNX path below is
-      // still there and still the one that actually runs frames today.
-      const m = String(e.message || e);
-      log('gguf load failed, continuing on the onnx path: ' + m, 'bad');
-      await report('gguf-failed', m);
-    }
-  }
+  log(`streaming layers ${meta.start}\u2013${meta.end} from GGUF\u2026`, 'ok');
+  const ad = await navigator.gpu.requestAdapter();
+  // Ask for the adapter's REAL limits. A bird's biggest single buffer is an
+  // ffn_down at ~3MB so the 128MiB default would do, but asking is free and an
+  // oversized binding is a SILENT wrong answer on this backend rather than a
+  // throw -- see the note in kernels/lib.ts getDevice().
+  device = await ad.requestDevice({requiredLimits: {
+    maxStorageBufferBindingSize: ad.limits.maxStorageBufferBindingSize,
+    maxBufferSize: ad.limits.maxBufferSize,
+  }});
+  const t = performance.now();
+  const got = await loadBirdWeights(device, meta.gguf, meta.start, meta.end, {
+    onNote: m => log('gguf: ' + m),
+    // One DOM write per whole percent, not per staging chunk: this fires
+    // thousands of times for 67MB and a write per call competes with the very
+    // allocations the streaming is being careful about.
+    onProgress: (() => {
+      let lastPct = -1;
+      return p => {
+        const pct = Math.floor(p.bytesDone / p.bytesTotal * 100);
+        if (pct === lastPct) return;
+        lastPct = pct;
+        progress(`gguf ${p.tensor.replace(/^blk\./, 'blk ')}`,
+                 p.bytesDone, p.bytesTotal);
+      };
+    })(),
+  });
+  const secs = (performance.now() - t) / 1000;
+  const s = got.stats;
+  log(`gguf: ${(s.bytesTotal / 1e6).toFixed(0)}MB in ${secs.toFixed(1)}s, ` +
+      `${s.tensors} tensors, ${s.requests} range request` +
+      `${s.requests === 1 ? '' : 's'}${s.fromCache ? ' (from cache)' : ''}`, 'ok');
 
-  log(`loading my ${meta.n_layers} layers…`);
-  const buf  = await grab(`/shard/${meta.slot}.onnx`, 'graph');
-  const wbuf = await grab(`/shard/${meta.slot}.onnx.data`, 'weights');
-
-  progress('building session', 1, 1);
-  session = await build(buf, wbuf, meta.slot);
+  // --- build the layers -----------------------------------------------------
+  //
+  // fromBuffers rather than create: the weights are already on the GPU and
+  // create() would want packed CPU bytes, which is the copy the streaming just
+  // avoided. Same kernels either way -- kernels/test_frombuffers.ts asserts the
+  // two constructors are bit-identical.
+  progress('building layers', 1, 1);
+  layers = [];
+  for (let i = meta.start; i <= meta.end; i++) {
+    const w = got.layers[i];
+    if (!w) throw new Error(`the loader returned no tensors for layer ${i}`);
+    layers.push(await Layer.fromBuffers(device, w, QWEN3_06B));
+  }
   progressDone('ready');
-  set('backend', capability.backend, hasGPU ? 'ok' : 'warn');
-  // Session is built; the weights are the runtime's problem now, so write the
-  // cache and drop our references.
-  // Only cache once inference is actually working; a device that is tight on
-  // memory should not also be storing 126MB blobs.
-  for (const [url, b] of pendingCache) {
-    if (b.byteLength === 0) continue;          // already transferred away
-    await idbPut(db, url, b).catch(e => log('cache write skipped: ' + e.message));
-  }
-  pendingCache.length = 0;
+  set('backend', capability.backend, 'ok');
+  await report('gguf-loaded', {
+    mb: +(s.bytesTotal / 1e6).toFixed(1), secs: +secs.toFixed(1),
+    tensors: s.tensors, requests: s.requests, cached: s.fromCache,
+    layers: layers.length,
+  });
   $('join').disabled = false;
   // A refresh shouldn't drop us out of the flock: if we were a member, rejoin.
   if (localStorage.getItem('flock_joined') === '1') {
@@ -431,11 +327,16 @@ let peerId = localStorage.getItem('flock_peer') || null;
   log('load failed: ' + m, 'bad');
   report('load-failed', m);
   if (/memory|allocation|OOM/i.test(m)) {
+    // The underlying message is included, not swallowed. A phone has no console,
+    // so this banner is the ONLY place the real error can be read -- and "ran out
+    // of memory" alone does not distinguish a 67MB stream that failed from a
+    // buffer the driver refused, which are different fixes.
     problem('this device ran out of memory',
-      'The weights downloaded, but building the session needed more memory than ' +
-      'this device would give the browser.',
+      'The weights needed more memory than this device would give the browser.\n' +
+      m,
       'Try: close other tabs and apps, then reload. Or split the model across ' +
-      'more devices so each one holds fewer layers (rebuild with more birds).');
+      'more devices so each one holds fewer layers (start the coordinator with ' +
+      'FLOCK_BIRDS set higher).');
   } else if (/fetch failed|short read|NetworkError|Load failed/i.test(m)) {
     problem('the download did not finish', m,
       'Check that this device is still on the same wifi as the coordinator, ' +
@@ -472,36 +373,50 @@ function forward(out, m) {
 }
 
 async function runFrame(floats, m) {
-  if (m.reset) { past = null; set('cache', '0 tokens'); }
+  // A reset means the conversation restarted, so OUR slice of the K/V cache is
+  // stale. Each Layer owns its own, so each one clears it.
+  if (m.reset) {
+    for (const L of layers) L.reset();
+    cachedTokens = 0;
+    set('cache', '0 tokens');
+  }
   const seq = m.seq;
-  const feed = {
-    hidden: new ort.Tensor('float32', floats, [1, seq, meta.hidden]),
-    position_ids: new ort.Tensor('int64',
-      BigInt64Array.from({length: seq}, (_, i) => BigInt(m.offset + i)), [1, seq]),
-  };
-  // Feed back the K/V we produced last step. THIS is the cache: we own the
-  // conversation state for our own layers, and nobody else has it.
-  if (meta.kv_cache) {
-    for (let i = 0; i < meta.n_layers; i++) {
-      feed[`past_k${i}`] = past ? past[`new_k${i}`] : empty();
-      feed[`past_v${i}`] = past ? past[`new_v${i}`] : empty();
-    }
-  }
+
   const t0 = performance.now();
-  const out = await session.run(feed);
-  const ms = +(performance.now() - t0).toFixed(1);
-  if (meta.kv_cache) {
-    past = {};
-    for (let i = 0; i < meta.n_layers; i++) {
-      past[`new_k${i}`] = out[`new_k${i}`];
-      past[`new_v${i}`] = out[`new_v${i}`];
+  // Chain the layers on the GPU: layer i reads what layer i-1 wrote through a
+  // device-to-device copy, all of it shares ONE command buffer, and only this
+  // shard's final output comes back to the host. A readback per layer instead
+  // would cost ~24ms each -- bench_layer.ts measured 20.8x for exactly this.
+  //
+  // The K/V cache never leaves the GPU and is never marshalled: it lives inside
+  // the layers, which is why there is no `past` to feed back. Position comes from
+  // each layer's own nKeys, so the cache and the positions cannot disagree.
+  const enc = device.createCommandEncoder();
+  for (let i = 0; i < layers.length; i++) {
+    const L = layers[i];
+    if (i === 0) {
+      // Only the first layer takes the hidden state off the wire.
+      if (seq === 1) L.encode(floats, enc);
+      else L.encodePrefill(seq, floats, enc);
+    } else {
+      enc.copyBufferToBuffer(layers[i - 1].outputBuffer(), 0,
+                             L.inputBuffer(), 0, seq * meta.hidden * 4);
+      // No hidden argument: consume what the copy just put in our own buffer.
+      if (seq === 1) L.encode(undefined, enc);
+      else L.encodePrefill(seq, undefined, enc);
     }
-    // Bytes, not just token count: this is the share of conversation state that
-    // lives on THIS device and nowhere else.
-    const tokens = out.new_k0.dims[2];
-    const bytes = tokens * meta.n_layers * 2 * meta.kv_heads * meta.head_dim * 4;
-    set('cache', `${tokens} tokens · ${(bytes / 1e6).toFixed(1)}MB`);
   }
+  device.queue.submit([enc.finish()]);
+  const out = await layers[layers.length - 1].readOutput(seq);
+  const ms = +(performance.now() - t0).toFixed(1);
+
+  // Bytes, not just token count: this is the share of conversation state that
+  // lives on THIS device and nowhere else. nKeys is the layer's own count, so it
+  // reports what the GPU actually holds rather than what we think we sent.
+  cachedTokens = layers[0].nKeys;
+  const bytes = cachedTokens * layers.length * 2 * meta.kv_heads * meta.head_dim * 4;
+  set('cache', `${cachedTokens} tokens · ${(bytes / 1e6).toFixed(1)}MB`);
+
   count++;
   $('count').textContent = count;
   set('ms', ms + ' ms');
@@ -509,7 +424,7 @@ async function runFrame(floats, m) {
   $('card').classList.remove('idle');
   $('card').classList.add('live');
   setTimeout(() => $('card').classList.remove('live'), 120);
-  return {out: out.output.data, ms};
+  return {out, ms};
 }
 
 /** Run one frame and hand the result on; any throw here is fatal to the lap, so

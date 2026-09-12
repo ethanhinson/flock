@@ -1,17 +1,15 @@
-# Build artifacts — regenerate with build_shards.py
-web/*.onnx
-web/*.onnx.data
-web/shard*.json
-web/flock.json
+# Weight cache. Every device fetches its own bytes from the model host, so
+# nothing here is a build artifact -- it is just a download that need not repeat.
+kernels/.cache
 
-__pycache__/
-*.pyc
 .DS_Store
 .venv/
 
-# Node
+# Node / Deno
 node/node_modules
-web/coord
+# Per-scenario module shims written and unlinked by node/test/bird_gguf.test.mjs.
+# Ignored so an interrupted run cannot leave one staged.
+node/test/.*-shim-*.mjs
 
 # agent worktrees
 .claude/worktrees/

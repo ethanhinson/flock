@@ -4,6 +4,11 @@ Nine WebGPU compute kernels and a `Model` that composes them into the whole of
 Qwen3-0.6B — token ids in, next token id out — consuming Q8_0 weights straight
 out of a GGUF file. No ONNX export, no Python build step, no pre-built artifacts.
 
+**This is now flock's only inference path.** The coordinator runs `Model` with a
+`cut` (layers 0..cut-1, plus the embedding, output_norm and the tied head); a bird
+runs `Layer.fromBuffers` over weights streamed straight from HuggingFace. ONNX
+remains only as the reference below.
+
 ```bash
 deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_q8.ts      # reference matvec
 deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_coop.ts    # optimized Q8_0 + Q4_0
@@ -13,12 +18,14 @@ deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_l
 deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_prefill.ts # prefill vs N decode steps
 deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_onnx.ts    # one layer vs web/shard0.onnx
 deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_model.ts   # WHOLE MODEL vs the ONNX pipeline
+deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_frombuffers.ts # the bird's constructor == the tested one
+deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_split.ts  # sharded across a cut == unsplit
 deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/bench.ts        # matvec benchmark
 deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/bench_layer.ts  # layer benchmark
 deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/bench_model.ts  # embedding, head, prefill, token
 ```
 
-171 assertions, all passing, stable across repeated runs.
+189 assertions, all passing, stable across repeated runs.
 
 ## Status
 
@@ -53,6 +60,8 @@ onnxruntime-node, with the same tokenizer and chat template.
 | Whole layer, decode | `layer.ts` | CPU reference, 1-2 ULP; ONNX shard cosine 0.9997 |
 | Whole layer, prefill | `layer.ts` | CPU ref 2e-7; **bit-identical to N decode steps** |
 | Whole model | `model.ts` | **same token ids as the ONNX pipeline** |
+| Whole model, sharded at a cut | `model.ts` | **bit-identical to the unsplit pass** |
+| Layer from pre-built GPU buffers | `layer.ts` | **bit-identical to `Layer.create`** |
 
 The strongest single piece of evidence is not a tolerance. `encodePrefill(N)` is
 **bit-identical** (`0.0e+0`) to N sequential decode steps — hidden states and KV

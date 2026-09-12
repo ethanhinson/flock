@@ -56,6 +56,27 @@ export interface LayerWeights {
   f32: Record<string, Float32Array>;
 }
 
+/**
+ * One tensor that is ALREADY on the GPU, in the split layout the kernels want.
+ *
+ * This is exactly what `streamTensorToGPU` in web/js/gguf-stream.mjs returns, and
+ * that is the point: a quantized tensor arrives as `{qs, scales}` and an f32 norm
+ * gain as `{data}`, keyed by the tensor suffix after `blk.N.`.
+ */
+export interface GpuTensor {
+  rows: number;
+  cols: number;
+  /** Q8_0: contiguous int8 quants, 4 per u32 word. */
+  qs?: GPUBuffer;
+  /** Q8_0: raw f16 scales, 2 per u32 word. */
+  scales?: GPUBuffer;
+  /** F32/F16: the tensor as-is, for the norm gains. */
+  data?: GPUBuffer;
+}
+
+/** One layer's tensors, already resident on the GPU, keyed by suffix. */
+export type LayerBuffers = Record<string, GpuTensor>;
+
 export interface LayerConfig {
   hidden: number;      // 1024
   nHeads: number;      // 16
@@ -122,6 +143,26 @@ function writeView(dev: GPUDevice, buf: GPUBuffer, offset: number, data: Float32
   dev.queue.writeBuffer(buf, offset, data.buffer, data.byteOffset, data.byteLength);
 }
 
+/**
+ * Read a WGSL file that sits next to this module.
+ *
+ * Two runtimes consume these kernels and they read files differently: the tests
+ * and the coordinator run under Deno, where `Deno.readTextFile` on a file URL is
+ * the direct route; a bird runs in a browser, where the same module is served
+ * over HTTP and only `fetch` exists. Resolving against `import.meta.url` makes
+ * one expression work for both -- the URL is a `file:` URL under Deno and an
+ * `http:` one in the page -- so there is no build step and no second copy of the
+ * loader to keep in sync.
+ */
+export async function wgslSource(file: string): Promise<string> {
+  const url = new URL("./" + file, import.meta.url);
+  const deno = (globalThis as { Deno?: { readTextFile(p: URL): Promise<string> } }).Deno;
+  if (deno?.readTextFile) return await deno.readTextFile(url);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`could not fetch ${file}: ${res.status}`);
+  return await res.text();
+}
+
 /** inv_freq[j] = 1 / base^(2j/headDim), computed on the host so it is exact. */
 function invFreqOf(headDim: number, base: number): Float32Array {
   const out = new Float32Array(headDim / 2);
@@ -152,13 +193,117 @@ export class Layer {
     this.cfg = cfg;
   }
 
+  /**
+   * Build a layer from weights that are ALREADY in GPU buffers.
+   *
+   * This is the bird's entry point. A bird streams its ~67 MB of layers straight
+   * from HuggingFace into GPU buffers (web/js/gguf-stream.mjs) precisely so the
+   * bytes never sit in the JS heap -- that streaming is what stops an iPad dying
+   * at 126 MB. `create()` below cannot consume that: it takes packed CPU bytes and
+   * calls splitQ8 on them, which is the materialize-the-whole-tensor step the
+   * streaming exists to avoid. So the two paths differ in exactly one thing --
+   * where the split happens -- and everything after it is shared.
+   *
+   * The keys are the tensor suffix after `blk.N.` WITH `.weight` left on
+   * (`attn_q.weight`), which is the convention both real_weights.ts and the
+   * streaming loader already use. Stripping it makes every lookup below return
+   * undefined, which is a silent wrong answer rather than an error -- so the
+   * required tensors are checked by name here.
+   */
+  static async fromBuffers(
+    dev: GPUDevice, w: LayerBuffers, cfg: LayerConfig = QWEN3_06B,
+  ): Promise<Layer> {
+    const L = await Layer.build(dev, cfg);
+    for (const [name, t] of Object.entries(w)) {
+      if (t.qs && t.scales) {
+        // Already split by the streamer, byte-identical to splitQ8's output. The
+        // two dims uniforms are per-weight state, not weight bytes, so they are
+        // built here exactly as create() builds them.
+        L.wq[name] = {
+          qs: t.qs, sc: t.scales,
+          dims: uniformBuffer(dev, [t.rows, t.cols, 1, 0]),
+          dimsPre: dev.createBuffer({
+            size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+          }),
+          rows: t.rows, cols: t.cols,
+        };
+      } else if (t.data) {
+        L.buf["g_" + name] = t.data;
+      } else {
+        throw new Error(`${name}: neither a split Q8_0 tensor nor f32 data`);
+      }
+    }
+    L.requireWeights();
+    return L;
+  }
+
+  /**
+   * Every tensor `encode()` will look up, checked once at construction.
+   *
+   * A missing weight is otherwise an `undefined` passed to createBindGroup deep
+   * inside a dispatch, which reports a binding error naming a slot number rather
+   * than a tensor -- or, for a norm gain, binds nothing and computes with garbage.
+   * Naming the tensor at load time is the difference between a one-line fix and
+   * bisecting a wrong model.
+   */
+  private requireWeights() {
+    const q8 = ["attn_q.weight", "attn_k.weight", "attn_v.weight",
+                "attn_output.weight", "ffn_gate.weight", "ffn_up.weight",
+                "ffn_down.weight"];
+    const f32 = ["attn_norm.weight", "attn_q_norm.weight", "attn_k_norm.weight",
+                 "ffn_norm.weight"];
+    const missing = [...q8.filter(n => !this.wq[n]),
+                     ...f32.filter(n => !this.buf["g_" + n])];
+    if (missing.length) {
+      throw new Error(`layer is missing ${missing.length} tensor(s): ` +
+                      missing.join(", "));
+    }
+  }
+
   static async create(
     dev: GPUDevice, w: LayerWeights, cfg: LayerConfig = QWEN3_06B,
   ): Promise<Layer> {
+    const L = await Layer.build(dev, cfg);
+    // Weights: repack each Q8_0 tensor into split qs/scales once, here.
+    //
+    // Two dims uniforms per weight, not one: the matvec's n_tokens differs between
+    // decode (1) and prefill (N), and a uniform that is REWRITTEN per call would
+    // invalidate nothing but would serialize -- queue.writeBuffer before a dispatch
+    // that reads it is ordered, but doing it 7 times per layer per prefill chunk is
+    // 196 host calls. Two immutable buffers cost 32 bytes and keep both bind groups
+    // permanently cacheable, which is worth ~4 ms/layer (see the bind-group note).
+    for (const [name, t] of Object.entries(w.q8)) {
+      const { qs, scales } = splitQ8(t.packed, t.rows, t.cols);
+      L.wq[name] = {
+        qs: storageBuffer(dev, qs), sc: storageBuffer(dev, scales),
+        dims: uniformBuffer(dev, [t.rows, t.cols, 1, 0]),
+        dimsPre: dev.createBuffer({
+          size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        }),
+        rows: t.rows, cols: t.cols,
+      };
+    }
+    for (const [name, v] of Object.entries(w.f32)) {
+      L.buf["g_" + name] = storageBuffer(dev, v);
+    }
+    L.requireWeights();
+    return L;
+  }
+
+  /**
+   * Everything a layer needs that is not a weight: pipelines, activation buffers,
+   * the KV cache and the uniforms.
+   *
+   * Split out so the two weight paths -- packed CPU bytes through splitQ8, or
+   * buffers the streaming loader already filled -- share one definition of the
+   * layer itself. A second copy of the buffer sizing is a second place for
+   * maxPrefill to be wrong.
+   */
+  private static async build(dev: GPUDevice, cfg: LayerConfig): Promise<Layer> {
     const L = new Layer(dev, cfg);
     const unpack8 = await probeUnpack(dev);
     const unpackF16 = await probeUnpackF16(dev);
-    const src = (f: string) => Deno.readTextFile(new URL("./" + f, import.meta.url));
+    const src = wgslSource;
     const mk = (code: string, entryPoint = "main") => dev.createComputePipeline({
       layout: "auto", compute: { module: dev.createShaderModule({ code }), entryPoint },
     });
@@ -180,27 +325,6 @@ export class Layer {
       swiglu: mk(ew, "swiglu"),
       add: mk(ew, "add"),
     };
-
-    // Weights: repack each Q8_0 tensor into split qs/scales once, here.
-    //
-    // Two dims uniforms per weight, not one: the matvec's n_tokens differs between
-    // decode (1) and prefill (N), and a uniform that is REWRITTEN per call would
-    // invalidate nothing but would serialize -- queue.writeBuffer before a dispatch
-    // that reads it is ordered, but doing it 7 times per layer per prefill chunk is
-    // 196 host calls. Two immutable buffers cost 32 bytes and keep both bind groups
-    // permanently cacheable, which is worth ~4 ms/layer (see the bind-group note).
-    for (const [name, t] of Object.entries(w.q8)) {
-      const { qs, scales } = splitQ8(t.packed, t.rows, t.cols);
-      L.wq[name] = {
-        qs: storageBuffer(dev, qs), sc: storageBuffer(dev, scales),
-        dims: uniformBuffer(dev, [t.rows, t.cols, 1, 0]),
-        dimsPre: dev.createBuffer({
-          size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-        }),
-        rows: t.rows, cols: t.cols,
-      };
-    }
-    for (const [name, v] of Object.entries(w.f32)) L.buf["g_" + name] = storageBuffer(dev, v);
 
     const { hidden, nHeads, nKvHeads, headDim, ffn, maxKeys } = cfg;
     const P = Math.max(1, cfg.maxPrefill);

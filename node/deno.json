@@ -1,0 +1,11 @@
+{
+  "//": "The server runs under Deno because the coordinator needs a GPU and Node has no WebGPU. Its dependencies are still npm ones installed by `npm install`, so nodeModulesDir is 'manual': Deno resolves express/ws/node-datachannel out of node_modules rather than fetching its own copies. kernels/*.ts reaches @huggingface/gguf through the same import map the kernel tests use.",
+  "nodeModulesDir": "manual",
+  "imports": {
+    "@huggingface/gguf": "npm:@huggingface/gguf@^0.4.6"
+  },
+  "tasks": {
+    "start": "deno run --unstable-webgpu --allow-all src/server.js",
+    "bird": "deno run --unstable-webgpu --allow-all sim_bird.mjs"
+  }
+}

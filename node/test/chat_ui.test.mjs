@@ -97,9 +97,19 @@ const check = (name, cond) => {
   console.log(`  ${cond ? 'ok  ' : 'FAIL'} ${name}`);
   if (!cond) fails++;
 };
-check('coordinator + 4 birds + 4 arrows rendered', pipe.children.length === 9);
-check('every bird shows its layer range',
-  flat(pipe).filter(t => /^layers /.test(t)).length === 5);
+// The expected cell count comes from the LIVE flock rather than a constant. The
+// topology used to be fixed by web/flock.json, so `=== 9` (coordinator + 4 birds
+// + 4 arrows) was a safe hardcode; now the split is chosen at startup from the
+// GGUF header, so a 1-bird flock renders 3 cells and a 4-bird one renders 9.
+// Deriving it means this asserts the page renders WHAT IS THERE -- which is the
+// actual claim -- instead of failing whenever the coordinator is configured
+// differently.
+const live = await (await fetch(`${BASE}/status`)).json();
+const nBirds = live.birds.length;
+check(`coordinator + ${nBirds} bird(s) + ${nBirds} arrow(s) rendered`,
+  pipe.children.length === 1 + 2 * nBirds);
+check('every device shows its layer range',
+  flat(pipe).filter(t => /^layers /.test(t)).length === 1 + nBirds);
 check('header reports the flock ready', /layers/.test(sub.innerHTML));
 
 // --- drive one real turn through the page's own send() ----------------------
