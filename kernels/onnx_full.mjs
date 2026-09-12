@@ -96,6 +96,7 @@ const H = meta.hidden, KVH = meta.kv_heads, HD = meta.head_dim;
 const empty = () => new ort.Tensor('float32', new Float32Array(0), [1, KVH, 0, HD]);
 
 let coordPast = null;
+let embeddingOfPrompt = null;
 
 /** One forward pass over `stepIds` at absolute offset `offset`. */
 async function forward(stepIds, offset) {
@@ -105,6 +106,10 @@ async function forward(stepIds, offset) {
   });
   const posIds = new ort.Tensor('int64',
     BigInt64Array.from({ length: n }, (_, i) => BigInt(offset + i)), [1, n]);
+  // The embedding of the PROMPT, kept so the WGSL gather can be diffed against the
+  // tensor the ONNX pipeline actually feeds its layers. Only the first call: later
+  // ones are single generated tokens.
+  if (wantHidden && offset === 0) embeddingOfPrompt = Array.from(emb.hidden.data);
 
   // coordinator layers 0..cut-1
   const feed = { hidden: emb.hidden, position_ids: posIds };
@@ -163,4 +168,5 @@ if (tok) {
   result.promptText = tok.decode(ids, { skip_special_tokens: false });
 }
 result.eos = meta.eos;
+if (embeddingOfPrompt) result.embedding = embeddingOfPrompt;
 writeFileSync(outPath, JSON.stringify(result));

@@ -348,6 +348,17 @@ export class Model {
     return await this.readF32(this.buf.normed, this.cfg.hidden);
   }
 
+  /**
+   * The token id the GPU argmax currently holds, without recomputing anything.
+   *
+   * For the one comparison that isolates the reduction: run it on the SAME logits a
+   * host scan reads, so a disagreement is the reduction and not the logits. Calling
+   * `step` again instead would recompute the logits and advance the KV cache.
+   */
+  async currentToken(): Promise<number> {
+    return (await this.readU32(this.buf.tokIdx, 1))[0];
+  }
+
   /** Just the embedding of `ids`, for validating the gather end to end. */
   async embed(ids: number[]): Promise<Float32Array> {
     const { dev, cfg, buf } = this;
