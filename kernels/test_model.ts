@@ -267,6 +267,103 @@ const cos = (a: Float32Array, b: Float32Array) => {
     viaPrefill === last, `prefill ${viaPrefill}, decode ${last}`);
 }
 
+// ============================ how long does agreement last, and why does it end?
+//
+// The short prompts above match to EOS, but that is a 9-token answer. A 60-token
+// generation does diverge, and the value of this section is that it pins down where
+// and proves what -- "probably f32 drift" is not an acceptable answer when the
+// margin can simply be measured.
+//
+// The test asserts two things and neither is "the ids match":
+//   1. Agreement lasts a long time (tens of tokens), not a handful.
+//   2. At the FIRST divergence, the top-two margin is smaller than the
+//      quantization difference -- i.e. the two engines were not distinguishable
+//      there. That is the claim "this is drift" cashed out as a number.
+{
+  const longPrompt = "Explain in three sentences why the sky is blue.";
+  const lIn = `${tmp}/in3.json`, lOut = `${tmp}/out3.json`;
+  await Deno.writeTextFile(lIn, JSON.stringify({
+    ...paths, prompt: longPrompt, maxTokens: 80, wantHidden: false,
+  }));
+  const p3 = await new Deno.Command("node", {
+    args: [new URL("./onnx_full.mjs", import.meta.url).pathname, lIn, lOut],
+    stdout: "piped", stderr: "piped",
+  }).output();
+  if (p3.code === 0) {
+    const o3 = JSON.parse(await Deno.readTextFile(lOut));
+    const refIds: number[] = o3.generated;
+
+    // Generate with WGSL, recording each step's top-two margin so a divergence can
+    // be diagnosed from the same run rather than reconstructed.
+    M.reset();
+    const gen: number[] = [];
+    const margins: number[] = [];
+    let next = 0;
+    for (let i = 0; i <= refIds.length + 5; i++) {
+      const lg = i === 0 ? await M.logits(o3.ids) : await M.logits([next]);
+      let b0 = -Infinity, i0 = 0, b1 = -Infinity;
+      for (let j = 0; j < lg.length; j++) {
+        if (lg[j] > b0) { b1 = b0; b0 = lg[j]; i0 = j; }
+        else if (lg[j] > b1) b1 = lg[j];
+      }
+      next = i0;
+      margins.push((b0 - b1) / amax(lg));
+      if (next === weights.eos) break;
+      gen.push(next);
+    }
+
+    let at = -1;
+    for (let i = 0; i < Math.min(gen.length, refIds.length); i++) {
+      if (gen[i] !== refIds[i]) { at = i; break; }
+    }
+    console.log(`\nlong prompt ${JSON.stringify(longPrompt)} (${o3.ids.length} prompt tokens):`);
+    console.log(`  ONNX generated ${refIds.length} tokens, WGSL ${gen.length}`);
+
+    // The measured margin floor over the run, which is the context any single
+    // divergence has to be read against.
+    const sorted = [...margins].sort((a, b) => a - b);
+    console.log(`  margin/scale over ${margins.length} steps: min ${sorted[0].toExponential(2)}` +
+      `  median ${sorted[sorted.length >> 1].toExponential(2)}` +
+      `  max ${sorted[sorted.length - 1].toExponential(2)}`);
+
+    ok("long-generation agreement lasts many tokens before any divergence",
+      at === -1 || at >= 20,
+      at === -1 ? `identical for all ${gen.length}` : `first divergence at token ${at}`);
+
+    if (at >= 0) {
+      // Re-run on the ONNX prefix so both engines are in the SAME state, and read
+      // the two candidates' logits directly. This is the diagnosis.
+      M.reset();
+      const lg = await M.logits([...o3.ids, ...refIds.slice(0, at)]);
+      const order = Array.from(lg.keys()).sort((a, b) => lg[b] - lg[a]);
+      const scale = amax(lg);
+      const gap = (lg[order[0]] - lg[refIds[at]]) / scale;
+      const rank = order.indexOf(refIds[at]) + 1;
+      console.log(`  divergence at token ${at}: WGSL ${order[0]} (${lg[order[0]].toFixed(5)}) ` +
+        `vs ONNX ${refIds[at]} (${lg[refIds[at]].toFixed(5)})`);
+      console.log(`    gap/scale ${gap.toExponential(3)};  ONNX's token is WGSL's rank #${rank}`);
+
+      // THE assertion. The hidden state feeding this projection differs from ONNX's
+      // by ~1.2e-2 relative (measured above, and it is quantization). If the gap
+      // between the two candidate logits is smaller than that, the engines were not
+      // distinguishable at this step and either answer is correct for its weights.
+      const QUANT = 1.22e-2;
+      ok("the first divergence is a near-tie that quantization fully explains",
+        gap < QUANT,
+        `gap/scale ${gap.toExponential(2)} < quantization ${QUANT.toExponential(2)} ` +
+        `(${(QUANT / gap).toFixed(1)}x margin)`);
+      // A wiring bug does not leave the reference's choice at rank 2; it scatters it
+      // into the tail of 151936. Rank is the structural half of the diagnosis.
+      ok("ONNX's choice is still at the very top of WGSL's ranking",
+        rank <= 3, `rank #${rank} of ${lg.length}`);
+      ok("the divergence happens at the run's tightest margin, not a typical one",
+        gap <= sorted[Math.max(0, Math.floor(margins.length * 0.15))],
+        `gap ${gap.toExponential(2)} vs p15 margin ` +
+        `${sorted[Math.max(0, Math.floor(margins.length * 0.15))].toExponential(2)}`);
+    }
+  }
+}
+
 // A second prompt, so the result is not one lucky string.
 {
   const alt = "What is 2 + 2?";
