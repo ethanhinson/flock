@@ -1,16 +1,24 @@
 {
   "name": "flock",
   "version": "0.1.0",
-  "description": "",
-  "main": "index.js",
+  "description": "One language model split across your laptop and your phone",
   "scripts": {
     "start": "node src/server.js",
-    "test": "node test/gguf.test.mjs",
-    "plan": "node plan.mjs"
+    "solo": "node sim_bird.mjs solo",
+    "bird": "node sim_bird.mjs",
+    "health": "curl -fsS http://127.0.0.1:${PORT:-8000}/health",
+    "status": "curl -fsS http://127.0.0.1:${PORT:-8000}/status",
+    "check": "node check_html.mjs ../web/*.html && node --check src/server.js && node --check src/mesh.js && node --check src/coordinator.js && node --check src/gguf.mjs && node --check sim_bird.mjs && node --check plan.mjs",
+    "test": "npm run check && node test/gguf.test.mjs",
+    "test:ui": "node test/chat_ui.test.mjs && node test/bird_ui.test.mjs",
+    "plan": "node plan.mjs",
+    "build:shards": "cd .. && python3 build_shards.py --start 24 --end 27 --birds 1 --int8",
+    "build:coord": "cd .. && python3 flock_export_coordinator.py --cut 24",
+    "build": "npm run build:shards && npm run build:coord"
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "dependencies": {
     "@huggingface/gguf": "^0.4.6",
     "@huggingface/transformers": "^4.2.0",

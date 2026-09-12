@@ -79,6 +79,8 @@ generates *identical* text (verified by a full greedy decode against the fp32
 shard). This is what makes the ONNX path competitive with GGUF on size without
 writing a single GPU kernel — ONNX Runtime already ships quantized matmul.
 
+`npm start` prints the LAN addresses to use:
+
 - **phone** → `http://<your-ip>:8000/flock` → tap **join the flock**
 - **any browser** → `http://<your-ip>:8000` → chat
 
@@ -86,6 +88,19 @@ Mac holds the embedding, layers 0–23, and the vocab projection. The phone hold
 layers 24–27 and the final norm, executed by **ONNX Runtime Web on WebGPU**
 (iOS 26+ enables WebGPU by default; older iOS falls back to WASM, slower but
 working — the page tells you which backend it got).
+
+No phone handy? `npm run solo` runs every bird in one Node process, so the whole
+chain works on one machine:
+
+```bash
+npm start                   # one shell
+npm run solo                # another: claims every layer slot
+npm run health              # is the flock covered?
+npm test                    # syntax + range planning
+npm run test:ui             # drives both pages against the live coordinator
+```
+
+Set `PORT` to run somewhere other than 8000.
 
 ---
 
@@ -127,6 +142,23 @@ wire      64→100KB growing    flat 4.0KB
 mac ms         ~81             ~28
 ```
 
+Conversations continue against that warm cache: turn two feeds only the new
+tokens, not the whole history. The subtle part is that you cannot simply
+re-encode the conversation each turn — with `enable_thinking:false` the Qwen3
+chat template injects a `<think></think>` scaffold for the *current* turn only,
+so a re-encoded history diverges from what was already fed (measured: the two
+token streams split at token 9 of 13) and every cache would be keyed to
+different tokens. So the coordinator appends exactly what the model saw next:
+
+```
+turn 1  "My favorite color is blue."   21 prompt tokens   cache 35
+turn 2  "What is my favorite color?"   20 prompt tokens   cache 64   -> "blue"
+turn 3  "Name one fruit of that color" 21 prompt tokens   cache 101  -> "blueberry"
+```
+
+Turn 2 fed 20 tokens instead of re-prefilling 55. `POST /reset` drops every
+device's shard of the cache.
+
 ## Design decisions worth understanding
 
 **The phone never gets `lm_head`.** It's 151936×1024 (~600MB fp32) and is
@@ -135,10 +167,11 @@ quadruple the phone's download to buy nothing, so the phone returns a hidden
 state and the Mac does the vocab projection. First export was 874MB; this
 brought it to 252MB.
 
-**The phone long-polls `/work`.** A browser cannot accept inbound connections,
-so the phone *asks* for activations rather than receiving them. That's the one
-real concession to running a node inside a web page — swarmllm.ai avoids it
-with WebRTC, at the cost of a signaling layer.
+**A browser cannot accept inbound connections.** The original design had the
+phone long-poll for work, which cost ~132ms per token. Now the coordinator is
+itself a WebRTC peer: it *offers* each bird a data channel over the websocket,
+and once that opens the websocket carries only signaling. This is the same role
+PeerJS plays for swarmllm, and it is why the network overhead is now ~11ms.
 
 **A screen wake lock is held while joined.** iOS suspends a backgrounded or
 locked tab: timers stop, fetches never return, and the node silently vanishes.
@@ -169,13 +202,16 @@ Read these before drawing conclusions from it.
   capacity, not throughput. Only one node computes at a time. That is the
   single most misunderstood thing about distributed inference, and you can feel
   it here in ~30 seconds.
-- **Flask dev servers, no auth, no TLS, no input validation.** LAN-only toy.
-  Do not expose to the internet.
+- **No auth, no TLS, barely any input validation.** LAN-only toy. Do not expose
+  to the internet.
 - **No re-sharding on peer loss.** If a device leaves, generation stops with a
   message naming the uncovered layers, and resumes when *some* device claims
   that slot. It does not redistribute those layers onto the survivors — that
   redistribution is most of the real complexity in production P2P swarms.
-- **Single conversation, no batching, no concurrency.**
+- **One conversation, no batching, no concurrency.** Turns are multi-turn and
+  continue from the warm cache, but there is exactly one of them: a second
+  simultaneous `/chat` is refused rather than interleaving writes into the same
+  K/V cache. The context also only grows — nothing evicts it but `/reset`.
 
 ---
 
@@ -189,9 +225,11 @@ Read these before drawing conclusions from it.
 | `node/src/server.js` | the coordinator: chat loop, signaling, HTTP |
 | `node/src/coordinator.js` | embedding + layers 0–23 + vocab projection |
 | `node/src/mesh.js` | the flock, slot claiming, chain topology, WebRTC links |
-| `web/js/wire.js` | the f16 frame format — one copy, imported by node and browsers |
+| `web/js/wire.mjs` | the f16 frame format — one copy, imported by node and browsers |
 | `web/bird.html` | a bird — ONNX Runtime Web on WebGPU |
-| `web/chat.html` | chat UI showing the per-token lap |
+| `web/chat.html` | chat UI: conversation, live topology, per-token stats |
+| `node/sim_bird.mjs` | a bird without a browser, for testing the chain |
+| `node/test/` | range planning, and both pages driven against a live coordinator |
 
 ## Things to try
 
