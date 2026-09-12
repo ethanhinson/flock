@@ -37,6 +37,17 @@ const META = JSON.parse(readFileSync('web/flock.json', 'utf8'));
 const RANGES = META.birds.map(b => [b.start, b.end]);
 const CUT = RANGES[0][0];
 
+// Where a bird can fetch GGUF weights for itself, if it would rather do that than
+// download an exported ONNX shard from us. Handed out by /join so the bird needs
+// no configuration of its own, and left empty to keep every bird on the ONNX path
+// -- which is still the reference the WGSL engine is validated against, so this is
+// opt-in rather than a switch that flips underneath it.
+//
+// It is a plain URL rather than something we proxy on purpose: the point of the
+// GGUF path is that weights go from the model host straight to the device, so the
+// coordinator never touches 67MB per bird and needs no build step and no disk.
+const GGUF_URL = process.env.FLOCK_GGUF || '';
+
 console.log(`loading coordinator (layers 0-${CUT - 1}) ...`);
 const coord = await Coordinator.load();
 const flock = new Flock(RANGES);
@@ -62,7 +73,8 @@ app.post('/join', (req, res) => {
   res.json({peer_id: pid, slot: bird.slot, start: bird.start, end: bird.end,
             n_layers: bird.end - bird.start + 1, hidden: META.hidden,
             kv_heads: META.kv_heads, head_dim: META.head_dim,
-            kv_cache: META.kv_cache, n_total: META.n_total, model: META.model});
+            kv_cache: META.kv_cache, n_total: META.n_total, model: META.model,
+            gguf: GGUF_URL});
 });
 
 // Birds have no readable console, so they POST failures here. Kept in a ring
