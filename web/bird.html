@@ -327,11 +327,16 @@ let peerId = localStorage.getItem('flock_peer') || null;
   log('load failed: ' + m, 'bad');
   report('load-failed', m);
   if (/memory|allocation|OOM/i.test(m)) {
+    // The underlying message is included, not swallowed. A phone has no console,
+    // so this banner is the ONLY place the real error can be read -- and "ran out
+    // of memory" alone does not distinguish a 67MB stream that failed from a
+    // buffer the driver refused, which are different fixes.
     problem('this device ran out of memory',
-      'The weights downloaded, but building the layers needed more memory than ' +
-      'this device would give the browser.',
+      'The weights needed more memory than this device would give the browser.\n' +
+      m,
       'Try: close other tabs and apps, then reload. Or split the model across ' +
-      'more devices so each one holds fewer layers (rebuild with more birds).');
+      'more devices so each one holds fewer layers (start the coordinator with ' +
+      'FLOCK_BIRDS set higher).');
   } else if (/fetch failed|short read|NetworkError|Load failed/i.test(m)) {
     problem('the download did not finish', m,
       'Check that this device is still on the same wifi as the coordinator, ' +
