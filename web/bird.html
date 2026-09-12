@@ -137,12 +137,22 @@ let ws = null, chan = null, inChan = null, chain = null;
 let rtc = null;      // link FROM the coordinator (or previous bird)
 let outRtc = null;   // link TO the next bird, if we have a successor
 
-/** A failure a person can act on, not a stack trace. */
+/** A failure a person can act on, not a stack trace.
+ *
+ *  Also hands the slot back: every failure here means this device will never
+ *  compute, and holding layers it cannot run stalls the whole flock until the
+ *  coordinator restarts.
+ */
 function problem(title, detail, fix) {
   $('ptitle').textContent = title;
   $('pdetail').textContent = detail;
   $('pfix').textContent = fix || '';
   $('problem').classList.add('on');
+  if (peerId) {
+    fetch('/leave', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                     body: JSON.stringify({peer_id: peerId, why: title})})
+      .catch(() => {});          // best effort: we are already failing
+  }
 }
 const clearProblem = () => $('problem').classList.remove('on');
 
@@ -601,6 +611,16 @@ document.addEventListener('visibilitychange', async () => {
     await keepAwake(true);
     if (!ws || ws.readyState > 1) connect();
     log('tab active again', 'ok');
+  }
+});
+
+// A closing tab should free its layers rather than wait to age out.
+addEventListener('pagehide', () => {
+  if (!peerId || !running) return;
+  const body = JSON.stringify({peer_id: peerId, why: 'tab closed'});
+  // sendBeacon survives unload; fetch usually does not.
+  if (navigator.sendBeacon) {
+    navigator.sendBeacon('/leave', new Blob([body], {type: 'application/json'}));
   }
 });
 

@@ -159,6 +159,36 @@ app.post('/join', (req, res) => {
 // buffer as well as logged: /status serves it, so the chat page can show what a
 // phone reported without anyone reading the terminal.
 const DIAG = [];
+// A device that cannot run must hand its slot back immediately. Without this a
+// bird that fails to load holds its layers until the coordinator restarts, and
+// the flock stalls on a device that will never compute anything -- which has
+// blocked a real join twice.
+app.post('/leave', (req, res) => {
+  const {peer_id, why} = req.body || {};
+  const bird = flock.byPeer(peer_id);
+  if (!bird) return res.json({ok: true, released: false});
+  console.log(`[flock] ${bird.label || 'a device'} released slot ${bird.slot} ` +
+              `(layers ${bird.start}-${bird.end})${why ? ': ' + why : ''}`);
+  bird.release();
+  flock.announce();
+  res.json({ok: true, released: true});
+});
+
+// Evict a slot whose device is gone but never said goodbye (a crashed tab, a
+// phone that slept). Without it the only cure is restarting the coordinator.
+app.post('/evict', (req, res) => {
+  const slot = Number((req.body || {}).slot);
+  const bird = flock.birds[slot];
+  if (!bird) return res.status(404).json({error: `no slot ${slot}`});
+  if (bird.alive()) {
+    return res.status(409).json({error:
+      `slot ${slot} is held by a live device (${bird.label}); it must leave first`});
+  }
+  bird.release();
+  flock.announce();
+  res.json({ok: true, slot, layers: `${bird.start}-${bird.end}`});
+});
+
 app.post('/diag', (req, res) => {
   const {stage, detail, ua, slot} = req.body || {};
   const dev = /iPad/.test(ua) ? 'iPad' : /iPhone/.test(ua) ? 'iPhone'

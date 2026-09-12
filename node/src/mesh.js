@@ -90,6 +90,16 @@ export class Bird {
 
   reset() { this.resetPending = true; }
 
+  /** Hand this slot back so another device can take these layers. */
+  release() {
+    this.teardown();
+    this.peerId = null;
+    this.label = '?';
+    this.lastSeen = 0;
+    this.lastMs = null;
+    this.frames = 0;
+  }
+
   /** Drop every link to this bird. Called when its websocket goes away, so a
    *  refresh starts from a clean slate instead of leaking a PeerConnection. */
   teardown() {
