@@ -280,6 +280,15 @@ WGSL    [785,6722,315,9625,374,3070,59604,334,13]   "The capital of France is **
 ONNX    [785,6722,315,9625,374,3070,59604,334,13]   identical, both stop at EOS
 ```
 
+One honest caveat about "no ONNX in the process": `@huggingface/transformers`
+bundles its own `onnxruntime-node` and dlopens `libonnxruntime` when imported, so
+the library *is* mapped into the coordinator — `lsof` shows it. Nothing ever asks
+it to run anything. The only API used from that package is `AutoTokenizer`, never
+`AutoModel` or `pipeline()`, so no `InferenceSession` is constructed and no ONNX
+graph is ever loaded. Removing the mapping would mean hand-rolling a tokenizer and
+moving the chat template — the one thing that must match the reference exactly —
+into new code, which buys nothing.
+
 ## Limitations
 
 Read these before drawing conclusions from it.

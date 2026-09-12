@@ -31,12 +31,25 @@ import { QWEN3_06B } from '../../kernels/layer.ts';
 import { realModel } from '../../kernels/real_weights.ts';
 import { AutoTokenizer } from '@huggingface/transformers';
 
-/** Where the tokenizer comes from. The GGUF carries the vocabulary but not the
- *  chat template, and getting the template wrong changes the prompt and
- *  therefore the text -- which looks exactly like an engine bug. So the
- *  tokenizer is the HuggingFace one, fetched once and cached by transformers.js,
- *  and it is the SAME template the ONNX comparison used: verified to produce the
- *  identical 16 prompt ids for "Capital of France?". */
+/** Where the tokenizer comes from.
+ *
+ *  ONE HONEST CAVEAT about "no ONNX in the process". @huggingface/transformers
+ *  bundles its own copy of onnxruntime-node and dlopens libonnxruntime at import
+ *  time, so the .dylib IS mapped into this process -- visible in lsof. Nothing
+ *  here ever asks it to run anything: the only API used from that package is
+ *  AutoTokenizer, never AutoModel or pipeline(), so no InferenceSession is ever
+ *  constructed and no ONNX graph is ever loaded. The inference path is WGSL end to
+ *  end. Removing the mapping entirely would mean replacing transformers.js with a
+ *  standalone tokenizer, which buys nothing for correctness and would put the chat
+ *  template -- the thing that must match the ONNX comparison exactly -- into new
+ *  code.
+ *
+ *  The GGUF carries the vocabulary but not the chat template, and getting the
+ *  template wrong changes the prompt and therefore the text -- which looks exactly
+ *  like an engine bug. So the tokenizer is the HuggingFace one, fetched once and
+ *  cached by transformers.js, and it is the SAME template the ONNX comparison
+ *  used: verified to produce the identical 16 prompt ids for "Capital of France?".
+ */
 const TOKENIZER = 'Qwen/Qwen3-0.6B';
 
 export class Coordinator {
