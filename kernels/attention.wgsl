@@ -19,12 +19,21 @@
 //
 // One workgroup per head, and the scores live in workgroup memory. That is what
 // makes the fusion possible: softmax needs a max and a sum over ALL scores before
-// any output element can be written, so a split into separate dispatches would
-// have to round-trip the scores through global memory twice. The cost is a cap of
-// MAX_KEYS on the context this kernel can serve in one pass; at 4096 that is 16 KB
-// of workgroup storage, the guaranteed minimum, and covers a great deal more than
-// the 2-layer shard needs. Beyond it a flash-attention-style online softmax would
-// be required -- deliberately not attempted yet, since an unvalidated streaming
+// any output element can be written, so splitting into separate dispatches would
+// round-trip the scores through global memory twice.
+//
+// $MAX_KEYS is substituted by the host (lib.ts attnSource) rather than fixed at
+// the 4096 the guaranteed 16 KB of workgroup storage allows, and that is a
+// performance decision, not a tidiness one. Workgroup memory is a hard occupancy
+// limit: a workgroup that declares 16 KB is the only one resident per core, so
+// the GPU cannot hide any latency behind a second one. Measured on this machine,
+// with MAX_KEYS fixed at 4096 this kernel cost 329 us at n_keys=1 -- twelve times
+// every other dispatch in the layer, and almost all of it occupancy loss rather
+// than work. Sizing the array to the cache the engine actually needs is worth
+// recompiling the shader for.
+//
+// Beyond whatever $MAX_KEYS is set to, a flash-attention-style online softmax
+// would be required. Deliberately not attempted yet: an unvalidated streaming
 // softmax is a worse problem than a context limit.
 
 struct Dims {
@@ -41,7 +50,7 @@ struct Dims {
 @group(0) @binding(4) var<uniform>             d: Dims;
 
 const WG: u32 = 128u;
-const MAX_KEYS: u32 = 4096u;
+const MAX_KEYS: u32 = $MAX_KEYSu;
 
 var<workgroup> scores: array<f32, MAX_KEYS>;
 var<workgroup> part: array<f32, WG>;

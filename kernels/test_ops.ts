@@ -28,7 +28,10 @@
 // convention and attention's GQA head mapping are pinned by exact equality on
 // constructed inputs, because those are the errors a loose tolerance could hide.
 
-import { getDevice, ok, randVec, readBack, storageBuffer, summary, uniformBuffer } from "./lib.ts";
+import {
+  attnSource, getDevice, ok, randVec, readBack, storageBuffer, summary,
+  uniformBuffer,
+} from "./lib.ts";
 import {
   absErrScaled, addRef, amax, attnRef, relErr, rmsnormRef, ropeInvFreq, ropeRef,
   swigluRef,
@@ -236,7 +239,9 @@ const rw = (n: number) => dev.createBuffer({
 
 // ---------------------------------------------------- attention (GQA, causal)
 {
-  const pipe = pipelineFor(await read("attention.wgsl"), "main");
+  // 1024 keys is plenty for these shapes and keeps the workgroup scores array at
+  // 4 KB. Sizing it to the 4096 the spec guarantees costs 15x; see attention.wgsl.
+  const pipe = pipelineFor(attnSource(await read("attention.wgsl"), 1024), "main");
   const HEAD_DIM = 128;
 
   for (const [nHeads, nKvHeads, nKeys, why] of [

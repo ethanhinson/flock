@@ -21,13 +21,32 @@
 // first, so shape[0] is the input width (our `cols`) and shape[1] is the number
 // of output rows. attn_q.weight [1024, 2048] is 2048 rows of 1024 columns.
 //
-// Buffers are allocated once per layer and reused across tokens. A decode step
-// is 7 matvecs plus 9 small dispatches, and at the ~17.6 us per-dispatch floor
-// this backend has (see bench.ts) the dispatch count matters more than the
-// arithmetic -- which is why attention is one fused dispatch rather than five.
+// A decode step is 16 dispatches whose arithmetic totals ~0.2 ms, and getting it
+// to run in anything close to that is entirely about NOT paying host costs per
+// step. Measured, per layer:
+//
+//   forward(), own command buffer, own readback     28.9 ms
+//   encode() x28 behind one readback                 1.46 ms   19.7x
+//   encode() x28 sharing one command buffer          1.39 ms   20.8x
+//
+// Three things bought that, in order of size:
+//
+//  - Not reading back per layer. A map readback is ~27 ms on this backend; see
+//    bench.ts for why it is also the only honest fence. `encode()` exists so the
+//    hidden state stays on the GPU and the host reads once per shard.
+//  - Caching bind groups. Creating them per step cost ~4 ms per layer.
+//  - Sharing one command buffer across layers (~0.07 ms per layer).
+//
+// So the API has two halves on purpose: `encode()` for chaining, `forward()` for
+// tests and for the one place a host actually needs the numbers.
+//
+// Buffers are allocated once and reused across tokens. Attention is one fused
+// dispatch rather than five because at a ~17.6 us per-dispatch floor the dispatch
+// count matters more than the arithmetic.
 
 import {
-  coopSource, probeUnpack, probeUnpackF16, splitQ8, storageBuffer, uniformBuffer,
+  attnSource, coopSource, probeUnpack, probeUnpackF16, splitQ8, storageBuffer,
+  uniformBuffer,
 } from "./lib.ts";
 
 export interface LayerWeights {
@@ -48,9 +67,14 @@ export interface LayerConfig {
   maxKeys: number;     // KV cache capacity
 }
 
+// maxKeys is 2048, not the 4096 that 16 KB of workgroup memory allows, and that
+// is deliberate. 16 KB is exactly the point where only one workgroup fits per
+// core, so attention loses all latency hiding: measured 328 us per dispatch at
+// 4096 versus 21 us at 2048, a 15x cliff for 2x the context. Raise it only with
+// that number in hand.
 export const QWEN3_06B: LayerConfig = {
   hidden: 1024, nHeads: 16, nKvHeads: 8, headDim: 128, ffn: 3072,
-  eps: 9.999999974752427e-7, ropeBase: 1e6, maxKeys: 4096,
+  eps: 9.999999974752427e-7, ropeBase: 1e6, maxKeys: 2048,
 };
 
 const ROWS_PER_WG = 4;     // must match q8_coop.wgsl
@@ -94,7 +118,10 @@ export class Layer {
       matvec: mk(coopSource(await src("q8_coop.wgsl"), { unpack8, unpackF16 })),
       rmsnorm: mk(await src("rmsnorm.wgsl")),
       rope: mk(await src("rope.wgsl")),
-      attn: mk(await src("attention.wgsl")),
+      // The scores array is sized to maxKeys, not to a fixed maximum: workgroup
+      // memory caps occupancy, and declaring the full 16 KB made attention cost
+      // 328 us instead of 21 us. Measured; see attention.wgsl.
+      attn: mk(attnSource(await src("attention.wgsl"), cfg.maxKeys)),
       swiglu: mk(ew, "swiglu"),
       add: mk(ew, "add"),
     };
@@ -154,18 +181,52 @@ export class Layer {
     L.buf.d_norm_k = normDims(headDim, nKvHeads);
     L.buf.d_ew_hidden = uniformBuffer(dev, [hidden, 0, 0, 0]);
     L.buf.d_ew_ffn = uniformBuffer(dev, [ffn, 0, 0, 0]);
+    // Rewritten every step, never reallocated -- see the bind-group cache note.
+    const posU = () => dev.createBuffer({
+      size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    L.buf.d_rope_q = posU();
+    L.buf.d_rope_k = posU();
+    L.buf.d_attn = posU();
+    for (const [name, pipe] of Object.entries(L.pipes)) L.pipeKey.set(pipe, name);
     return L;
   }
 
   /** Reset the KV cache, e.g. for a new sequence. */
   reset() { this.nKeys = 0; }
 
+  /**
+   * Bind groups, memoized by pipeline and buffer identity.
+   *
+   * Not a micro-optimization: creating them per step cost 4 ms of the 5.4 ms a
+   * chained layer step took. They are pure functions of (pipeline, buffers), and
+   * every buffer this layer uses is allocated once in create(), so every bind
+   * group can be built once too. The three position-carrying uniforms are
+   * REWRITTEN each step rather than reallocated, which is what keeps their bind
+   * groups cacheable as well.
+   */
+  private bgCache = new Map<string, GPUBindGroup>();
+
   private bind(pipe: GPUComputePipeline, bufs: GPUBuffer[]) {
-    return this.dev.createBindGroup({
-      layout: pipe.getBindGroupLayout(0),
-      entries: bufs.map((buffer, binding) => ({ binding, resource: { buffer } })),
-    });
+    let key = this.pipeKey.get(pipe) ?? "?";
+    for (const b of bufs) {
+      let id = this.bufId.get(b);
+      if (id === undefined) { id = this.bufId.size; this.bufId.set(b, id); }
+      key += "/" + id;
+    }
+    let bg = this.bgCache.get(key);
+    if (!bg) {
+      bg = this.dev.createBindGroup({
+        layout: pipe.getBindGroupLayout(0),
+        entries: bufs.map((buffer, binding) => ({ binding, resource: { buffer } })),
+      });
+      this.bgCache.set(key, bg);
+    }
+    return bg;
   }
+
+  private bufId = new Map<GPUBuffer, number>();
+  private pipeKey = new Map<GPUComputePipeline, string>();
 
   private matvec(
     p: GPUComputePassEncoder, wName: string, xBuf: GPUBuffer, outBuf: GPUBuffer,
@@ -211,19 +272,41 @@ export class Layer {
    * disagrees; test_layer.ts is what would catch that.
    */
   async forward(hidden: Float32Array): Promise<Float32Array> {
+    this.encode(hidden);
+    return await this.readOutput();
+  }
+
+  /**
+   * Encode one decode step into the queue WITHOUT reading the result back.
+   *
+   * This is the form a real engine wants. The map readback that `forward` does is
+   * ~24 ms on this backend -- measured, and it dominates everything: a step whose
+   * arithmetic is ~0.2 ms takes 29 ms end to end, so 99% of a forward() call is
+   * the host waiting to see a number it does not need yet. Chaining layers means
+   * calling encode() per layer and reading back once, at the end of the shard.
+   *
+   * `hidden` is optional: omit it to consume whatever is already in the output
+   * buffer, which is how one layer feeds the next without a host round-trip.
+   */
+  encode(hidden?: Float32Array, encoder?: GPUCommandEncoder): void {
     const { dev, cfg, buf } = this;
     const { nHeads, nKvHeads, headDim, ffn } = cfg;
     const pos = this.nKeys;
     if (pos >= cfg.maxKeys) throw new Error(`KV cache full at ${cfg.maxKeys} keys`);
 
-    dev.queue.writeBuffer(buf.h, 0, hidden);
+    if (hidden) dev.queue.writeBuffer(buf.h, 0, hidden);
 
-    // Uniforms that depend on position have to be written before the pass.
-    const ropeQ = uniformBuffer(dev, [1, nHeads, headDim, pos]);
-    const ropeK = uniformBuffer(dev, [1, nKvHeads, headDim, pos]);
-    const attnDims = uniformBuffer(dev, [nHeads, nKvHeads, headDim, pos + 1]);
+    // Position-dependent uniforms are REWRITTEN, not reallocated. Allocating them
+    // per step would make their bind groups uncacheable, which is the expensive
+    // part; the write itself is ~10 us for all three.
+    dev.queue.writeBuffer(buf.d_rope_q, 0, new Uint32Array([1, nHeads, headDim, pos]));
+    dev.queue.writeBuffer(buf.d_rope_k, 0, new Uint32Array([1, nKvHeads, headDim, pos]));
+    dev.queue.writeBuffer(buf.d_attn, 0, new Uint32Array([nHeads, nKvHeads, headDim, pos + 1]));
 
-    const enc = dev.createCommandEncoder();
+    // The caller may pass an encoder so that several layers -- or several decode
+    // steps -- share one command buffer. That is worth a lot: 28 steps in one
+    // command buffer cost 1.39 ms each, versus 5.43 ms each in their own.
+    const enc = encoder ?? dev.createCommandEncoder();
     const p = enc.beginComputePass();
 
     // --- attention block ---------------------------------------------------
@@ -246,8 +329,8 @@ export class Layer {
       p.setBindGroup(0, this.bind(this.pipes.rope, [x, dims, buf.invFreq]));
       p.dispatchWorkgroups(Math.ceil((heads * headDim / 2) / 64));
     };
-    rope(ropeQ, buf.qn, nHeads);
-    rope(ropeK, buf.kn, nKvHeads);
+    rope(buf.d_rope_q, buf.qn, nHeads);
+    rope(buf.d_rope_k, buf.kn, nKvHeads);
     p.end();
 
     // Append this token's k/v to the cache. A buffer-to-buffer copy cannot be
@@ -261,7 +344,7 @@ export class Layer {
     const p2 = enc.beginComputePass();
     p2.setPipeline(this.pipes.attn);
     p2.setBindGroup(0, this.bind(this.pipes.attn,
-      [buf.qn, buf.kcache, buf.vcache, buf.attn, attnDims]));
+      [buf.qn, buf.kcache, buf.vcache, buf.attn, buf.d_attn]));
     p2.dispatchWorkgroups(nHeads);
 
     // Output projection and the first residual. h2 = h + proj.
@@ -278,20 +361,28 @@ export class Layer {
     this.elementwise(p2, "add", buf.h2, buf.proj, buf.out, buf.d_ew_hidden, cfg.hidden);
     p2.end();
 
-    dev.queue.submit([enc.finish()]);
+    // The layer's output becomes the next step's input. Copying out -> h here
+    // rather than swapping the two means the caller can chain encode() calls with
+    // no argument and no host involvement.
+    enc.copyBufferToBuffer(buf.out, 0, buf.h, 0, cfg.hidden * 4);
+    // Only submit if we own the encoder. When the caller supplied one, they
+    // decide when to submit -- which is the whole point of sharing it.
+    if (!encoder) dev.queue.submit([enc.finish()]);
+    this.nKeys = pos + 1;
+  }
 
+  /** Read the current hidden state back to the host. This is the expensive part. */
+  async readOutput(): Promise<Float32Array> {
+    const { dev, cfg, buf } = this;
     const rd = dev.createBuffer({
       size: cfg.hidden * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
-    const enc2 = dev.createCommandEncoder();
-    enc2.copyBufferToBuffer(buf.out, 0, rd, 0, cfg.hidden * 4);
-    dev.queue.submit([enc2.finish()]);
+    const enc = dev.createCommandEncoder();
+    enc.copyBufferToBuffer(buf.out, 0, rd, 0, cfg.hidden * 4);
+    dev.queue.submit([enc.finish()]);
     await rd.mapAsync(GPUMapMode.READ);
     const out = new Float32Array(rd.getMappedRange().slice(0));
     rd.unmap(); rd.destroy();
-    for (const b of [ropeQ, ropeK, attnDims]) b.destroy();
-
-    this.nKeys = pos + 1;
     return out;
   }
 }

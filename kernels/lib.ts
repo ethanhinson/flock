@@ -398,6 +398,19 @@ export function coopSource(src: string, opts: { unpack8: boolean; unpackF16: boo
 }
 
 /**
+ * Size attention.wgsl's workgroup scores array to the KV capacity actually
+ * needed. See the note in that file: the array is a hard occupancy limit, and
+ * over-declaring it made the kernel 12x more expensive than every other dispatch
+ * in the layer at n_keys=1.
+ */
+export function attnSource(src: string, maxKeys: number): string {
+  if (maxKeys < 1 || !Number.isInteger(maxKeys)) {
+    throw new Error(`maxKeys must be a positive integer, got ${maxKeys}`);
+  }
+  return src.replaceAll("$MAX_KEYS", String(maxKeys));
+}
+
+/**
  * f16 -> f32 in f32 arithmetic, for backends without unpack2x16float. Kept as a
  * string rather than duplicated into each kernel so there is one copy to be
  * right about. inf clamps to the largest finite f32, matching lib.ts halfToF32.
