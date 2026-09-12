@@ -116,3 +116,110 @@ export async function realLayer(layer: number): Promise<LayerWeights> {
   }
   return out;
 }
+
+// ------------------------------------------------------------- the whole model
+
+/** Every tensor of Qwen3-0.6B: 28 layers plus the embedding and the final norm. */
+export interface RealModel {
+  layers: LayerWeights[];
+  /** token_embd.weight -- the embedding table AND, tied, the LM head. */
+  embd: RealTensor;
+  /** output_norm.weight: the final RMSNorm before the vocab projection. */
+  outputNorm: Float32Array;
+  eos: number;
+  bos: number;
+  nLayers: number;
+  hidden: number;
+  vocab: number;
+}
+
+/**
+ * Load the whole model, cached as ONE file under kernels/.cache.
+ *
+ * Deliberately a single whole-file download rather than 30 range requests. The
+ * per-layer path above exists because a kernel test wants ~18 MB and not 640 MB,
+ * but a full forward pass needs every byte anyway, and one sequential read beats
+ * thirty range requests that each pay a round trip. The cache is what makes the
+ * test suite usable: the download happens once, and every subsequent run reads
+ * from disk.
+ *
+ * The file is validated by SIZE against the directory the header describes, which
+ * is what catches a truncated download -- the failure mode that matters, because a
+ * short file's tail decodes as valid-looking Q8_0 rather than erroring.
+ */
+export async function realModel(): Promise<RealModel> {
+  const file = new URL("model.gguf", CACHE);
+  modelPromise ??= readModel(MODEL);
+  const model = await modelPromise;
+
+  // The file is exactly dataStart + (end of the last tensor) bytes.
+  let end = 0;
+  for (const t of model.tensors) end = Math.max(end, t.offset + t.bytes);
+  const wantBytes = model.dataStart + end;
+
+  let blob: Uint8Array;
+  try {
+    const stat = await Deno.stat(file);
+    if (stat.size !== wantBytes) {
+      throw new Error(`cached model.gguf is ${stat.size} bytes, want ${wantBytes}`);
+    }
+    blob = await Deno.readFile(file);
+  } catch {
+    console.log(`  fetching ${(wantBytes / 1e6).toFixed(0)} MB model to ${file.pathname} ...`);
+    const r = await fetch(MODEL);
+    if (!r.ok) throw new Error(`model fetch failed: ${r.status}`);
+    blob = new Uint8Array(await r.arrayBuffer());
+    if (blob.byteLength !== wantBytes) {
+      throw new Error(`downloaded ${blob.byteLength} bytes, want ${wantBytes}`);
+    }
+    await Deno.mkdir(CACHE, { recursive: true });
+    await Deno.writeFile(file, blob);
+  }
+
+  // Tensor offsets are relative to dataStart, not to the file. Reading them as
+  // absolute fetches wrong bytes that decode as valid-looking Q8_0.
+  const at = (t: { offset: number; bytes: number }) =>
+    blob.subarray(model.dataStart + t.offset, model.dataStart + t.offset + t.bytes);
+  const find = (name: string) => {
+    const t = model.tensors.find((x: { name: string }) => x.name === name);
+    if (!t) throw new Error(`tensor ${name} not in ${MODEL}`);
+    return t;
+  };
+
+  const layers: LayerWeights[] = [];
+  for (let l = 0; l < model.nLayers; l++) {
+    const w: LayerWeights = { q8: {}, f32: {} };
+    const prefix = `blk.${l}.`;
+    for (const t of layerTensors(model, l)) {
+      const key = t.name.slice(prefix.length);
+      const bytes = at(t);
+      if (t.dtype === 8) {
+        const [cols, rows] = t.shape;
+        w.q8[key] = { rows, cols, packed: bytes };
+      } else if (t.dtype === 0) {
+        // slice() first: the subarray's byteOffset is not 4-byte aligned in
+        // general, and Float32Array over an unaligned offset throws.
+        w.f32[key] = new Float32Array(bytes.slice().buffer);
+      } else {
+        throw new Error(`${t.name} has unexpected dtype ${t.dtype}`);
+      }
+    }
+    layers.push(w);
+  }
+
+  const et = find("token_embd.weight");
+  if (et.dtype !== 8) throw new Error(`token_embd is dtype ${et.dtype}, expected Q8_0`);
+  const [ecols, erows] = et.shape;
+  const nt = find("output_norm.weight");
+
+  return {
+    layers,
+    embd: { name: et.name, rows: erows, cols: ecols, packed: at(et) },
+    outputNorm: new Float32Array(at(nt).slice().buffer),
+    eos: Number(model.metadata["tokenizer.ggml.eos_token_id"]),
+    bos: Number(model.metadata["tokenizer.ggml.bos_token_id"]),
+    nLayers: model.nLayers,
+    hidden: Number(model.metadata[`${model.arch}.embedding_length`]),
+    vocab: erows,
+  };
+}

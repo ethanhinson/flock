@@ -298,10 +298,43 @@ export function maxRelErr(a: Float32Array, b: Float32Array): number {
 
 // -------------------------------------------------------------------- WebGPU
 
+/**
+ * A device with the storage-buffer limits RAISED to what the adapter actually
+ * supports, not the spec defaults.
+ *
+ * This is required, not an optimization. `maxStorageBufferBindingSize` defaults to
+ * 128 MiB, and Qwen3-0.6B's `token_embd.weight` -- which is both the embedding
+ * table and, tied, the LM head -- is 151936 x 1024 int8 = 155.6 MB once repacked
+ * into the split layout the kernels read. Binding it on a default device fails
+ * with "range 155582464 exceeds max_*_buffer_binding_size limit 134217728", and
+ * because a failed bind group is a validation error rather than an exception at
+ * the call site, the symptom is a kernel that silently writes zeros. Measured on
+ * this machine the adapter allows 4 GiB bindings and 22 GB buffers, so asking for
+ * the maximum costs nothing.
+ *
+ * A device is requested with raised limits first and falls back to the defaults if
+ * that is refused, because a browser or a smaller GPU may cap them lower -- and
+ * every kernel except the two that touch token_embd fits inside 128 MiB anyway.
+ * Note the Deno quirk this has to work around: a failed `requestDevice` still
+ * INVALIDATES the adapter ("The adapter cannot be reused, as it has been
+ * invalidated by a device creation"), so the fallback has to request a fresh one.
+ */
 export async function getDevice(): Promise<GPUDevice> {
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) throw new Error("no WebGPU adapter");
-  const dev = await adapter.requestDevice();
+  let dev: GPUDevice;
+  try {
+    dev = await adapter.requestDevice({
+      requiredLimits: {
+        maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+        maxBufferSize: adapter.limits.maxBufferSize,
+      },
+    });
+  } catch {
+    const again = await navigator.gpu.requestAdapter();
+    if (!again) throw new Error("no WebGPU adapter");
+    dev = await again.requestDevice();
+  }
   dev.addEventListener?.("uncapturederror", (e) => {
     console.error("uncaptured GPU error:", (e as GPUUncapturedErrorEvent).error);
   });
@@ -408,6 +441,31 @@ export function attnSource(src: string, maxKeys: number): string {
     throw new Error(`maxKeys must be a positive integer, got ${maxKeys}`);
   }
   return src.replaceAll("$MAX_KEYS", String(maxKeys));
+}
+
+/**
+ * Which two elements of a head RoPE rotates together.
+ *
+ *   "norm"  GGUF / llama.cpp: adjacent, (0,1), (2,3), ...
+ *   "neox"  HuggingFace:      halves,   (0,64), (1,65), ...
+ *
+ * A parameter rather than a constant because which one is correct depends on the
+ * WEIGHTS and not on the file format. llama.cpp's converter permutes q/k for
+ * Llama-style models so that NORM reproduces HF; a GGUF converted without that
+ * permutation still needs HF pairing. Qwen3-0.6B-Q8_0 is the latter -- measured,
+ * see test_rope_convention.ts and the note in rope.wgsl.
+ *
+ * Both are self-consistent rotations, so the wrong choice degrades the model
+ * silently instead of failing. That is why it is measured against ONNX rather than
+ * inferred from the container.
+ */
+export type RopePairing = "norm" | "neox";
+
+export function ropeSource(src: string, pairing: RopePairing): string {
+  const [ia, ib] = pairing === "norm"
+    ? ["j * 2u", "j * 2u + 1u"]
+    : ["j", "j + half_dim"];
+  return src.replaceAll("$ROPE_IA", ia).replaceAll("$ROPE_IB", ib);
 }
 
 /**

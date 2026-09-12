@@ -45,8 +45,8 @@
 // count matters more than the arithmetic.
 
 import {
-  attnSource, coopSource, probeUnpack, probeUnpackF16, splitQ8, storageBuffer,
-  uniformBuffer,
+  attnSource, coopSource, probeUnpack, probeUnpackF16, ropeSource, splitQ8,
+  storageBuffer, uniformBuffer, type RopePairing,
 } from "./lib.ts";
 
 export interface LayerWeights {
@@ -65,6 +65,22 @@ export interface LayerConfig {
   eps: number;         // 1e-6
   ropeBase: number;    // 1e6
   maxKeys: number;     // KV cache capacity
+  /**
+   * Largest prefill batch, which sizes every activation buffer (q, k, v, the ffn
+   * intermediates). Prefill is what makes those buffers N-wide: a decode step
+   * needs 3072 floats of `gate`, a 256-token prefill needs 786432. Default 512,
+   * which is ~10 MB of activations for Qwen3-0.6B; a longer prompt is chunked
+   * rather than requiring a reallocation.
+   */
+  maxPrefill: number;
+  /**
+   * Which two elements of a head RoPE rotates together. "neox" (HuggingFace
+   * halves) is correct for Qwen3-0.6B-Q8_0 -- MEASURED against the ONNX graphs,
+   * not inferred from the fact that the weights came out of a GGUF. See
+   * rope.wgsl and test_rope_convention.ts; the wrong choice is a
+   * position-dependent silent degradation, not a failure.
+   */
+  ropePairing: RopePairing;
 }
 
 // maxKeys is 2048, not the 4096 that 16 KB of workgroup memory allows, and that
@@ -74,11 +90,37 @@ export interface LayerConfig {
 // that number in hand.
 export const QWEN3_06B: LayerConfig = {
   hidden: 1024, nHeads: 16, nKvHeads: 8, headDim: 128, ffn: 3072,
-  eps: 9.999999974752427e-7, ropeBase: 1e6, maxKeys: 2048,
+  eps: 9.999999974752427e-7, ropeBase: 1e6, maxKeys: 2048, maxPrefill: 512,
+  ropePairing: "neox",
 };
 
 const ROWS_PER_WG = 4;     // must match q8_coop.wgsl
 const COOP_LANES = 64;     // must match q8_coop.wgsl
+
+/**
+ * queue.writeBuffer, but correct for a TypedArray that VIEWS part of a larger
+ * buffer.
+ *
+ * Deno 2.1.2's wgpu backend ignores a view's byteOffset and length and uploads the
+ * whole underlying ArrayBuffer from 0. Measured directly: writing
+ * `new Float32Array([1..8]).subarray(4, 8)` into a 4-float buffer reports "Copy of
+ * 0..32 would end up overrunning the bounds of the Destination buffer of size 16".
+ *
+ * That error only appears when the destination happens to be too small. When it is
+ * large enough -- which it is for every activation buffer here, since they are
+ * sized for maxPrefill -- the write SILENTLY lands the wrong data, and the symptom
+ * is a model that computes a plausible wrong answer. It cost real time: feeding
+ * decode steps as `hidden.subarray(i * H, (i + 1) * H)` made every step consume
+ * token 0, so the KV cache filled with one key repeated and the prefill-vs-decode
+ * equivalence test failed with the GPU prefill (correct) blamed for it.
+ *
+ * Passing the ArrayBuffer with an explicit byte offset and size is honoured
+ * correctly, so that is what this does. Slicing instead would also work and would
+ * cost a copy of every hidden state on every step.
+ */
+function writeView(dev: GPUDevice, buf: GPUBuffer, offset: number, data: Float32Array) {
+  dev.queue.writeBuffer(buf, offset, data.buffer, data.byteOffset, data.byteLength);
+}
 
 /** inv_freq[j] = 1 / base^(2j/headDim), computed on the host so it is exact. */
 function invFreqOf(headDim: number, base: number): Float32Array {
@@ -94,7 +136,14 @@ export class Layer {
   private cfg: LayerConfig;
   private pipes!: Record<string, GPUComputePipeline>;
   private buf: Record<string, GPUBuffer> = {};
-  private wq: Record<string, { qs: GPUBuffer; sc: GPUBuffer; dims: GPUBuffer; rows: number }> = {};
+  private wq: Record<string, {
+    qs: GPUBuffer; sc: GPUBuffer;
+    /** matvec Dims with n_tokens = 1, for decode. */
+    dims: GPUBuffer;
+    /** matvec Dims with n_tokens = the current prefill batch, rewritten per chunk. */
+    dimsPre: GPUBuffer;
+    rows: number; cols: number;
+  }> = {};
   /** How many keys are currently in the cache. */
   nKeys = 0;
 
@@ -117,26 +166,44 @@ export class Layer {
     L.pipes = {
       matvec: mk(coopSource(await src("q8_coop.wgsl"), { unpack8, unpackF16 })),
       rmsnorm: mk(await src("rmsnorm.wgsl")),
-      rope: mk(await src("rope.wgsl")),
+      rope: mk(ropeSource(await src("rope.wgsl"), cfg.ropePairing)),
       // The scores array is sized to maxKeys, not to a fixed maximum: workgroup
       // memory caps occupancy, and declaring the full 16 KB made attention cost
       // 328 us instead of 21 us. Measured; see attention.wgsl.
       attn: mk(attnSource(await src("attention.wgsl"), cfg.maxKeys)),
+      // Prefill attention is a SEPARATE kernel, not the decode one run N times.
+      // Its softmax is streaming, so it holds O(TILE) scores instead of O(n_keys)
+      // and has no maxKeys cap -- see attention_prefill.wgsl. Decode keeps the
+      // one-pass kernel because at n_keys in the low thousands the single pass is
+      // strictly less work and the cap is not yet binding.
+      attnPre: mk(await src("attention_prefill.wgsl")),
       swiglu: mk(ew, "swiglu"),
       add: mk(ew, "add"),
     };
 
     // Weights: repack each Q8_0 tensor into split qs/scales once, here.
+    //
+    // Two dims uniforms per weight, not one: the matvec's n_tokens differs between
+    // decode (1) and prefill (N), and a uniform that is REWRITTEN per call would
+    // invalidate nothing but would serialize -- queue.writeBuffer before a dispatch
+    // that reads it is ordered, but doing it 7 times per layer per prefill chunk is
+    // 196 host calls. Two immutable buffers cost 32 bytes and keep both bind groups
+    // permanently cacheable, which is worth ~4 ms/layer (see the bind-group note).
     for (const [name, t] of Object.entries(w.q8)) {
       const { qs, scales } = splitQ8(t.packed, t.rows, t.cols);
       L.wq[name] = {
         qs: storageBuffer(dev, qs), sc: storageBuffer(dev, scales),
-        dims: uniformBuffer(dev, [t.rows, t.cols, 0, 0]), rows: t.rows,
+        dims: uniformBuffer(dev, [t.rows, t.cols, 1, 0]),
+        dimsPre: dev.createBuffer({
+          size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        }),
+        rows: t.rows, cols: t.cols,
       };
     }
     for (const [name, v] of Object.entries(w.f32)) L.buf["g_" + name] = storageBuffer(dev, v);
 
     const { hidden, nHeads, nKvHeads, headDim, ffn, maxKeys } = cfg;
+    const P = Math.max(1, cfg.maxPrefill);
     const rw = (n: number) => dev.createBuffer({
       size: n * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
@@ -146,20 +213,26 @@ export class Layer {
     // has a distinct destination -- qn/kn for the per-head norms, h2 for the
     // residual -- rather than working in place. This is not a micro-optimization
     // being skipped: the in-place version is a validation error, not merely slow.
-    L.buf.h = rw(hidden);          // hidden state in / residual source
-    L.buf.h2 = rw(hidden);         // after the attention residual
-    L.buf.out = rw(hidden);        // after the ffn residual: the layer's output
-    L.buf.nh = rw(hidden);         // normalized hidden
-    L.buf.q = rw(nHeads * headDim);
-    L.buf.qn = rw(nHeads * headDim);     // q after per-head norm
-    L.buf.k = rw(nKvHeads * headDim);
-    L.buf.kn = rw(nKvHeads * headDim);   // k after per-head norm
-    L.buf.v = rw(nKvHeads * headDim);
-    L.buf.attn = rw(nHeads * headDim);
-    L.buf.proj = rw(hidden);
-    L.buf.gate = rw(ffn);
-    L.buf.up = rw(ffn);
-    L.buf.act = rw(ffn);
+    //
+    // Every activation buffer is maxPrefill-wide, and one buffer set serves both
+    // paths: decode is the N=1 case and uses the first slice of each. That is why
+    // there is one Layer class and not two -- the KV cache, the bind-group cache
+    // and the weights are shared, and prefill differs only in the dispatch sizes
+    // and in which attention kernel runs.
+    L.buf.h = rw(P * hidden);      // hidden state in / residual source
+    L.buf.h2 = rw(P * hidden);     // after the attention residual
+    L.buf.out = rw(P * hidden);    // after the ffn residual: the layer's output
+    L.buf.nh = rw(P * hidden);     // normalized hidden
+    L.buf.q = rw(P * nHeads * headDim);
+    L.buf.qn = rw(P * nHeads * headDim);     // q after per-head norm
+    L.buf.k = rw(P * nKvHeads * headDim);
+    L.buf.kn = rw(P * nKvHeads * headDim);   // k after per-head norm
+    L.buf.v = rw(P * nKvHeads * headDim);
+    L.buf.attn = rw(P * nHeads * headDim);
+    L.buf.proj = rw(P * hidden);
+    L.buf.gate = rw(P * ffn);
+    L.buf.up = rw(P * ffn);
+    L.buf.act = rw(P * ffn);
     // KV cache, laid out [key][kv_head][head_dim] so appending a token is one
     // contiguous write -- which is what a decode step does every time.
     L.buf.kcache = rw(maxKeys * nKvHeads * headDim);
@@ -188,6 +261,26 @@ export class Layer {
     L.buf.d_rope_q = posU();
     L.buf.d_rope_k = posU();
     L.buf.d_attn = posU();
+    // The prefill counterparts of every shape-carrying uniform. They are rewritten
+    // once per chunk (not per op and not per token), so the cost is 6 writeBuffers
+    // per layer per chunk regardless of N, and their bind groups stay cached.
+    //
+    // RMSNorm's n_vecs is where prefill actually shows up in the norms: the hidden
+    // norm becomes N vectors of `hidden`, and the per-head q/k norms become
+    // N*nHeads and N*nKvHeads vectors of headDim. One dispatch each, still.
+    L.buf.dp_norm_hidden = posU();
+    L.buf.dp_norm_q = posU();
+    L.buf.dp_norm_k = posU();
+    L.buf.dp_ew_hidden = posU();
+    L.buf.dp_ew_ffn = posU();
+    L.buf.dp_attn = dev.createBuffer({
+      size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    // eps never changes, so write it into the prefill norm uniforms once here; only
+    // the n/n_vecs words are rewritten per chunk.
+    for (const b of [L.buf.dp_norm_hidden, L.buf.dp_norm_q, L.buf.dp_norm_k]) {
+      dev.queue.writeBuffer(b, 8, new Float32Array([cfg.eps]));
+    }
     for (const [name, pipe] of Object.entries(L.pipes)) L.pipeKey.set(pipe, name);
     return L;
   }
@@ -228,14 +321,20 @@ export class Layer {
   private bufId = new Map<GPUBuffer, number>();
   private pipeKey = new Map<GPUComputePipeline, string>();
 
+  /**
+   * One projection. `nTokens > 1` dispatches the batched form: the token index
+   * rides on workgroup_id.y, so N tokens are one dispatch rather than N.
+   */
   private matvec(
     p: GPUComputePassEncoder, wName: string, xBuf: GPUBuffer, outBuf: GPUBuffer,
+    nTokens = 1,
   ) {
     const w = this.wq[wName];
     const pipe = this.pipes.matvec;
     p.setPipeline(pipe);
-    p.setBindGroup(0, this.bind(pipe, [w.qs, w.sc, xBuf, outBuf, w.dims]));
-    p.dispatchWorkgroups(Math.ceil(w.rows / ROWS_PER_WG));
+    p.setBindGroup(0, this.bind(pipe,
+      [w.qs, w.sc, xBuf, outBuf, nTokens === 1 ? w.dims : w.dimsPre]));
+    p.dispatchWorkgroups(Math.ceil(w.rows / ROWS_PER_WG), nTokens);
   }
 
   private norm(
@@ -294,7 +393,7 @@ export class Layer {
     const pos = this.nKeys;
     if (pos >= cfg.maxKeys) throw new Error(`KV cache full at ${cfg.maxKeys} keys`);
 
-    if (hidden) dev.queue.writeBuffer(buf.h, 0, hidden);
+    if (hidden) writeView(dev, buf.h, 0, hidden);
 
     // Position-dependent uniforms are REWRITTEN, not reallocated. Allocating them
     // per step would make their bind groups uncacheable, which is the expensive
@@ -371,14 +470,156 @@ export class Layer {
     this.nKeys = pos + 1;
   }
 
-  /** Read the current hidden state back to the host. This is the expensive part. */
-  async readOutput(): Promise<Float32Array> {
+  /**
+   * Encode a PREFILL of `nTokens` positions starting at `this.nKeys`.
+   *
+   * Same op sequence as decode -- it is the same layer -- with four differences,
+   * each of which is a place a prefill implementation can be quietly wrong:
+   *
+   *  1. Every matvec is batched (workgroup_id.y over tokens), so the seven
+   *     projections are seven dispatches and not 7N.
+   *  2. RMSNorm's n_vecs is multiplied by nTokens. The per-head q/k norms become
+   *     N*nHeads and N*nKvHeads independent 128-wide vectors -- still one dispatch
+   *     each, because the kernel was written around "n_vecs vectors of width n"
+   *     for exactly this reason.
+   *  3. RoPE gets n_tokens = N and pos0 = this.nKeys, so token i is rotated by
+   *     position nKeys + i. This is the one place where a prefill bug is invisible
+   *     in the output magnitude: every token rotated by the same angle is a
+   *     self-consistent, wrong model.
+   *  4. Attention is the streaming-softmax prefill kernel over an N x (pos+N)
+   *     causal region, dispatched (nHeads, N). Decode's kernel would compute the
+   *     wrong thing here, not just slowly: it has one query and no causal bound
+   *     per query.
+   *
+   * The KV append is still a single contiguous copy. kn/v hold the batch as
+   * [token][kv_head][head_dim] and the cache is [key][kv_head][head_dim], so N
+   * tokens land as one run of N*kvBytes at pos*kvBytes -- the layouts agree by
+   * construction, which is why prefill needs no scatter kernel.
+   *
+   * `hidden` is N*cfg.hidden long, or omitted to consume what is already in the
+   * buffer (how one layer feeds the next with no host round-trip).
+   */
+  encodePrefill(nTokens: number, hidden?: Float32Array, encoder?: GPUCommandEncoder): void {
     const { dev, cfg, buf } = this;
+    const { nHeads, nKvHeads, headDim, ffn, hidden: H } = cfg;
+    const pos = this.nKeys;
+    if (nTokens < 1) throw new Error(`nTokens must be >= 1, got ${nTokens}`);
+    if (nTokens > cfg.maxPrefill) {
+      throw new Error(`prefill of ${nTokens} exceeds maxPrefill ${cfg.maxPrefill}; chunk it`);
+    }
+    if (pos + nTokens > cfg.maxKeys) {
+      throw new Error(`KV cache would exceed ${cfg.maxKeys} keys (${pos} + ${nTokens})`);
+    }
+    if (hidden && hidden.length !== nTokens * H) {
+      throw new Error(`hidden is ${hidden.length}, expected ${nTokens * H}`);
+    }
+    if (hidden) writeView(dev, buf.h, 0, hidden);
+
+    // Per-chunk uniform rewrites: 6 + 7 writes, independent of N. The matvec dims
+    // differ per weight only in rows/cols, so each weight's own dimsPre is written.
+    const u32 = (...v: number[]) => new Uint32Array(v);
+    dev.queue.writeBuffer(buf.dp_norm_hidden, 0, u32(H, nTokens));
+    dev.queue.writeBuffer(buf.dp_norm_q, 0, u32(headDim, nTokens * nHeads));
+    dev.queue.writeBuffer(buf.dp_norm_k, 0, u32(headDim, nTokens * nKvHeads));
+    dev.queue.writeBuffer(buf.dp_ew_hidden, 0, u32(nTokens * H, 0, 0, 0));
+    dev.queue.writeBuffer(buf.dp_ew_ffn, 0, u32(nTokens * ffn, 0, 0, 0));
+    dev.queue.writeBuffer(buf.dp_attn, 0,
+      u32(nHeads, nKvHeads, headDim, nTokens, pos, 0, 0, 0));
+    dev.queue.writeBuffer(buf.d_rope_q, 0, u32(nTokens, nHeads, headDim, pos));
+    dev.queue.writeBuffer(buf.d_rope_k, 0, u32(nTokens, nKvHeads, headDim, pos));
+    for (const name of Object.keys(this.wq)) {
+      const w = this.wq[name];
+      dev.queue.writeBuffer(w.dimsPre, 0, u32(w.rows, w.cols, nTokens, 0));
+    }
+
+    const enc = encoder ?? dev.createCommandEncoder();
+    const p = enc.beginComputePass();
+
+    // --- attention block ---------------------------------------------------
+    this.norm(p, buf.h, buf["g_attn_norm.weight"], buf.nh, buf.dp_norm_hidden, nTokens);
+    this.matvec(p, "attn_q.weight", buf.nh, buf.q, nTokens);
+    this.matvec(p, "attn_k.weight", buf.nh, buf.k, nTokens);
+    this.matvec(p, "attn_v.weight", buf.nh, buf.v, nTokens);
+    this.norm(p, buf.q, buf["g_attn_q_norm.weight"], buf.qn, buf.dp_norm_q,
+      nTokens * nHeads);
+    this.norm(p, buf.k, buf["g_attn_k_norm.weight"], buf.kn, buf.dp_norm_k,
+      nTokens * nKvHeads);
+
+    const rope = (dims: GPUBuffer, x: GPUBuffer, heads: number) => {
+      p.setPipeline(this.pipes.rope);
+      p.setBindGroup(0, this.bind(this.pipes.rope, [x, dims, buf.invFreq]));
+      p.dispatchWorkgroups(Math.ceil((nTokens * heads * headDim / 2) / 64));
+    };
+    rope(buf.d_rope_q, buf.qn, nHeads);
+    rope(buf.d_rope_k, buf.kn, nKvHeads);
+    p.end();
+
+    // N tokens of k/v as ONE contiguous copy: the batch layout and the cache
+    // layout are both [*][kv_head][head_dim], so they concatenate.
+    const kvBytes = nKvHeads * headDim * 4;
+    enc.copyBufferToBuffer(buf.kn, 0, buf.kcache, pos * kvBytes, nTokens * kvBytes);
+    enc.copyBufferToBuffer(buf.v, 0, buf.vcache, pos * kvBytes, nTokens * kvBytes);
+
+    const p2 = enc.beginComputePass();
+    p2.setPipeline(this.pipes.attnPre);
+    p2.setBindGroup(0, this.bind(this.pipes.attnPre,
+      [buf.qn, buf.kcache, buf.vcache, buf.attn, buf.dp_attn]));
+    // (head, query): one workgroup per pair, which is what keeps prefill wide.
+    p2.dispatchWorkgroups(nHeads, nTokens);
+
+    this.matvec(p2, "attn_output.weight", buf.attn, buf.proj, nTokens);
+    this.elementwise(p2, "add", buf.h, buf.proj, buf.h2, buf.dp_ew_hidden, nTokens * H);
+
+    // --- feed-forward block ------------------------------------------------
+    this.norm(p2, buf.h2, buf["g_ffn_norm.weight"], buf.nh, buf.dp_norm_hidden, nTokens);
+    this.matvec(p2, "ffn_gate.weight", buf.nh, buf.gate, nTokens);
+    this.matvec(p2, "ffn_up.weight", buf.nh, buf.up, nTokens);
+    this.elementwise(p2, "swiglu", buf.gate, buf.up, buf.act, buf.dp_ew_ffn, nTokens * ffn);
+    this.matvec(p2, "ffn_down.weight", buf.act, buf.proj, nTokens);
+    this.elementwise(p2, "add", buf.h2, buf.proj, buf.out, buf.dp_ew_hidden, nTokens * H);
+    p2.end();
+
+    enc.copyBufferToBuffer(buf.out, 0, buf.h, 0, nTokens * H * 4);
+    if (!encoder) dev.queue.submit([enc.finish()]);
+    this.nKeys = pos + nTokens;
+  }
+
+  /** The buffer holding this layer's output, for a caller chaining layers itself. */
+  outputBuffer(): GPUBuffer { return this.buf.out; }
+
+  /**
+   * The buffer this layer reads its input from.
+   *
+   * Exposed so a Model can chain 28 layers with device-to-device copies inside one
+   * command buffer, instead of passing a Float32Array per layer -- which would mean
+   * a readback and an upload per layer, ~24 ms each on this backend against a
+   * whole-token budget of a few ms.
+   */
+  inputBuffer(): GPUBuffer { return this.buf.h; }
+
+  /**
+   * The KV cache buffers. Exposed so a test can assert that a prefill left the
+   * cache BIT-IDENTICAL to what the equivalent decode steps would have written --
+   * a prefill can produce the right hidden states and still corrupt the cache,
+   * which then breaks every token generated afterwards instead of the prefill.
+   */
+  cacheBuffers(): { k: GPUBuffer; v: GPUBuffer } {
+    return { k: this.buf.kcache, v: this.buf.vcache };
+  }
+
+  /**
+   * Read the hidden state back to the host. This is the expensive part (~24 ms).
+   *
+   * `nTokens` reads a whole prefill batch; the default of 1 is the decode case.
+   */
+  async readOutput(nTokens = 1): Promise<Float32Array> {
+    const { dev, cfg, buf } = this;
+    const bytes = nTokens * cfg.hidden * 4;
     const rd = dev.createBuffer({
-      size: cfg.hidden * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
     const enc = dev.createCommandEncoder();
-    enc.copyBufferToBuffer(buf.out, 0, rd, 0, cfg.hidden * 4);
+    enc.copyBufferToBuffer(buf.out, 0, rd, 0, bytes);
     dev.queue.submit([enc.finish()]);
     await rd.mapAsync(GPUMapMode.READ);
     const out = new Float32Array(rd.getMappedRange().slice(0));

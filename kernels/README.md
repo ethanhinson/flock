@@ -1,42 +1,106 @@
-# WGSL kernels: a GGUF transformer layer, no ONNX
+# WGSL kernels: Qwen3 end to end, no ONNX
 
-Six WebGPU compute kernels and a `layerForward()` that composes them into one
-Qwen3 transformer layer, consuming Q8_0 weights straight out of a GGUF file. No
-ONNX export, no Python build step, no pre-built artifacts.
+Nine WebGPU compute kernels and a `Model` that composes them into the whole of
+Qwen3-0.6B — token ids in, next token id out — consuming Q8_0 weights straight
+out of a GGUF file. No ONNX export, no Python build step, no pre-built artifacts.
 
 ```bash
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_q8.ts     # reference matvec
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_coop.ts   # optimized Q8_0 + Q4_0
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_ops.ts    # rmsnorm, rope, swiglu, add, attention
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_layer.ts  # whole layer vs CPU reference
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_onnx.ts   # whole layer vs web/shard0.onnx
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/bench.ts       # matvec benchmark
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/bench_layer.ts # layer benchmark
+deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_q8.ts      # reference matvec
+deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_coop.ts    # optimized Q8_0 + Q4_0
+deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_ops.ts     # rmsnorm, rope, swiglu, add, attention
+deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_head.ts    # embedding, argmax, prefill attention
+deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_layer.ts   # whole layer vs CPU reference
+deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_prefill.ts # prefill vs N decode steps
+deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_onnx.ts    # one layer vs web/shard0.onnx
+deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_model.ts   # WHOLE MODEL vs the ONNX pipeline
+deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/bench.ts        # matvec benchmark
+deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/bench_layer.ts  # layer benchmark
+deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/bench_model.ts  # embedding, head, prefill, token
 ```
 
-79 assertions, all passing, stable across repeated runs.
+171 assertions, all passing, stable across repeated runs.
 
 ## Status
+
+**The engine generates the same text as ONNX, token for token.**
+
+```
+prompt  "Capital of France?"
+WGSL    [785,6722,315,9625,374,3070,59604,334,13]   "The capital of France is **Paris**."
+ONNX    [785,6722,315,9625,374,3070,59604,334,13]   identical, both stop at EOS
+
+prompt  "What is 2 + 2?"
+WGSL    [17,488,220,17,284,220,19,13]               "2 + 2 = 4."
+ONNX    [17,488,220,17,284,220,19,13]               identical
+```
+
+ONNX here is the full five-graph pipeline flock ships — `embed.onnx`,
+`layers.onnx` (layers 0-23), `shard0.onnx`, `shard1.onnx`, `head.onnx` — under
+onnxruntime-node, with the same tokenizer and chat template.
 
 | kernel | file | validated against |
 |---|---|---|
 | Q8_0 matvec, reference | `q8_matmul.wgsl` | strict-f32 CPU, **bit-exact** |
-| Q8_0 matvec, cooperative | `q8_coop.wgsl` | strict-f32 CPU, **bit-exact** |
+| Q8_0 matvec, cooperative (+batched) | `q8_coop.wgsl` | strict-f32 CPU, **bit-exact** |
 | Q4_0 matvec, cooperative | `q4_coop.wgsl` | strict-f32 CPU, **bit-exact** |
 | RMSNorm (incl. per-head) | `rmsnorm.wgsl` | strict-f32 CPU, **bit-exact** |
-| RoPE | `rope.wgsl` | strict-f32 CPU, ~1.5 ULP |
+| RoPE (both pairings) | `rope.wgsl` | strict-f32 CPU, ~1.5 ULP |
 | SwiGLU + add | `elementwise.wgsl` | add bit-exact, swiglu ~2.5 ULP |
-| Causal GQA attention | `attention.wgsl` | strict-f32 CPU, ~1.5e-5 |
-| Whole layer | `layer.ts` | CPU reference layer, 1-2 ULP; **ONNX shard, cosine 0.9997** |
+| Causal GQA attention, decode | `attention.wgsl` | strict-f32 CPU, ~1.5e-5 |
+| Causal GQA attention, prefill | `attention_prefill.wgsl` | streaming-softmax CPU ref, ~4e-7 |
+| Token embedding gather | `embed.wgsl` | on-disk-layout decoder, **bit-exact**, real 165 MB tensor |
+| Argmax reduction | `argmax.wgsl` | host scan, **exact**, incl. the tie rule |
+| Whole layer, decode | `layer.ts` | CPU reference, 1-2 ULP; ONNX shard cosine 0.9997 |
+| Whole layer, prefill | `layer.ts` | CPU ref 2e-7; **bit-identical to N decode steps** |
+| Whole model | `model.ts` | **same token ids as the ONNX pipeline** |
 
-`layerForward()` is real: two chained WGSL layers reproduce `web/shard0.onnx`
-(Qwen3 layers 24-25) at cosine similarity 0.9997, with the remaining gap
-accounted for by Q8_0 quantization (measured, see below). **That is the point
-at which ONNX can be deleted.**
+The strongest single piece of evidence is not a tolerance. `encodePrefill(N)` is
+**bit-identical** (`0.0e+0`) to N sequential decode steps — hidden states and KV
+cache — and the two paths share no attention code: one-pass versus streaming
+softmax, different kernels, different uniforms, different dispatch shapes.
 
-Not done: no prompt prefill (decode only, one token per step), no embedding or
-LM head, no multi-shard chaining, and attention caps at `maxKeys` (2048 by
-default) because the softmax is not streaming.
+### Where long generations diverge, and why
+
+A 60-token generation does eventually disagree, and the divergence is measured
+rather than assumed. For `"Explain in three sentences why the sky is blue."` the
+first difference is at generated token **30**:
+
+```
+WGSL picks 4803   logit 24.57773
+ONNX picks 12203  logit 24.48939 under WGSL
+gap/scale 3.59e-3
+```
+
+Three things establish this is quantization, not a bug, and all three are
+assertions in `test_model.ts`:
+
+- The gap is **smaller than the quantization difference**. The hidden state
+  feeding the projection differs from ONNX's by 1.22e-2 relative (Q8_0 weights
+  versus f32), which is 3.4x larger than the gap. Neither engine is "right".
+- ONNX's token is WGSL's **rank #2 of 151936**. A wiring bug scatters the
+  reference's choice into the tail; it does not leave it second.
+- It happens at the run's **tightest margin**. Over 66 steps the margin/scale
+  distribution is min 3.59e-3, median 8.94e-2, max 4.27e-1, and only 4 of 66
+  steps are under 1e-2. Agreement lasts 30 tokens because nearly every step is
+  decided by a margin an order of magnitude clear of the noise.
+
+### Not done
+
+- **No sampling.** Greedy decode only.
+- **`maxKeys` is 2048** for decode, because `attention.wgsl`'s softmax is not
+  streaming and its workgroup array is an occupancy cliff (see below).
+  `attention_prefill.wgsl` has no such cap — it is validated at pos0=2100 — so
+  the ceiling is the decode kernel's alone, and lifting it means giving decode
+  the streaming softmax too.
+- **No tiled GEMM for prefill.** The batched matvec saves N-1 dispatches per
+  projection but re-reads the weights per token, so it does not reuse weight
+  loads across the batch. Prefill still reaches 501 tok/s; a real tile would
+  beat that and the amount is unmeasured.
+- **The 165 MB tied matrix needs raised device limits.** `getDevice()` requests
+  the adapter's real `maxStorageBufferBindingSize`; the 128 MiB default is too
+  small and the failure is silent (see below).
+- **`unpack4xI8` is still unbenchmarkable here** — Deno's wgpu does not
+  implement it, so the fallback path is what all of these numbers describe.
 
 ## Benchmarks
 
@@ -82,9 +146,152 @@ A 28-layer pass projects to **25.7 tok/s** batched, versus 1.24 tok/s with a
 readback and a submit per layer. The arithmetic is ~15% of a batched step; the
 rest is per-dispatch overhead, which is why attention is one fused dispatch.
 
+### Embedding, LM head, argmax
+
+`bench_model.ts`. Batched figures are per dispatch with the fence's ~26 ms removed.
+
+| op | shape | batched | note |
+|---|---|---|---|
+| embedding gather | 1 token | 18.5 us | |
+| embedding gather | 16 tokens | 18.7 us | |
+| embedding gather | 64 tokens | 18.3 us | |
+| embedding gather | 256 tokens | 18.4 us | |
+| LM head matvec | 151936x1024 | **785 us** | 396 GFLOP/s, 211 GB/s, 37984 workgroups |
+| same kernel, layer shape | 3072x1024 | 38 us | 88 GB/s |
+| argmax pass1 + pass2 | 151936 | 31 + 20 us | |
+
+The embedding is **flat from 1 to 256 tokens** — 256x the work for the same time,
+which is what a dispatch that is pure launch overhead looks like. A decode step's
+gather is 5 KB and costs the same as an empty kernel, so there is nothing to win.
+
+The LM head is the largest single op in the model: ~21x the biggest matvec inside
+a layer, and 4% of a 28-layer step's total arithmetic. **It is not a bad dispatch
+shape** — that was checked rather than assumed, by running the same kernel at a
+layer-sized shape with the same per-byte accounting. The head sustains 211 GB/s
+against the layer shape's 88, i.e. **2.4x better** per byte: 3.3 MB is too little
+work to saturate the GPU and 165 MB is not. So the head is already doing the best
+this kernel does, and a faster one needs fewer *bytes* (Q4 on this one tensor) or
+fewer *rows*, not a better dispatch. Whether 211 GB/s is near this machine's
+ceiling was not measured, so no absolute headroom claim is made.
+
+**Argmax on the GPU is a negative result.** It was expected to beat reading
+151936 floats back; measured, it is **1.04x**:
+
+| | one call |
+|---|---|
+| GPU reduction + 4-byte readback | 26.3 ms |
+| copy 0.61 MB back + scan in JS | 27.4 ms |
+
+Not because the reduction is slow — it is 50 us of kernel — but because *both*
+paths pay one map readback, and that readback is ~26 ms regardless of size on
+this backend, swamping both the copy and the kernel. The reduction is still the
+right choice (never slower, keeps 0.6 MB off the bus, and wins properly on a
+backend whose readback scales with size), but 1.04x is the honest number.
+
+### Prefill and a whole token
+
+| | per token | tok/s |
+|---|---|---|
+| prefill, 1 token | 42.1 ms | 24 |
+| prefill, 8 tokens | 7.71 ms | 130 |
+| prefill, 16 tokens | 4.54 ms | 220 |
+| prefill, 64 tokens | 2.51 ms | 399 |
+| prefill, 128 tokens | 2.10 ms | 477 |
+| prefill, 256 tokens | **2.00 ms** | **501** |
+| decode at 16 keys | 43.7 ms | 22.9 |
+| decode at 128 keys | 44.5 ms | 22.5 |
+| decode at 512 keys | 57.7 ms | 17.3 |
+
+**Prefill is 19.8x faster than decoding the same tokens**: 128 tokens take 279 ms
+as one prefill and 5520 ms as 128 decode steps. That ratio is the entire
+justification for prefill existing — a decode step's cost is dominated by
+per-dispatch and per-submit overhead, and prefill pays it once for N tokens.
+
+A decode token is dominated by the map readback, not by the model:
+
+| K decode steps behind one fence | per token | tok/s |
+|---|---|---|
+| K=1 (what generation actually pays) | 43.1 ms | 23 |
+| K=4 | 21.5 ms | 47 |
+| K=16 | 16.8 ms | 59 |
+| K=64 | 15.8 ms | 63 |
+
+The gap between K=1 and K=64 *is* the readback, ~26 ms. Greedy decode cannot
+amortize it — it needs each id on the host before choosing the next input — so
+**23 tok/s is the honest generation figure** and 63 tok/s is the GPU work
+underneath it. `stepsAmortized` exists only to measure this and deliberately
+computes the wrong tokens.
+
+## The correctness traps
+
+These are the ones that produce a **working model that is wrong**, which is worse
+than a broken one. Each was found by measurement, and each is now an assertion.
+
+**1. RoPE's pairing convention depends on the WEIGHTS, not the file format.**
+There are two conventions: GGUF/llama.cpp NORM pairs adjacent elements
+`(0,1),(2,3),...`; HuggingFace NEOX pairs halves `(0,64),(1,65),...`. Both are
+self-consistent rotations, so the wrong one does not crash and does not look
+wrong — it produces fluent, wrong text.
+
+The intuitive inference — "weights came out of a GGUF, so use NORM" — is false
+here. llama.cpp's converter permutes q/k for Llama-style models so that NORM
+reproduces HF; this Qwen3 GGUF was **not** permuted, so it still needs HF
+pairing. Measured over 24 layers on a 16-token prompt:
+
+```
+              token 0          token 15        whole tensor
+  NORM      cosine 0.999997   cosine 0.557    cosine 0.9967
+  NEOX      cosine 0.999997   cosine 0.9997   cosine 0.999989
+```
+
+The **failure signature is the useful part**: token 0 was essentially exact while
+every later token degraded monotonically with position. Position 0 has a zero
+rotation angle under either convention, so it is the one token both agree on. A
+per-token cosine that is perfect at 0 and decays with position indicts the
+rotation, not the arithmetic — which is why the magnitudes matched all along
+(|max| 8152 against ONNX's 8150).
+
+Two existing tests could not see this bug, and the reason generalizes:
+
+- `test_onnx.ts` diffs at **position 0 only**, where the conventions are
+  identical. It passed at cosine 0.999814 before the fix and 0.999735 after.
+- `test_ops.ts` asserted NORM deliberately, against a reference that stated the
+  same choice — so kernel and reference agreed with each other about the wrong
+  thing. **A consistency test between a kernel and its reference cannot catch a
+  shared assumption.** Both conventions are now built and tested, with a planted
+  input that asserts element 0's partner *is* the expected one *and* that the
+  other convention's partner is untouched.
+
+**2. `queue.writeBuffer` ignores a TypedArray view's offset** on Deno 2.1.2's
+wgpu, uploading the whole underlying ArrayBuffer from 0. Writing
+`Float32Array([1..8]).subarray(4,8)` into a 4-float buffer reports "Copy of
+0..32 would end up overrunning the bounds of the Destination buffer of size 16".
+
+The bounds error only appears when the destination is too small. With buffers
+sized for `maxPrefill` it **silently lands the wrong bytes**: feeding decode steps
+as `hidden.subarray(i * H, ...)` made every step consume token 0, so the KV cache
+filled with one key repeated — and the failing test blamed the prefill, which was
+correct. `layer.ts` `writeView()` passes `(buffer, byteOffset, byteLength)`
+explicitly, which *is* honoured.
+
+**3. The default `maxStorageBufferBindingSize` is too small for a tied LM head,
+and overflowing it is silent.** The split `token_embd` is 155.6 MB; the default
+limit is 128 MiB. An oversized bind group is a *validation error*, not an
+exception at the call site, so the symptom was a kernel writing zeros. This
+adapter allows 4 GiB, so `getDevice()` asks for the adapter's real limits. Note
+the Deno quirk the fallback has to handle: a **failed** `requestDevice` still
+invalidates the adapter, so the retry must request a fresh one.
+
+**4. `output_norm` is applied by the last SHARD, not by `head.onnx`.**
+`flock_export_coordinator.py` builds `Head(model.model.norm, model.lm_head)`
+whose forward is `self.head(hidden).argmax(-1)` — it takes the norm in its
+constructor and never calls it. `flock_export.py` applies it when `is_last`.
+Reading `head.onnx` as "norm then project" and applying `output_norm` twice on
+the WGSL side would be plausible and wrong.
+
 ## The measurement traps
 
-Four of these cost real time. They are documented because each one produced
+Six of these cost real time. They are documented because each one produced
 confident, plausible, wrong numbers.
 
 **1. `onSubmittedWorkDone()` does not wait.** On Deno 2.1.2's wgpu it returns
@@ -132,6 +339,33 @@ cancellation. Matvec cross-checks flickered between 3.9e-5 and 2.2e-4 on
 different random draws from an identical kernel. Sums of signed terms get judged
 by `absErrScaled` (max absolute error over the data's scale) instead.
 
+**5. The readback is not a constant you can difference away.** Splitting a decode
+token into "layers" and "head" by timing `step()` against `hiddenState()` and
+subtracting reported **"the head is 0% of a token"**. Both calls *end* in the
+~26 ms map readback, so the subtraction cancels the layers and the readback
+together and leaves noise. This is trap 1 wearing a different hat: the readback is
+not overhead around the measurement, it *is* the measurement. The split is now
+made by amortizing K steps behind one fence — 43.1 ms/token at K=1 falling to
+15.8 at K=64, and the gap is the readback.
+
+**6. A signal cancelled down to the noise cannot be tested, at any threshold.**
+Two attempts to assert that prefill applies RoPE per token both failed on a
+*correct* kernel. Qwen3's `rope_base` is 1e6, so at positions 0-5 the rotation
+angles are tiny:
+
+```
+positions 0..5, identical input tokens:     |positional signal|   ~1.0e-5
+GPU vs CPU reference on those same outputs:  absolute error       ~1.0e-5
+```
+
+Both are one ULP of an output near 48. So "more than 90% of entries differ"
+failed (86% is the correct answer) and comparing the GPU's positional delta
+against the reference's gave a ratio of 0.8-1.2 — one ULP against one ULP. No
+metric built at those positions can discriminate. The assertion now runs at
+**pos0=900**, where the rotation is real: max |diff| 41.7 against |out| 43.2.
+This is trap 4's deeper form — before choosing a tolerance, check that the
+quantity has any signal-to-noise margin at all.
+
 ## Device-specific gotchas
 
 - **`unpack4xI8` / `unpack4xU8` / `dot4I8Packed` are not implemented by Deno
@@ -171,9 +405,10 @@ Read from the GGUF metadata, not assumed: hidden 1024, ffn 3072, 16 query heads,
 - **q_norm and k_norm are per head**, over head_dim=128, not once over the whole
   projection. Qwen3 is unusual in having them at all. `rmsnorm.wgsl` takes an
   `n_vecs` parameter so one dispatch normalizes every head.
-- **RoPE pairs adjacent elements** (GGUF/llama.cpp NORM), not halves as
-  HuggingFace does. Both are self-consistent rotations, so the wrong one degrades
-  the model *silently*. Pinned by an exact assertion on constructed input.
+- **RoPE pairs HALVES here** (HuggingFace NEOX), not adjacent elements, even
+  though the weights come from a GGUF — this GGUF was converted without
+  llama.cpp's q/k permutation. See correctness trap 1: this was measured against
+  ONNX, and an earlier version of this README asserted the opposite.
 - **GGUF tensor shapes are `[in, out]`.** `attn_q.weight [1024, 2048]` is 2048
   rows of 1024 columns.
 - **Tensor offsets are relative to `dataStart`**, not absolute. Reading them as
@@ -188,10 +423,28 @@ Read from the GGUF metadata, not assumed: hidden 1024, ffn 3072, 16 query heads,
 ```
 lib.ts            quantize, repack, strict-f32 references, WebGPU helpers, fma32
 ops_ref.ts        CPU references for the non-matmul ops
-layer.ts          Layer: encode() / forward(), KV cache, bind-group cache
-layer_ref.ts      CPU reference layer, composed from the per-op references
-real_weights.ts   range-fetch real GGUF tensors and layers, cached in .cache/
+head_ref.ts       CPU references for embedding, argmax, prefill attention
+layer.ts          Layer: encode() / encodePrefill(), KV cache, bind-group cache
+layer_ref.ts      CPU reference layer (decode and prefill), from the per-op refs
+model.ts          Model: ids -> embedding -> 28 layers -> norm -> head -> argmax
+real_weights.ts   range-fetch GGUF tensors/layers, or the whole model, in .cache/
 dequant.ts        Q8_0 -> f32, and the quantization-term estimator
 onnx_truth.mjs    runs web/shard0.onnx under Node (native addon, cannot use Deno)
+onnx_full.mjs     runs the WHOLE ONNX pipeline + tokenizer, for the text diff
 deno.json         import map so the tests can reach @huggingface/gguf
 ```
+
+### Why `model.ts` keeps everything on the GPU
+
+A map readback is ~26 ms on this backend regardless of size, so the shape of the
+API is forced: 28 layers chained through host round-trips would cost 28 x 26 ms
+per token for numbers nobody needs yet. `step()` reads back **4 bytes** — the
+token id — and everything else (the 151936 logits, every intermediate hidden
+state, the KV cache) stays in device memory. One command buffer covers the
+embedding and all 28 layers per prefill chunk.
+
+The tied LM head needs no kernel of its own. `token_embd.weight` is 151936 rows
+of 1024 columns in the GGUF, which is exactly the layout the matvec kernel already
+wants, so the head is `q8_coop.wgsl` at a different shape and the embedding is a
+gather over the same buffer. One 155.6 MB repacked upload serves both; a second
+copy, or a dequantized one (622 MB), would buy nothing.

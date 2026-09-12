@@ -6,7 +6,7 @@
 // -- those are implementation-defined to a few ULP and Metal's differ from V8's
 // -- so those references document a tolerance and say why.
 
-import { fma32 } from "./lib.ts";
+import { fma32, type RopePairing } from "./lib.ts";
 
 const fr = Math.fround;
 
@@ -44,17 +44,22 @@ export function rmsnormRef(
 }
 
 /**
- * RoPE with GGUF/llama.cpp NORM (adjacent-pair) convention, in place on a copy.
- * `invFreq` must be precomputed by the caller so host and device agree on it.
+ * RoPE in place on a copy. `invFreq` must be precomputed by the caller so host and
+ * device agree on it.
+ *
+ * `pairing` selects which two elements of a head rotate together -- "norm"
+ * (GGUF/llama.cpp, adjacent) or "neox" (HuggingFace, halves). It is a parameter
+ * because which one is correct depends on the weights, not the container: see
+ * rope.wgsl. Qwen3-0.6B-Q8_0 needs "neox", measured against ONNX.
  *
  * cos/sin are the reason this one cannot be bit-exact: they are accurate to a
  * few ULP but Metal's and V8's implementations are different functions. The
  * error that leaks into the output is bounded by the input magnitude times a few
- * ULP, which is what test_rope.ts asserts.
+ * ULP, which is what test_ops.ts asserts.
  */
 export function ropeRef(
   x: Float32Array, nTokens: number, nHeads: number, headDim: number,
-  pos0: number, invFreq: Float32Array,
+  pos0: number, invFreq: Float32Array, pairing: RopePairing = "neox",
 ): Float32Array {
   const out = Float32Array.from(x);
   const half = headDim / 2;
@@ -63,11 +68,13 @@ export function ropeRef(
       for (let j = 0; j < half; j++) {
         const theta = fr((pos0 + t) * invFreq[j]);
         const c = fr(Math.cos(theta)), s = fr(Math.sin(theta));
-        const base = (t * nHeads + h) * headDim + j * 2;
-        const a = out[base], b = out[base + 1];
+        const base = (t * nHeads + h) * headDim;
+        const ia = base + (pairing === "norm" ? j * 2 : j);
+        const ib = base + (pairing === "norm" ? j * 2 + 1 : j + half);
+        const a = out[ia], b = out[ib];
         // a*c - b*s as one FMA: fma(-b, s, a*c).
-        out[base] = fr(-b * s + fr(a * c));
-        out[base + 1] = fr(b * c + fr(a * s));
+        out[ia] = fr(-b * s + fr(a * c));
+        out[ib] = fr(b * c + fr(a * s));
       }
     }
   }
