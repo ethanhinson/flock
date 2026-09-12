@@ -309,22 +309,108 @@ export async function getDevice(): Promise<GPUDevice> {
 }
 
 /**
- * Does this device's WGSL support the packed-byte builtins? Compiling a probe
- * shader is the only reliable answer -- there is no feature flag for them, and
- * the spec made them mandatory only after shipping implementations existed.
+ * Does this device's WGSL support a given builtin? Compiling a probe shader is
+ * the only reliable answer -- these are language builtins, not device features,
+ * so nothing is advertised in `device.features`, and they were made mandatory
+ * only after shipping implementations existed.
+ *
+ * Deno 2.1's wgpu backend has no `getCompilationInfo`, so the error scope alone
+ * has to carry the verdict. It does: a missing identifier is a validation error.
  */
-export async function probeUnpack(dev: GPUDevice): Promise<boolean> {
+export async function probeWGSL(dev: GPUDevice, body: string): Promise<boolean> {
   dev.pushErrorScope("validation");
   const m = dev.createShaderModule({
-    code: `@compute @workgroup_size(1) fn p() {
-      let v = vec4<f32>(unpack4xU8(0x0F0F0F0Fu)) + vec4<f32>(unpack4xI8(1u))
-            + vec4<f32>(unpack2x16float(0u), 0.0, 0.0);
-    }`,
+    code: `@compute @workgroup_size(1) fn p() { ${body} }`,
   });
-  const info = await m.getCompilationInfo();
+  let msgs = false;
+  if (typeof m.getCompilationInfo === "function") {
+    const info = await m.getCompilationInfo();
+    msgs = info.messages.some((x) => x.type === "error");
+  }
   const err = await dev.popErrorScope();
-  return !err && !info.messages.some((x) => x.type === "error");
+  return !err && !msgs;
 }
+
+/**
+ * The packed-byte path needs BOTH unpack4xI8 (8 int8 -> 2 vec4<f32> in two
+ * instructions) and unpack2x16float (f16 decode in one). They are probed
+ * together because the kernel uses them together.
+ *
+ * Measured support, for the record:
+ *   Deno 2.1.2 / wgpu / Metal   unpack2x16float yes, unpack4xI8 NO
+ *   Chrome / Safari 26          both yes (per swarmllm, not verified here)
+ *
+ * So on Deno the fallback shift/mask path is what actually runs, and any claim
+ * about what the builtins buy has to come from a browser, not from here.
+ */
+export function probeUnpack(dev: GPUDevice): Promise<boolean> {
+  return probeWGSL(dev, `let v = vec4<f32>(unpack4xU8(0x0F0F0F0Fu))
+      + vec4<f32>(unpack4xI8(1u))
+      + vec4<f32>(unpack2x16float(0u), 0.0, 0.0);`);
+}
+
+/** unpack2x16float alone -- available more widely than the 8-bit unpacks. */
+export function probeUnpackF16(dev: GPUDevice): Promise<boolean> {
+  return probeWGSL(dev, `let v = unpack2x16float(0u);`);
+}
+
+/**
+ * Fill in the $-placeholders in a cooperative kernel's source.
+ *
+ * WGSL has no preprocessor and the 8-bit unpack builtins are not implemented
+ * everywhere (Deno's wgpu has unpack2x16float but not unpack4xI8), so the two
+ * decode spellings live here and the host picks one per device. They produce
+ * bit-identical values -- the only difference is one instruction versus three
+ * ALU ops per element -- which is what makes it safe to validate on the
+ * fallback path and still ship the fast one.
+ */
+export function coopSource(src: string, opts: { unpack8: boolean; unpackF16: boolean }): string {
+  const i8x4 = opts.unpack8
+    // unpack4xI8 sign-extends and converts 4 bytes in one instruction.
+    ? "vec4<f32>(unpack4xI8(w))"
+    // Fallback: shift each byte into the top of a u32 and arithmetic-shift back
+    // down. `extractBits` would read better but goes through slow polyfill
+    // paths on some backends, so the shift pair is deliberate.
+    : `vec4<f32>(
+    f32(bitcast<i32>(w << 24u) >> 24u),
+    f32(bitcast<i32>(w << 16u) >> 24u),
+    f32(bitcast<i32>(w << 8u) >> 24u),
+    f32(bitcast<i32>(w) >> 24u))`;
+  // Q4_0 stores two weights per byte, biased by 8. `v` is the word already
+  // masked down to one nibble per byte, so both spellings see the same input.
+  const nib = opts.unpack8
+    ? "vec4<f32>(unpack4xU8(v)) - vec4<f32>(8.0)"
+    : `vec4<f32>(
+    f32(v & 0xFFu),
+    f32((v >> 8u) & 0xFFu),
+    f32((v >> 16u) & 0xFFu),
+    f32(v >> 24u)) - vec4<f32>(8.0)`;
+  const f16 = opts.unpackF16
+    ? "unpack2x16float(sc[i >> 1u])[i & 1u]"
+    : "half_to_f32((sc[i >> 1u] >> ((i & 1u) * 16u)) & 0xFFFFu)";
+  return src
+    .replaceAll("$DECODE_I8X4", i8x4)
+    .replaceAll("$DECODE_NIBX4", nib)
+    .replaceAll("$DECODE_F16", f16)
+    // The manual f16 decoder is only referenced on the fallback path; leaving a
+    // dead copy in every shader would be noise, so it is spliced in on demand.
+    .replace("$HALF_TO_F32", opts.unpackF16 ? "" : HALF_TO_F32_WGSL);
+}
+
+/**
+ * f16 -> f32 in f32 arithmetic, for backends without unpack2x16float. Kept as a
+ * string rather than duplicated into each kernel so there is one copy to be
+ * right about. inf clamps to the largest finite f32, matching lib.ts halfToF32.
+ */
+const HALF_TO_F32_WGSL = `
+fn half_to_f32(h: u32) -> f32 {
+  let sign = select(1.0, -1.0, (h & 0x8000u) != 0u);
+  let exp  = (h >> 10u) & 0x1Fu;
+  let man  = h & 0x3FFu;
+  if (exp == 0u) { return sign * f32(man) * 0.000000059604645; }   // 2^-24
+  if (exp == 31u) { return sign * 3.4028235e38; }
+  return sign * (1.0 + f32(man) / 1024.0) * exp2(f32(exp) - 15.0);
+}`;
 
 export function storageBuffer(dev: GPUDevice, data: Uint8Array | Float32Array): GPUBuffer {
   const bytes = data instanceof Float32Array
