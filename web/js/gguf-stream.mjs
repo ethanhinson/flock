@@ -62,7 +62,26 @@ function blockSpec(dtype) {
 export async function allocStorage(device, size, label) {
   // WebGPU requires a 4-byte-aligned size and the 34-byte Q8_0 layout is not,
   // so a tensor's scales array can land on an odd size.
-  const aligned = (size + 3) & ~3;
+  //
+  // NOT `(size + 3) & ~3`. JS bitwise operators coerce to int32, so that spelling
+  // silently WRAPS above 2GB: a 90GB request came back as a 257MB buffer with no
+  // error at all, which would then take weights quietly truncated rather than
+  // failing. Measured on a device advertising maxBufferSize 22.6GB, where such a
+  // request is otherwise plausible.
+  if (!Number.isFinite(size) || size < 0) {
+    throw new Error(`${label}: bad buffer size ${size}`);
+  }
+  const aligned = Math.ceil(size / 4) * 4;
+  // A device's own limit is the honest place to refuse, and refusing here names
+  // the tensor. An over-limit createBuffer is a validation error rather than an
+  // out-of-memory one, so the scope below would not catch it.
+  const max = device.limits?.maxBufferSize;
+  if (max && aligned > max) {
+    throw new Error(
+      `this device pledged more than its GPU can hold: ${label} needs ` +
+      `${(aligned / 1e6).toFixed(1)}MB but the largest buffer it allows is ` +
+      `${(max / 1e6).toFixed(1)}MB`);
+  }
   device.pushErrorScope('out-of-memory');
   const buf = device.createBuffer({
     label,
@@ -222,7 +241,11 @@ async function writeAndYield(device, buf, offset, src) {
   // the wrong place. The block-count rounding in SplitStreamer is what keeps this
   // from happening, so an assert here is how that invariant stays true rather
   // than quietly producing a buffer that is a few bytes out of phase.
-  if (offset & 3) {
+  // `% 4` rather than `& 3`: a buffer offset can exceed 2GB on a large tensor, and
+  // bitwise operators coerce to int32. The low-bit test happens to survive the
+  // wrap, but it is not worth leaving a second int32 trap in the file after the
+  // first one produced a silently truncated buffer. See allocStorage.
+  if (offset % 4 !== 0) {
     throw new Error(`writeBuffer offset ${offset} is not 4-byte aligned (${buf.label})`);
   }
   if (size & 3) {

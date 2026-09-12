@@ -30,7 +30,7 @@
 
 import {
   loadLayersToGPU, readDirectory, layerTensors, byteRanges, totalBytes,
-  streamTensorToGPU, fetchRange, STAGING,
+  streamTensorToGPU, fetchRange, STAGING, allocStorage,
 } from "./gguf-stream.mjs";
 import { splitQ8 } from "../../kernels/lib.ts";
 import { realLayer } from "../../kernels/real_weights.ts";
@@ -288,6 +288,36 @@ const spotGot = await readBytes(layers[26]["attn_q.weight"].qs,
 ok("a tensor from the middle of the slice matches splitQ8 too",
   firstDiff(spotGot, spotRef.qs) === -1,
   `blk.26.attn_q, first diff at ${firstDiff(spotGot, spotRef.qs)}`);
+
+// ------------------------------------------------------------- the OOM message
+//
+// An over-committed device must produce a sentence a person can act on rather than
+// a mystery. This is also where a real bug turned up: `(size + 3) & ~3` is the
+// obvious way to 4-byte-align a size, and JS bitwise operators coerce to int32, so
+// it WRAPS above 2GB. A 90GB request came back as a 257MB buffer with no error at
+// all -- weights would have been quietly truncated, which is the failure mode this
+// whole file exists to rule out. The aligner is arithmetic now, and this asserts
+// the failure is loud.
+
+console.log("\nasking for more than the device allows...");
+const limit = dev.limits.maxBufferSize;
+let oomMsg = "";
+try {
+  await allocStorage(dev, limit * 4, "impossible.qs");
+  oomMsg = "(no throw)";
+} catch (e) {
+  oomMsg = (e as Error).message;
+}
+ok("an impossible allocation throws rather than truncating",
+  oomMsg !== "(no throw)", oomMsg.slice(0, 100));
+ok("the message names the device, the tensor and both sizes",
+  /pledged more than its GPU can hold/.test(oomMsg) &&
+  /impossible\.qs/.test(oomMsg) && /MB/.test(oomMsg));
+// The wrap this replaced: int32 coercion turned 4x the limit into a small number,
+// so seeing the full magnitude in the message is what shows it is gone.
+ok("the requested size is reported at full magnitude, not wrapped",
+  oomMsg.includes(String(Math.round(limit * 4 / 1e5) / 10)),
+  `${(limit * 4 / 1e6).toFixed(1)}MB requested, limit ${(limit / 1e6).toFixed(1)}MB`);
 
 // ------------------------------------------- substitutable for the engine's own
 //
