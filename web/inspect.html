@@ -1,0 +1,125 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>flock · check this device</title>
+<style>
+  :root{
+    --bg:#0b0d10; --panel:#0d1117; --fg:#e6edf3; --dim:#7d8590; --faint:#4d5560;
+    --line:#21262d; --hot:#2f81f7; --ok:#3fb950; --bad:#f85149; --warn:#d29922;
+    --mono:ui-monospace,SFMono-Regular,SF Mono,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:14px/1.5 var(--mono);padding:14px;
+       padding-bottom:calc(20px + env(safe-area-inset-bottom));
+       max-width:620px;margin-inline:auto}
+  h1{font-size:14px;margin:0;font-weight:600;letter-spacing:.02em}
+  .sub{color:var(--dim);font-size:11.5px;margin-top:3px}
+  .ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}
+  .card{border:1px solid var(--line);border-radius:11px;padding:13px;
+        margin-top:13px;background:var(--panel)}
+  .card h2{font-size:11px;color:var(--dim);text-transform:uppercase;
+           letter-spacing:.08em;margin:0 0 9px;font-weight:600}
+  .row{display:flex;justify-content:space-between;gap:10px;padding:3px 0;
+       font-size:12.5px;align-items:baseline}
+  .row span:first-child{color:var(--dim)}
+  .row span:last-child{font-variant-numeric:tabular-nums;text-align:right}
+  .verdict{font-size:16px;font-weight:600;margin:2px 0 4px}
+  .note{color:var(--dim);font-size:11.5px;margin-top:7px;white-space:pre-wrap}
+  pre{margin:9px 0 0;padding:9px;background:#010409;border:1px solid var(--line);
+      border-radius:8px;font-size:11px;overflow-x:auto;color:var(--dim)}
+  a{color:var(--hot)}
+</style>
+
+<h1>flock · what can this device do?</h1>
+<div class="sub" id="sub">probing…</div>
+
+<!-- The verdict first. The numbers are for a human who wants to know why, but the
+     answer to "can this be a bird" has to be readable at arm's length on a phone. -->
+<div class="card">
+  <h2>verdict</h2>
+  <div class="verdict" id="verdict">…</div>
+  <div class="note" id="why"></div>
+</div>
+
+<div class="card">
+  <h2>gpu limits</h2>
+  <div class="row"><span>max storage buffer binding</span><span id="bind">—</span></div>
+  <div class="row"><span>max buffer size</span><span id="buf">—</span></div>
+  <div class="row"><span>max compute workgroup storage</span><span id="wg">—</span></div>
+  <div class="row"><span>max compute invocations / workgroup</span><span id="inv">—</span></div>
+  <div class="row"><span>adapter</span><span id="adapter">—</span></div>
+</div>
+
+<div class="card">
+  <h2>device</h2>
+  <div class="row"><span>logical cores</span><span id="cores">—</span></div>
+  <div class="row"><span>device memory hint</span><span id="mem">—</span></div>
+  <div class="row"><span>secure context</span><span id="secure">—</span></div>
+  <div class="row"><span>platform</span><span id="plat">—</span></div>
+</div>
+
+<div class="card">
+  <h2>a real compute shader</h2>
+  <div class="row"><span>result</span><span id="shader">—</span></div>
+  <div class="row"><span>round trip</span><span id="shaderms">—</span></div>
+  <div class="note">A limits table can be reported by a device that then fails to
+run anything. This dispatches an actual WGSL compute pass and checks the number it
+computes, so "WebGPU works here" is measured rather than advertised.</div>
+</div>
+
+<div class="card">
+  <h2>what the coordinator is told</h2>
+  <pre id="json">…</pre>
+  <div class="note">This exact object is what POST /join sends as <code>caps</code>,
+and it is what the allocator plans against. One probe, one set of numbers: there is
+no second implementation to drift from this one.</div>
+</div>
+
+
+<script type="module">
+// web/inspect.html — the capability probe, as a page. Served at /check.
+//
+// The measuring itself lives in /js/probe.mjs, which web/bird.html imports too. That
+// split is the point: the allocator refuses a device any layer whose largest tensor
+// exceeds its maxStorageBufferBindingSize, so the numbers it plans against must be
+// the real ones, and a second probe would eventually disagree with this one. What a
+// human reads here is literally what POST /join sent.
+import {probe, verdict} from '/js/probe.mjs';
+
+const $ = id => document.getElementById(id);
+const set = (id, v, cls) => {
+  const n = $(id);
+  if (!n) return;
+  n.textContent = v;
+  if (cls != null) n.className = cls;
+};
+const mb = n => n == null ? '—' : `${(n / 1e6).toFixed(0)} MB`;
+
+const {caps, detail} = await probe();
+const v = verdict(detail);
+$('verdict').textContent = v.headline;
+$('verdict').className = 'verdict ' + (v.ok ? 'ok' : 'bad');
+$('why').textContent = v.why;
+$('sub').innerHTML = v.ok
+  ? '<span class="ok">probe finished</span> — every number below was measured on ' +
+    'this device just now'
+  : '<span class="bad">probe finished</span> — this device cannot run layers';
+
+const L = detail.limits || {};
+set('bind', mb(L.maxStorageBufferBindingSize));
+set('buf', mb(L.maxBufferSize));
+set('wg', L.maxComputeWorkgroupStorageSize == null ? '—'
+   : `${(L.maxComputeWorkgroupStorageSize / 1024).toFixed(0)} KB`);
+set('inv', L.maxComputeInvocationsPerWorkgroup ?? '—');
+set('adapter', [detail.adapter?.vendor, detail.adapter?.architecture]
+  .filter(Boolean).join(' · ') || 'not reported');
+set('cores', detail.cores ?? 'not reported');
+set('mem', detail.deviceMemoryGb ? `${detail.deviceMemoryGb} GB (hint)` : 'not reported');
+set('secure', detail.secureContext === null ? '—' : (detail.secureContext ? 'yes' : 'no'),
+    detail.secureContext ? 'ok' : 'warn');
+set('plat', detail.platform || 'not reported');
+set('shader', detail.computeOk === null ? 'not run'
+   : (detail.computeOk ? 'correct' : 'WRONG'), detail.computeOk ? 'ok' : 'bad');
+set('shaderms', detail.computeMs == null ? '—' : `${detail.computeMs} ms`);
+$('json').textContent = JSON.stringify(caps, null, 2);
+</script>
