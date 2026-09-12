@@ -1,0 +1,5 @@
+{
+  "imports": {
+    "@huggingface/gguf": "npm:@huggingface/gguf@^0.4.6"
+  }
+}
