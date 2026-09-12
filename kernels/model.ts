@@ -349,6 +349,41 @@ export class Model {
   }
 
   /**
+   * K decode steps encoded behind ONE map readback, for measurement only.
+   *
+   * NOT a generation path, and it is important to be clear about why: greedy decode
+   * needs each token id on the host before it can choose the next input, so it
+   * cannot batch steps -- it pays one ~26 ms readback per token by construction.
+   * This runs K steps on a FIXED input id instead, which computes the wrong tokens
+   * on purpose but does exactly the right amount of GPU work, and so isolates that
+   * work from the readback. bench_model.ts uses it to show what the readback costs;
+   * the honest tok/s figure is the unbatched one.
+   */
+  async stepsAmortized(ids: number[]): Promise<number> {
+    for (const id of ids) {
+      this.encodeTokens([id]);
+      const enc = this.dev.createCommandEncoder();
+      this.encodeHead(enc);
+      this.dev.queue.submit([enc.finish()]);
+    }
+    return (await this.readU32(this.buf.tokIdx, 1))[0];
+  }
+
+  /**
+   * Drop the KV cache back to `nKeys`, so a benchmark's repeated trials all run at
+   * the same context length.
+   *
+   * Legal because the cache is append-only: keys past `nKeys` are never read again
+   * once nKeys says they are not there. Nothing is zeroed, which is why this is a
+   * measurement aid and not a correctness-preserving public operation -- a
+   * generation should use reset().
+   */
+  rewind(nKeys: number) {
+    this.pos = nKeys;
+    for (const l of this.layers) l.nKeys = nKeys;
+  }
+
+  /**
    * The token id the GPU argmax currently holds, without recomputing anything.
    *
    * For the one comparison that isolates the reduction: run it on the SAME logits a
