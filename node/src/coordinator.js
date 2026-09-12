@@ -23,12 +23,29 @@ export class Coordinator {
     return c;
   }
 
-  encode(prompt) {
-    const text = this.tok.apply_chat_template(
-      [{role: 'user', content: prompt}],
-      {add_generation_prompt: true, enable_thinking: false, tokenize: false});
-    const enc = this.tok(text, {add_special_tokens: false});
-    return Array.from(enc.input_ids.data).map(Number);
+  /** Raw text -> token ids, with no chat template applied. */
+  ids(text) {
+    return Array.from(this.tok(text, {add_special_tokens: false})
+                          .input_ids.data).map(Number);
+  }
+
+  /** The tokens to feed for ONE user turn, continuing whatever is already cached.
+   *
+   *  Deliberately not `apply_chat_template(wholeHistory)`: with
+   *  enable_thinking:false the template injects a `<think></think>` scaffold for
+   *  the CURRENT turn only, so re-encoding the history produces a token stream
+   *  that DIVERGES from what we already fed (measured: they split at token 9 of
+   *  13). Feeding that against a warm K/V cache would silently compute garbage.
+   *
+   *  So we append exactly what the model saw next. The cost is that earlier
+   *  turns keep their scaffold, which is well-formed and is what the model
+   *  itself generated in context. The benefit is that the sharded K/V cache
+   *  stays valid across turns, which is the whole point of sharding it.
+   */
+  turnTokens(prompt, isFirst) {
+    const open = isFirst ? '' : '<|im_end|>\n';
+    return this.ids(`${open}<|im_start|>user\n${prompt}<|im_end|>\n` +
+                    `<|im_start|>assistant\n<think>\n\n</think>\n\n`);
   }
 
   decode(ids) {

@@ -10,5 +10,5 @@ __pycache__/
 .venv/
 
 # Node
-node/node_modules/
-web/coord/
+node/node_modules
+web/coord

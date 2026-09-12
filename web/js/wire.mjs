@@ -1,7 +1,7 @@
 // flock wire format — the single implementation, shared by both sides.
 //
 // The coordinator (node/src/*) imports this file directly; browsers fetch it
-// from /js/wire.js. One copy means the two ends cannot drift apart, which is
+// from /js/wire.mjs. One copy means the two ends cannot drift apart, which is
 // the only way a binary format like this stays safe to change.
 //
 // Layout: "FLK1" | seq u32 | hidden u32 | offset u32 | flags u32 | f16 payload
