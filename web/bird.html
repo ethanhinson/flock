@@ -267,10 +267,18 @@ let peerId = localStorage.getItem('flock_peer') || null;
   // the runtime made its own copy, ~250MB peak, and that is what killed an iPad.
   // See web/js/gguf-stream.mjs.
   if (!hasGPU) {
-    problem('this device has no WebGPU',
-      'A bird runs transformer layers as WebGPU compute shaders, so there is ' +
-      'nothing to fall back to on this device.',
-      'Try a current Safari, Chrome or Edge. On iOS, WebGPU needs iOS 17 or newer.');
+    // Careful with this wording: the GPU is fine, the API is not exposed. Saying
+    // "no GPU" sends people looking at hardware that is not the problem.
+    problem('this browser is not exposing WebGPU',
+      'The GPU itself is fine — the browser just is not offering the WebGPU API ' +
+      'to this page. A bird runs transformer layers as compute shaders, so there ' +
+      'is nothing to fall back to.',
+      (window.isSecureContext === false && /Chrome/.test(navigator.userAgent))
+        ? 'Chrome only exposes WebGPU in a secure context, and this page is plain ' +
+          'http on a LAN. Use Safari, or serve the coordinator over https. ' +
+          'Open /check for a full report.'
+        : 'On iPad/iPhone before iPadOS 26: Settings > Apps > Safari > Advanced > ' +
+          'Feature Flags > WebGPU, then reload. Open /check for a full report.');
     await report('no-webgpu', navigator.userAgent);
     return;
   }

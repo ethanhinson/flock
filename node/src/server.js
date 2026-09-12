@@ -210,6 +210,11 @@ const page = rel => (_, res) => res.sendFile(rel, {root: ROOT});
 app.get('/', page('web/chat.html'));
 app.get('/flock', page('web/bird.html'));
 
+// A standalone hardware report. Separate from /flock because it must work even
+// when the bird page cannot: it claims no slot, loads no weights, and its only
+// job is to say WHY a device is or is not usable as a bird.
+app.get('/check', page('web/inspect.html'));
+
 app.get('/status', (_, res) => res.json({
   ready: flock.ready(), missing: flock.missing(),
   coord_layers: `0-${CUT - 1}`, coord_n_layers: CUT,
