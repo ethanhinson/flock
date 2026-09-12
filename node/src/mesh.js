@@ -12,7 +12,8 @@ export class Bird {
   constructor(start, end, slot) {
     Object.assign(this, {start, end, slot});
     this.peerId = null; this.label = '?';
-    this.lastSeen = 0; this.lastMs = null;
+    this.lastSeen = 0; this.lastMs = null; this.claimedAt = 0;
+    this.frames = 0;
     this.transport = 'none';
     this.resetPending = false;
     this.forwardsDirectly = false;   // set when the bird reports a live peer link
@@ -25,38 +26,35 @@ export class Bird {
     return linked && (Date.now() - this.lastSeen) < grace;
   }
 
+  /** Is this slot spoken for? Alive, or claimed over HTTP and still connecting.
+   *
+   *  /join happens over plain HTTP, so a just-claimed slot has no websocket yet
+   *  and so is not yet `alive()`. Without this window the next /join hands out
+   *  the SAME slot and overwrites peerId, which is why several birds joining at
+   *  once all ended up as slot 0 and the flock never covered its layers. */
+  claimed(hold = 15000) {
+    return this.alive() || (!!this.peerId && Date.now() - this.claimedAt < hold);
+  }
+
   chanOpen() {
     try { return !!(this.chan && this.chan.isOpen()); } catch { return false; }
   }
 
   info() {
     return {slot: this.slot, start: this.start, end: this.end,
+            n_layers: this.end - this.start + 1,
             alive: this.alive(), last_ms: this.lastMs,
-            label: this.label, transport: this.transport};
+            label: this.label, transport: this.transport,
+            frames: this.frames, peer_id: this.peerId,
+            // How long since we last heard anything: the UI can say "12s ago"
+            // rather than a bare alive/dead flag that hides a stalling device.
+            last_seen_ms: this.lastSeen ? Date.now() - this.lastSeen : null,
+            forwards_directly: this.forwardsDirectly};
   }
 
-  /** Push activations to this bird and await the reply. */
-  send(floats, seq, hidden, offset, timeout = 120000) {
-    const frame = pack(floats, {seq, hidden, offset, reset: this.resetPending});
-    this.resetPending = false;
-    const viaRTC = this.chanOpen();
-    const link = viaRTC ? this.chan : this.ws;
-    if (!link) return Promise.reject(new Error(
-      `no device holding layers ${this.start}-${this.end}`));
-    this.transport = viaRTC ? 'webrtc' : 'ws';   // observed, not self-reported
-    return new Promise((res, rej) => {
-      const timer = setTimeout(() => {
-        this._waiter = null;
-        rej(new Error(`device holding layers ${this.start}-${this.end} stopped ` +
-                      `responding — is its screen on and the tab in front?`));
-      }, timeout);
-      this._waiter = v => { clearTimeout(timer); this._waiter = null; res(v); };
-      if (this.chanOpen()) this.chan.sendMessageBinary(Buffer.from(frame));
-      else this.ws.send(Buffer.from(frame));
-    });
-  }
-
-  /** Push into this bird but wait for `awaitOn` to answer (the chain's tail). */
+  /** Push into this bird but wait for `awaitOn` to answer (the chain's tail).
+   *  When this bird IS the tail, `awaitOn` is itself — so this one method covers
+   *  both the chained and the single-bird case. */
   sendChained(floats, seq, hidden, offset, awaitOn, timeout = 120000) {
     const frame = pack(floats, {seq, hidden, offset, reset: this.resetPending});
     this.resetPending = false;
@@ -79,6 +77,7 @@ export class Bird {
 
   deliver(buf) {
     this.lastSeen = Date.now();
+    this.frames++;
     const {data, meta} = unpack(
       buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
     if (this._waiter) this._waiter({data, meta});
@@ -142,10 +141,9 @@ export class Flock {
     const b = this.byPeer(peerId);
     if (!b) return null;
     const next = this.birds[b.slot + 1] || null;
-    return {t: 'chain', slot: b.slot,
+    return {t: 'chain', slot: b.slot, start: b.start, end: b.end,
             next_peer: next ? next.peerId : null,
-            next_range: next ? `${next.start}-${next.end}` : null,
-            is_last: !next};
+            next_range: next ? `${next.start}-${next.end}` : null};
   }
 
   /** Tell every bird its successor — call whenever membership changes. */
@@ -181,9 +179,14 @@ export class Flock {
     return {data: flat};
   }
   claim(peerId, label) {
-    for (const b of this.birds) if (b.peerId === peerId) { b.lastSeen = Date.now(); return b; }
-    for (const b of this.birds) if (!b.alive()) {
-      b.peerId = peerId; b.label = label; b.lastSeen = Date.now(); return b;
+    for (const b of this.birds) if (b.peerId === peerId) {
+      b.lastSeen = Date.now(); b.claimedAt = Date.now(); return b;
+    }
+    for (const b of this.birds) if (!b.claimed()) {
+      b.peerId = peerId; b.label = label;
+      b.lastSeen = Date.now(); b.claimedAt = Date.now();
+      b.frames = 0;
+      return b;
     }
     return null;
   }
