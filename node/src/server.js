@@ -1,59 +1,81 @@
-// flock_server (Node) — runs the whole flock with WebRTC on every link.
+// flock_server — runs the whole flock with WebRTC on every link.
 //
-// The coordinator holds the embedding, layers 0..cut-1 and the vocab
+// The coordinator holds the embedding, layers 0..cut-1, output_norm and the vocab
 // projection; each phone (a "bird") holds a contiguous slice of the rest.
 // Per token the hidden state makes one lap: coordinator -> bird -> bird -> back.
 //
-// Because this is Node rather than Python, the coordinator is itself a WebRTC
-// peer: it offers a data channel to each bird, and once that opens the
-// websocket carries nothing but signaling.
+// Because this is a real server rather than a Python script, the coordinator is
+// itself a WebRTC peer: it offers a data channel to each bird, and once that
+// opens the websocket carries nothing but signaling.
 //
-// Run:  npm start   (from node/)
+// RUN IT WITH DENO, NOT NODE:
+//
+//   deno task start            (from node/, or `npm start` which calls it)
+//
+// The coordinator runs Qwen3's first 24 layers as WGSL compute kernels, so it
+// needs a GPU, and Node has no WebGPU -- no `navigator` at all, and no flag that
+// adds one. Deno provides a device and also runs express, ws and node-datachannel
+// unchanged through its node compatibility layer, so the whole server is one
+// process on one runtime. See node/README.md for what was measured.
+//
+// THERE IS NO BUILD STEP. The topology used to come from web/flock.json, written
+// by build_shards.py alongside exported ONNX graphs. With GGUF a split is just a
+// choice about byte ranges, so it is computed here at startup from the model's
+// header: nothing is exported, nothing is written to disk, and the split can
+// change without rebuilding anything.
 import express from 'express';
 import {WebSocketServer} from 'ws';
-import {readFileSync, existsSync} from 'fs';
-import {createServer} from 'http';
-import {randomBytes} from 'crypto';
-import {networkInterfaces} from 'os';
-import path from 'path';
-import {fileURLToPath} from 'url';
+import {createServer} from 'node:http';
+import {randomBytes} from 'node:crypto';
+import {networkInterfaces} from 'node:os';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
 
 import {Coordinator} from './coordinator.js';
 import {Flock} from './mesh.js';
+import {readModel, splitLayers} from './gguf.mjs';
+import {QWEN3_06B} from '../../kernels/layer.ts';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 process.chdir(ROOT);
 
-for (const f of ['web/flock.json', 'web/coord/coord.json']) {
-  if (!existsSync(f)) {
-    console.error(`missing ${f} — build first:\n` +
-      '    python3 build_shards.py --start 24 --end 27 --birds 1\n' +
-      '    python3 flock_export_coordinator.py --cut 24');
-    process.exit(1);
-  }
-}
+// Where every device -- birds AND this coordinator -- reads its weights from.
+// A plain URL rather than something we proxy, on purpose: the point of the GGUF
+// path is that weights go from the model host straight to the device, so the
+// coordinator never moves 67MB per bird and needs no build step and no disk.
+const GGUF_URL = process.env.FLOCK_GGUF ||
+  'https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf';
 
-const META = JSON.parse(readFileSync('web/flock.json', 'utf8'));
-const RANGES = META.birds.map(b => [b.start, b.end]);
-const CUT = RANGES[0][0];
+// How the layers are divided. Only the model's HEADER is read to decide this --
+// a few MB, not the weights -- which is what makes the topology a startup
+// decision rather than a build artifact.
+const N_BIRDS = +(process.env.FLOCK_BIRDS || 1);
+console.log(`reading GGUF header: ${GGUF_URL.split('/').pop()}`);
+const header = await readModel(GGUF_URL);
+const N_TOTAL = header.nLayers;
+// Birds hold the last `FLOCK_BIRD_LAYERS` layers; the coordinator holds the rest.
+// Default 4, which is flock's long-standing split (coordinator 0-23, birds 24-27).
+const BIRD_LAYERS = Math.min(N_TOTAL - 1, +(process.env.FLOCK_BIRD_LAYERS || 4));
+const CUT = N_TOTAL - BIRD_LAYERS;
+const RANGES = splitLayers(CUT, N_TOTAL - 1, N_BIRDS);
 
-// Where a bird can fetch GGUF weights for itself, if it would rather do that than
-// download an exported ONNX shard from us. Handed out by /join so the bird needs
-// no configuration of its own, and left empty to keep every bird on the ONNX path
-// -- which is still the reference the WGSL engine is validated against, so this is
-// opt-in rather than a switch that flips underneath it.
-//
-// It is a plain URL rather than something we proxy on purpose: the point of the
-// GGUF path is that weights go from the model host straight to the device, so the
-// coordinator never touches 67MB per bird and needs no build step and no disk.
-const GGUF_URL = process.env.FLOCK_GGUF || '';
+const META = {
+  model: header.metadata['general.name'] || 'Qwen3-0.6B',
+  n_total: N_TOTAL,
+  hidden: QWEN3_06B.hidden,
+  kv_heads: QWEN3_06B.nKvHeads,
+  head_dim: QWEN3_06B.headDim,
+  kv_cache: true,
+  coord_layers: [0, CUT - 1],
+  birds: RANGES.map(([s, e], i) => ({slot: i, start: s, end: e})),
+};
 
-console.log(`loading coordinator (layers 0-${CUT - 1}) ...`);
-const coord = await Coordinator.load();
+console.log(`loading coordinator (layers 0-${CUT - 1}) on the GPU ...`);
+const coord = await Coordinator.load(CUT);
 const flock = new Flock(RANGES);
 console.log(`coordinator holds layers 0-${CUT - 1}; birds hold ` +
             RANGES.map(([s, e]) => `${s}-${e}`).join(', '));
-console.log('kv cache: ON  |  wire: f16 binary  |  links: webrtc');
+console.log('kv cache: ON  |  wire: f16 binary  |  links: webrtc  |  engine: wgsl');
 
 // The LAN address is the one thing you cannot guess, and you need it to open
 // /flock on a phone. Print it rather than making the user go find it.
@@ -65,6 +87,12 @@ function localAddresses() {
 const app = express();
 app.use(express.json());
 app.use('/js', express.static('web/js'));
+// A bird runs the SAME kernels the tests validate, so it fetches them from here
+// rather than carrying a copy. `wgslSource()` in kernels/layer.ts resolves them
+// relative to its own module URL, which is what makes one file work under Deno
+// (a file: URL) and in the page (an http: URL) with no build step. Serving the
+// directory rather than bundling it means a kernel fix reaches birds on reload.
+app.use('/kernels', express.static('kernels'));
 
 app.post('/join', (req, res) => {
   const pid = req.body.peer_id || randomBytes(4).toString('hex');
@@ -102,28 +130,12 @@ const page = rel => (_, res) => res.sendFile(rel, {root: ROOT});
 app.get('/', page('web/chat.html'));
 app.get('/flock', page('web/bird.html'));
 
-// A slot is an index into the flock, so anything else is a bad request rather
-// than a path to go looking for on disk.
-const slotFile = suffix => (req, res) => {
-  const slot = +req.params.slot;
-  if (!Number.isInteger(slot) || slot < 0 || slot >= RANGES.length)
-    return res.status(404).json({error: `no slot ${req.params.slot}`});
-  res.sendFile(`web/shard${slot}${suffix}`, {root: ROOT}, err => {
-    if (!err) return;
-    console.error(`[shard] slot ${slot}${suffix}: ${err.message}`);
-    if (!res.headersSent)
-      res.status(404).json({error: `shard ${slot}${suffix} missing — run build_shards.py`});
-  });
-};
-app.get('/shard/:slot.onnx', slotFile('.onnx'));
-app.get('/shard/:slot.onnx.data', slotFile('.onnx.data'));
-
 app.get('/status', (_, res) => res.json({
   ready: flock.ready(), missing: flock.missing(),
   coord_layers: `0-${CUT - 1}`, coord_n_layers: CUT,
   birds: flock.birds.map(b => b.info()),
   n_total: META.n_total, hidden: META.hidden, kv_cache: META.kv_cache,
-  wire: 'f16', runtime: 'node', model: META.model,
+  wire: 'f16', runtime: 'deno', engine: 'wgsl', model: META.model,
   // Conversation state, so the chat UI can show how much context is cached and
   // whether a turn is already in flight.
   cached_tokens: convo.fed, turns: convo.turns, busy: convo.busy,

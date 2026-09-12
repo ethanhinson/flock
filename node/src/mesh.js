@@ -4,6 +4,11 @@
 // The websocket exists ONLY to carry offers/answers/ICE. Once a channel opens,
 // no activation touches it again.
 import nodeDataChannel from 'node-datachannel';
+// Buffer is an implicit global under Node but not under Deno, and the server runs
+// under Deno because the coordinator needs a GPU. Imported rather than replaced:
+// node-datachannel's sendMessageBinary and ws both want a real Buffer, so the
+// transport keeps using exactly what it used before.
+import {Buffer} from 'node:buffer';
 import {pack, unpack} from '../../web/js/wire.mjs';
 
 const ICE = ['stun:stun.l.google.com:19302'];

@@ -1,41 +1,54 @@
-// Stand-in bird against the Node coordinator (websocket path).
+// Stand-in bird against the coordinator (websocket path).
 //
-// Runs the same shards a phone would, so the whole chain can be exercised on one
-// machine with no browser. Not a fossil: it is the only way to test the
-// coordinator end to end in CI or over ssh, where there is no WebGPU.
+// Runs the same layers a phone would, with the same WGSL kernels, so the whole
+// chain can be exercised on one machine with no browser. Not a fossil: it is the
+// only way to test the coordinator end to end over ssh or in a script, where
+// there is no browser to open /flock in.
 //
-//   node sim_bird.mjs            claim one free slot
-//   node sim_bird.mjs solo       claim EVERY slot, so the flock is covered alone
-//   FLOCK_URL=http://host:port   point at a coordinator elsewhere
+// RUN IT WITH DENO, NOT NODE -- it needs a GPU for the same reason the
+// coordinator does, and Node has no WebGPU:
+//
+//   deno run --unstable-webgpu --allow-all sim_bird.mjs          one free slot
+//   deno run --unstable-webgpu --allow-all sim_bird.mjs solo     every slot
+//   FLOCK_URL=http://host:port                                   a coordinator elsewhere
 //
 // Each simulated bird keeps its own K/V cache, exactly as a real bird does — the
 // point is to exercise the sharded-cache path, not to shortcut it.
-import ort from 'onnxruntime-node';
+//
+// WEIGHTS COME FROM THE SAME PLACE A REAL BIRD'S DO: the GGUF file, by byte
+// range, over the network. There is no exported shard to load any more. What
+// differs from bird.html is only HOW they reach the GPU -- this reads the
+// cached whole-model file through real_weights.ts, while a phone streams its
+// range so the bytes never sit in the JS heap (see web/js/gguf-stream.mjs).
+// Both end up calling the same Layer with the same numbers.
 import WebSocket from 'ws';
-import path from 'path';
-import {fileURLToPath} from 'url';
 import {pack, unpack} from '../web/js/wire.mjs';
+import {getDevice} from '../kernels/lib.ts';
+import {Layer, QWEN3_06B} from '../kernels/layer.ts';
+import {realModel} from '../kernels/real_weights.ts';
 
-// Resolve the shards relative to THIS file, not the cwd: a hardcoded absolute
-// path made the sim load another checkout's weights when run from a worktree.
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const BASE = process.env.FLOCK_URL || 'http://127.0.0.1:8000';
 const solo = process.argv[2] === 'solo';
 const label = solo ? 'sim' : (process.argv[2] || 'sim');
 
-/** Claim a slot, load its shard, and serve frames until the socket closes. */
+const dev = await getDevice();
+console.log('reading weights ...');
+const weights = await realModel();
+
+/** Claim a slot, build its layers on the GPU, and serve frames until the socket
+ *  closes. */
 async function bird(tag) {
   const j = await (await fetch(`${BASE}/join`, {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({label: tag})})).json();
   if (j.error) throw new Error(j.error);
-  const s = await ort.InferenceSession.create(
-    path.join(ROOT, `web/shard${j.slot}.onnx`));
-  console.log(`bird ${j.slot}: layers ${j.start}-${j.end}`);
 
-  let past = null;
-  const empty = () => new ort.Tensor('float32', new Float32Array(0),
-                                     [1, j.kv_heads, 0, j.head_dim]);
+  const layers = [];
+  for (let i = j.start; i <= j.end; i++) {
+    layers.push(await Layer.create(dev, weights.layers[i], QWEN3_06B));
+  }
+  console.log(`bird ${j.slot}: layers ${j.start}-${j.end} on the GPU`);
+
   const ws = new WebSocket(BASE.replace(/^http/, 'ws') + '/ws');
   let beat = null;
   ws.on('open', () => {
@@ -51,26 +64,36 @@ async function bird(tag) {
     if (!isBinary) return;
     const ab = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
     const {data: h, meta: m} = unpack(ab);
-    if (m.reset) past = null;
-    const feed = {
-      hidden: new ort.Tensor('float32', h, [1, m.seq, j.hidden]),
-      position_ids: new ort.Tensor('int64',
-        BigInt64Array.from({length: m.seq}, (_, i) => BigInt(m.offset + i)), [1, m.seq]),
-    };
-    for (let i = 0; i < j.n_layers; i++) {
-      feed[`past_k${i}`] = past ? past[`new_k${i}`] : empty();
-      feed[`past_v${i}`] = past ? past[`new_v${i}`] : empty();
-    }
+    // A reset means the conversation restarted, so OUR shard of the K/V cache is
+    // stale too. Each layer owns its own, so each one clears it.
+    if (m.reset) for (const L of layers) L.reset();
+
     const t0 = performance.now();
-    const out = await s.run(feed);
-    const ms = +(performance.now() - t0).toFixed(1);
-    past = {};
-    for (let i = 0; i < j.n_layers; i++) {
-      past[`new_k${i}`] = out[`new_k${i}`];
-      past[`new_v${i}`] = out[`new_v${i}`];
+    // Chain the layers on the GPU, the way kernels/model.ts chains its 28: layer i
+    // reads what layer i-1 wrote via a device-to-device copy, everything shares
+    // ONE command buffer, and only the shard's final output comes back to the
+    // host. A readback per layer instead would cost ~24 ms each -- measured 20.8x
+    // for this exact difference in bench_layer.ts.
+    const enc = dev.createCommandEncoder();
+    for (let i = 0; i < layers.length; i++) {
+      const L = layers[i];
+      if (i === 0) {
+        // Only the first layer takes the hidden state off the wire.
+        if (m.seq === 1) L.encode(h, enc);
+        else L.encodePrefill(m.seq, h, enc);
+      } else {
+        enc.copyBufferToBuffer(layers[i - 1].outputBuffer(), 0,
+                               L.inputBuffer(), 0, m.seq * j.hidden * 4);
+        // No hidden argument: consume what the copy just put in our own buffer.
+        if (m.seq === 1) L.encode(undefined, enc);
+        else L.encodePrefill(m.seq, undefined, enc);
+      }
     }
-    ws.send(Buffer.from(pack(out.output.data,
-      {seq: m.seq, hidden: j.hidden, offset: m.offset})));
+    dev.queue.submit([enc.finish()]);
+    const flat = await layers[layers.length - 1].readOutput(m.seq);
+    const ms = +(performance.now() - t0).toFixed(1);
+
+    ws.send(pack(flat, {seq: m.seq, hidden: j.hidden, offset: m.offset}));
     ws.send(JSON.stringify({t: 'stats', ms}));
   });
   return j;
