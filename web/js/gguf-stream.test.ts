@@ -1,19 +1,25 @@
 // Prove the streaming loader against the real Qwen3-0.6B file on HuggingFace.
 //
-//   deno run --unstable-webgpu --allow-all web/js/gguf-stream.test.ts
+//   npm run test:gpu       (from node/)
+//   deno run --config kernels/deno.json --unstable-webgpu --allow-all \
+//     web/js/gguf-stream.test.ts
+//
+// The kernels config is needed only because this test imports the kernels' own
+// reference loader to compare against, and that one is Node-side.
 //
 // Three claims are under test, and each is the kind that a unit test over a
 // fixture cannot make:
 //
 //   1. CORRECTNESS. The bytes that land in the GPU buffers are byte-identical to
-//      fetchRange + splitQ8 over the same tensor. That reference is the one the
+//      fetchRange + splitQ8, and -- for a whole layer -- to what realLayer() in
+//      kernels/real_weights.ts hands the engine today. That is the reference the
 //      kernels are already validated against, so matching it is what makes these
-//      buffers substitutable for the ones kernels/layer.ts builds today.
+//      buffers substitutable rather than merely plausible.
 //
-//   2. PEAK MEMORY. Deno exposes real RSS, so peak heap can be sampled while a
-//      67MB slice streams. The claim is that peak tracks the STAGING size, not
-//      the tensor size -- which is the entire reason this module exists, and the
-//      only way to show it is to measure it against a large tensor.
+//   2. PEAK MEMORY. The claim is that peak JS memory tracks the STAGING size, not
+//      the slice size -- the entire reason this module exists. Measured against a
+//      real 67MB slice, against a measured floor for the fetch stack alone, and
+//      against a control that does it the naive way so the comparison is real.
 //
 //   3. REQUEST COUNT. A 4-layer bird should fetch its ~67MB in one range
 //      request, because GGUF lays layers out contiguously.
@@ -27,6 +33,7 @@ import {
   streamTensorToGPU, fetchRange, STAGING,
 } from "./gguf-stream.mjs";
 import { splitQ8 } from "../../kernels/lib.ts";
+import { realLayer } from "../../kernels/real_weights.ts";
 
 const MODEL =
   "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf";
@@ -248,14 +255,16 @@ ok("peak JS memory does not scale with the slice: 4 layers cost under 2x one lay
 // The shape the kernels consume: layers[24].attn_q, keyed by the suffix after
 // blk.N. -- so these buffers can be handed to kernels/layer.ts directly.
 ok("keyed by layer then tensor suffix",
-  !!(layers[24]?.attn_q && layers[27]?.ffn_down && layers[24]?.attn_norm),
+  !!(layers[24]?.["attn_q.weight"] && layers[27]?.["ffn_down.weight"] &&
+     layers[24]?.["attn_norm.weight"]),
   Object.keys(layers[24] ?? {}).sort().join(","));
 ok("norm gains are f32 single buffers, not split",
-  !!layers[24].attn_norm.data && !layers[24].attn_norm.qs,
-  `attn_norm ${layers[24].attn_norm.dataBytes} bytes`);
+  !!layers[24]["attn_norm.weight"].data && !layers[24]["attn_norm.weight"].qs,
+  `attn_norm ${layers[24]["attn_norm.weight"].dataBytes} bytes`);
 ok("projections are split into qs + scales",
-  !!(layers[24].attn_q.qs && layers[24].attn_q.scales),
-  `attn_q qs ${MB(layers[24].attn_q.qsBytes)} scales ${MB(layers[24].attn_q.scaleBytes)}`);
+  !!(layers[24]["attn_q.weight"].qs && layers[24]["attn_q.weight"].scales),
+  `attn_q qs ${MB(layers[24]["attn_q.weight"].qsBytes)} ` +
+  `scales ${MB(layers[24]["attn_q.weight"].scaleBytes)}`);
 
 // Total GPU bytes should be LESS than the file bytes: the split layout drops
 // nothing, but it also does not pad -- 34 bytes on disk becomes 32 + 2.
@@ -274,10 +283,56 @@ const spot = model.tensors.find((x) => x.name === "blk.26.attn_q.weight")!;
 const spotAbs = model.dataStart + spot.offset;
 const spotPacked = await fetchRange(MODEL, { start: spotAbs, end: spotAbs + spot.bytes });
 const spotRef = splitQ8(spotPacked, Number(spot.shape[1]), Number(spot.shape[0]));
-const spotGot = await readBytes(layers[26].attn_q.qs, layers[26].attn_q.qsBytes);
+const spotGot = await readBytes(layers[26]["attn_q.weight"].qs,
+  layers[26]["attn_q.weight"].qsBytes);
 ok("a tensor from the middle of the slice matches splitQ8 too",
   firstDiff(spotGot, spotRef.qs) === -1,
   `blk.26.attn_q, first diff at ${firstDiff(spotGot, spotRef.qs)}`);
+
+// ------------------------------------------- substitutable for the engine's own
+//
+// The strongest correctness claim available, and the one that actually matters to
+// the WGSL engine: for a whole layer, do these GPU buffers hold the same bytes the
+// engine gets TODAY from realLayer() + splitQ8? Every projection and every norm
+// gain, not a sample.
+//
+// This is also what caught the one real integration bug in the loader:
+// kernels/real_weights.ts keys its tensors WITH the trailing `.weight`
+// (`attn_q.weight`), and the loader was stripping it. Every lookup in
+// kernels/layer.ts would have returned undefined -- a silent failure, not an
+// error. Comparing against the real reference is what surfaced it; comparing
+// against a fixture of my own making would not have.
+
+console.log("\nchecking a whole layer against kernels/real_weights.ts...");
+const ref24 = await realLayer(24);
+const { layers: one } = await loadLayersToGPU(dev, model, [24], { cache: false });
+let checked = 0, bad: string[] = [];
+for (const [k, ent] of Object.entries(ref24.q8)) {
+  const got = one[24][k];
+  if (!got?.qs) { bad.push(`${k} missing (key mismatch)`); continue; }
+  const exp = splitQ8(ent.packed, ent.rows, ent.cols);
+  if (firstDiff(await readBytes(got.qs, got.qsBytes), exp.qs) !== -1) bad.push(`${k} qs`);
+  if (firstDiff(await readBytes(got.scales, got.scaleBytes), exp.scales) !== -1) {
+    bad.push(`${k} scales`);
+  }
+  if (got.rows !== ent.rows || got.cols !== ent.cols) {
+    bad.push(`${k} dims ${got.rows}x${got.cols} vs ${ent.rows}x${ent.cols}`);
+  }
+  checked++;
+}
+for (const [k, v] of Object.entries(ref24.f32)) {
+  const got = one[24][k];
+  if (!got?.data) { bad.push(`${k} missing (key mismatch)`); continue; }
+  const exp = new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+  if (firstDiff(await readBytes(got.data, got.dataBytes), exp) !== -1) bad.push(`${k} f32`);
+  checked++;
+}
+ok("every tensor of a layer is byte-identical to what the kernels load today",
+  bad.length === 0 && checked === 11,
+  bad.length ? bad.join("; ") : `${checked}/11 tensors, 7 quantized + 4 f32 gains`);
+ok("keyed the way kernels/real_weights.ts keys them (suffix keeps `.weight`)",
+  !!one[24]["attn_q.weight"] && !one[24]["attn_q"],
+  Object.keys(one[24]).sort().join(","));
 
 // ------------------------------------------------- the control: the naive path
 //

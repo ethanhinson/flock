@@ -672,7 +672,12 @@ export async function loadLayersToGPU(device, model, layers, opts = {}) {
         });
         bytesDone += t.bytes;
 
-        const m = /^blk\.(\d+)\.(.+?)(?:\.weight)?$/.exec(t.name);
+        // Keyed by the suffix after `blk.N.`, WITH the trailing `.weight` left on.
+        // That is not a stylistic choice: it is the convention realLayer() in
+        // kernels/real_weights.ts already uses, so `attn_q.weight` not `attn_q`.
+        // Stripping it made every lookup in kernels/layer.ts return undefined,
+        // which is a silent integration failure rather than an error.
+        const m = /^blk\.(\d+)\.(.+)$/.exec(t.name);
         const layer = m ? Number(m[1]) : -1;
         const key = m ? m[2] : t.name;
         (out[layer] ??= {})[key] = up;
