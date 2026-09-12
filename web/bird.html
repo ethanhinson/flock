@@ -137,6 +137,11 @@ let peerId = localStorage.getItem('flock_peer') || null;
   // on its own, so we hand it the bytes explicitly below.
   const db = await idbOpen();
   const pendingCache = [];
+  // Stream the response into ONE preallocated buffer instead of calling
+  // .arrayBuffer(), which materialises a second copy of the whole tensor and is
+  // what made an iPad run out of memory on a 126MB shard. Peak extra memory here
+  // is one network chunk, not one shard. (swarmllm does the same thing, staging
+  // ~4MB at a time straight into GPU buffers.)
   async function grab(url, label) {
     const hit = await idbGet(db, url);
     if (hit) {
@@ -144,12 +149,39 @@ let peerId = localStorage.getItem('flock_peer') || null;
       return hit;
     }
     const t = performance.now();
-    const buf = await (await fetch(url)).arrayBuffer();
-    log(`${label} ${(buf.byteLength/1e6).toFixed(0)}MB in ${((performance.now()-t)/1000).toFixed(1)}s`, 'ok');
-    // Cache AFTER the session is built, not during: a structured clone of the
-    // weights while ORT is also allocating is what pushes a tight heap over.
-    pendingCache.push([url, buf]);
-    return buf;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`${label} fetch failed: ${res.status}`);
+    const total = +res.headers.get('content-length') || 0;
+
+    let out;
+    if (total && res.body) {
+      out = new Uint8Array(total);           // exact size known: one allocation
+      let at = 0, lastPct = -1;
+      const reader = res.body.getReader();
+      for (;;) {
+        const {value, done} = await reader.read();
+        if (done) break;
+        if (at + value.length > total) throw new Error(`${label}: longer than declared`);
+        out.set(value, at);
+        at += value.length;
+        const pct = Math.floor(at / total * 100);
+        if (pct >= lastPct + 10) {           // log sparingly; DOM writes cost too
+          lastPct = pct;
+          log(`${label} ${pct}% (${(at/1e6).toFixed(0)}/${(total/1e6).toFixed(0)}MB)`);
+        }
+        // Yield so WebKit can hand buffers to the GPU process and reclaim pages
+        // before we ask for more -- without this a tight device still dies.
+        await new Promise(r => setTimeout(r, 0));
+      }
+      if (at !== total) throw new Error(`${label}: short read ${at}/${total}`);
+    } else {
+      out = new Uint8Array(await res.arrayBuffer());   // no content-length
+    }
+
+    log(`${label} ${(out.byteLength/1e6).toFixed(0)}MB in ` +
+        `${((performance.now()-t)/1000).toFixed(1)}s`, 'ok');
+    pendingCache.push([url, out.buffer]);
+    return out.buffer;
   }
 
   // Hand ORT the bytes, then drop OUR reference immediately. Keeping `wbuf`
