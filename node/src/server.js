@@ -82,12 +82,29 @@ app.post('/diag', (req, res) => {
   res.json({ok: true});
 });
 
-app.get('/', (_, res) => res.sendFile(path.join(ROOT, 'web/chat.html')));
-app.get('/flock', (_, res) => res.sendFile(path.join(ROOT, 'web/bird.html')));
-app.get('/shard/:slot.onnx', (req, res) =>
-  res.sendFile(path.join(ROOT, `web/shard${req.params.slot}.onnx`)));
-app.get('/shard/:slot.onnx.data', (req, res) =>
-  res.sendFile(path.join(ROOT, `web/shard${req.params.slot}.onnx.data`)));
+// Serve relative to ROOT, not as an absolute path: send() rejects any path with
+// a dot-prefixed segment as a hidden file, so an absolute path through a
+// checkout under e.g. ~/.worktrees/ 404s every page. With `root` set it only
+// inspects the relative part, which also keeps a crafted :slot from escaping.
+const page = rel => (_, res) => res.sendFile(rel, {root: ROOT});
+app.get('/', page('web/chat.html'));
+app.get('/flock', page('web/bird.html'));
+
+// A slot is an index into the flock, so anything else is a bad request rather
+// than a path to go looking for on disk.
+const slotFile = suffix => (req, res) => {
+  const slot = +req.params.slot;
+  if (!Number.isInteger(slot) || slot < 0 || slot >= RANGES.length)
+    return res.status(404).json({error: `no slot ${req.params.slot}`});
+  res.sendFile(`web/shard${slot}${suffix}`, {root: ROOT}, err => {
+    if (!err) return;
+    console.error(`[shard] slot ${slot}${suffix}: ${err.message}`);
+    if (!res.headersSent)
+      res.status(404).json({error: `shard ${slot}${suffix} missing — run build_shards.py`});
+  });
+};
+app.get('/shard/:slot.onnx', slotFile('.onnx'));
+app.get('/shard/:slot.onnx.data', slotFile('.onnx.data'));
 
 app.get('/status', (_, res) => res.json({
   ready: flock.ready(), missing: flock.missing(),
@@ -286,7 +303,11 @@ wss.on('connection', ws => {
       else if (m.t === 'forwards') bird.forwardsDirectly = !!m.direct;
       // note: transport is set from the send path in mesh.js, not from here --
       // what actually carried the frame is the only honest answer.
-      else if (m.t === 'pull') bird.lastSeen = Date.now();
+      // Liveness heartbeat. Without it an idle bird ages past alive()'s grace
+      // period and the flock reports itself uncovered until a turn starts.
+      // `pull` is the old name from the long-polling transport -- still accepted
+      // so an un-refreshed bird page keeps its slot.
+      else if (m.t === 'ping' || m.t === 'pull') bird.lastSeen = Date.now();
     } else if (bird) {
       bird.deliver(data);
     }

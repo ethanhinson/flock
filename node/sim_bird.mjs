@@ -37,7 +37,15 @@ async function bird(tag) {
   const empty = () => new ort.Tensor('float32', new Float32Array(0),
                                      [1, j.kv_heads, 0, j.head_dim]);
   const ws = new WebSocket(BASE.replace(/^http/, 'ws') + '/ws');
-  ws.on('open', () => ws.send(JSON.stringify({peer_id: j.peer_id, label: tag})));
+  let beat = null;
+  ws.on('open', () => {
+    ws.send(JSON.stringify({peer_id: j.peer_id, label: tag}));
+    // Heartbeat, same as a real bird: liveness is judged on lastSeen, so an idle
+    // sim silently ages out of the flock after 40s without this.
+    ws.send(JSON.stringify({t: 'ping'}));
+    beat = setInterval(() => ws.send(JSON.stringify({t: 'ping'})), 4000);
+  });
+  ws.on('close', () => clearInterval(beat));
   ws.on('error', e => console.error(`bird ${j.slot} socket: ${e.message}`));
   ws.on('message', async (data, isBinary) => {
     if (!isBinary) return;
