@@ -104,7 +104,7 @@ function coopVariant(
       const bufs = [
         storageBuffer(dev, qs), storageBuffer(dev, scales), storageBuffer(dev, x),
         dev.createBuffer({ size: rows * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
-        uniformBuffer(dev, [rows, cols, 0, 0]),
+        uniformBuffer(dev, [rows, cols, 1, 0]),
       ];
       const bg = dev.createBindGroup({
         layout: pipe.getBindGroupLayout(0),
