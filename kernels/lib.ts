@@ -418,7 +418,12 @@ export function storageBuffer(dev: GPUDevice, data: Uint8Array | Float32Array): 
     : data;
   // WebGPU requires a 4-byte-aligned size; the 34-byte Q8_0 layout is not.
   const size = (bytes.byteLength + 3) & ~3;
-  const buf = dev.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  // COPY_SRC as well as COPY_DST: some kernels (RoPE) work in place, so their
+  // input buffer is also the buffer a test reads back.
+  const buf = dev.createBuffer({
+    size,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+  });
   const padded = size === bytes.byteLength ? bytes : (() => {
     const p = new Uint8Array(size); p.set(bytes); return p;
   })();
