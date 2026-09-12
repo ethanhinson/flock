@@ -45,8 +45,8 @@ export function layerForwardRef(
   q = rmsnormRef(q, w.f32["attn_q_norm.weight"], headDim, nHeads, eps);
   k = rmsnormRef(k, w.f32["attn_k_norm.weight"], headDim, nKvHeads, eps);
 
-  q = ropeRef(q, 1, nHeads, headDim, pos, invFreq);
-  k = ropeRef(k, 1, nKvHeads, headDim, pos, invFreq);
+  q = ropeRef(q, 1, nHeads, headDim, pos, invFreq, cfg.ropePairing);
+  k = ropeRef(k, 1, nKvHeads, headDim, pos, invFreq, cfg.ropePairing);
 
   cache.k.push(k);
   cache.v.push(v);
@@ -130,8 +130,8 @@ export function layerPrefillRef(
 
   // Token i is rotated by position pos0 + i. ropeRef's nTokens argument is what
   // makes that per-token rather than uniform.
-  q = ropeRef(q, nTokens, nHeads, headDim, pos0, invFreq);
-  k = ropeRef(k, nTokens, nKvHeads, headDim, pos0, invFreq);
+  q = ropeRef(q, nTokens, nHeads, headDim, pos0, invFreq, cfg.ropePairing);
+  k = ropeRef(k, nTokens, nKvHeads, headDim, pos0, invFreq, cfg.ropePairing);
 
   const kvw = nKvHeads * headDim;
   for (let i = 0; i < nTokens; i++) {

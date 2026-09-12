@@ -45,8 +45,8 @@
 // count matters more than the arithmetic.
 
 import {
-  attnSource, coopSource, probeUnpack, probeUnpackF16, splitQ8, storageBuffer,
-  uniformBuffer,
+  attnSource, coopSource, probeUnpack, probeUnpackF16, ropeSource, splitQ8,
+  storageBuffer, uniformBuffer, type RopePairing,
 } from "./lib.ts";
 
 export interface LayerWeights {
@@ -73,6 +73,14 @@ export interface LayerConfig {
    * rather than requiring a reallocation.
    */
   maxPrefill: number;
+  /**
+   * Which two elements of a head RoPE rotates together. "neox" (HuggingFace
+   * halves) is correct for Qwen3-0.6B-Q8_0 -- MEASURED against the ONNX graphs,
+   * not inferred from the fact that the weights came out of a GGUF. See
+   * rope.wgsl and test_rope_convention.ts; the wrong choice is a
+   * position-dependent silent degradation, not a failure.
+   */
+  ropePairing: RopePairing;
 }
 
 // maxKeys is 2048, not the 4096 that 16 KB of workgroup memory allows, and that
@@ -83,6 +91,7 @@ export interface LayerConfig {
 export const QWEN3_06B: LayerConfig = {
   hidden: 1024, nHeads: 16, nKvHeads: 8, headDim: 128, ffn: 3072,
   eps: 9.999999974752427e-7, ropeBase: 1e6, maxKeys: 2048, maxPrefill: 512,
+  ropePairing: "neox",
 };
 
 const ROWS_PER_WG = 4;     // must match q8_coop.wgsl
@@ -157,7 +166,7 @@ export class Layer {
     L.pipes = {
       matvec: mk(coopSource(await src("q8_coop.wgsl"), { unpack8, unpackF16 })),
       rmsnorm: mk(await src("rmsnorm.wgsl")),
-      rope: mk(await src("rope.wgsl")),
+      rope: mk(ropeSource(await src("rope.wgsl"), cfg.ropePairing)),
       // The scores array is sized to maxKeys, not to a fixed maximum: workgroup
       // memory caps occupancy, and declaring the full 16 KB made attention cost
       // 328 us instead of 21 us. Measured; see attention.wgsl.
@@ -577,6 +586,16 @@ export class Layer {
 
   /** The buffer holding this layer's output, for a caller chaining layers itself. */
   outputBuffer(): GPUBuffer { return this.buf.out; }
+
+  /**
+   * The buffer this layer reads its input from.
+   *
+   * Exposed so a Model can chain 28 layers with device-to-device copies inside one
+   * command buffer, instead of passing a Float32Array per layer -- which would mean
+   * a readback and an upload per layer, ~24 ms each on this backend against a
+   * whole-token budget of a few ms.
+   */
+  inputBuffer(): GPUBuffer { return this.buf.h; }
 
   /**
    * The KV cache buffers. Exposed so a test can assert that a prefill left the

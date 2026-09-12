@@ -29,7 +29,7 @@
 // constructed inputs, because those are the errors a loose tolerance could hide.
 
 import {
-  attnSource, getDevice, ok, randVec, readBack, storageBuffer, summary,
+  attnSource, getDevice, ok, randVec, readBack, ropeSource, storageBuffer, summary,
   uniformBuffer,
 } from "./lib.ts";
 import {
@@ -142,8 +142,12 @@ const rw = (n: number) => dev.createBuffer({
 }
 
 // ---------------------------------------------------------------- RoPE
-{
-  const pipe = pipelineFor(await read("rope.wgsl"), "main");
+// BOTH pairing conventions are tested, because both are shipped: which one a set
+// of weights needs is a property of the weights and is selected by the host (see
+// rope.wgsl). Testing only the default would leave the other silently rotting, and
+// the two differ by nothing an output magnitude can reveal.
+for (const pairing of ["norm", "neox"] as const) {
+  const pipe = pipelineFor(ropeSource(await read("rope.wgsl"), pairing), "main");
   const HEAD_DIM = 128, BASE = 1e6;   // qwen3.rope.freq_base
   const invFreq = ropeInvFreq(HEAD_DIM, BASE);
 
@@ -159,7 +163,7 @@ const rw = (n: number) => dev.createBuffer({
       storageBuffer(dev, invFreq)];
     const threads = nTokens * nHeads * (HEAD_DIM / 2);
     const gpu = await run(pipe, bufs, 0, n, Math.ceil(threads / 64));
-    const cpu = ropeRef(x, nTokens, nHeads, HEAD_DIM, pos0, invFreq);
+    const cpu = ropeRef(x, nTokens, nHeads, HEAD_DIM, pos0, invFreq, pairing);
     // Absolute error against the data's scale, not per-element relative error.
     // A rotation of two O(1) inputs can land near zero by cancellation, and that
     // one entry then reports a huge relative error while carrying the same ~1 ULP
@@ -169,28 +173,35 @@ const rw = (n: number) => dev.createBuffer({
     // 4e-7 is ~3 ULP of the input scale: above the cos/sin ULP difference between
     // Metal and V8, and far below a structural error, which would be O(1).
     const e = absErrScaled(gpu, cpu, amax(x));
-    ok(`rope ${nTokens}x${nHeads}x${HEAD_DIM} pos0=${pos0}`, e < 4e-7,
+    ok(`rope[${pairing}] ${nTokens}x${nHeads}x${HEAD_DIM} pos0=${pos0}`, e < 4e-7,
       `abs err / scale ${e.toExponential(1)}  (${why})`);
     for (const b of bufs) b.destroy();
   }
 
-  // The pairing convention is the thing most likely to be silently wrong, so it
-  // gets an assertion that does not depend on the reference agreeing: at
-  // position 1, pair j=0 rotates by exactly inv_freq[0] = 1 radian, and pair
-  // j=half-1 rotates by the smallest angle. Check the first pair directly.
+  // The pairing itself, asserted without depending on the reference agreeing: put
+  // a 1 at element 0 and nothing anywhere else, rotate by position 1, and read
+  // where the sine landed. Under NORM the partner of element 0 is element 1; under
+  // NEOX it is element 64. Both spellings produce a valid rotation of a valid
+  // vector, so this planted-input check is the only thing that distinguishes them.
   {
-    const nHeads = 1, n = HEAD_DIM;
+    const n = HEAD_DIM;
     const x = new Float32Array(n);
-    x[0] = 1; x[1] = 0;         // pair 0 = (1, 0); if pairing were (0, 64) this
-    x[64] = 0; x[65] = 0;       // element would be the partner instead
-    const bufs = [storageBuffer(dev, x), uniformBuffer(dev, [1, nHeads, HEAD_DIM, 1]),
+    x[0] = 1;
+    const bufs = [storageBuffer(dev, x), uniformBuffer(dev, [1, 1, HEAD_DIM, 1]),
       storageBuffer(dev, invFreq)];
     const gpu = await run(pipe, bufs, 0, n, Math.ceil(HEAD_DIM / 2 / 64));
-    const theta = invFreq[0];   // pos 1 * inv_freq[0]
+    const theta = invFreq[0];            // pos 1 * inv_freq[0]
+    const partner = pairing === "norm" ? 1 : HEAD_DIM / 2;
     const okPair = Math.abs(gpu[0] - Math.cos(theta)) < 1e-6 &&
-      Math.abs(gpu[1] - Math.sin(theta)) < 1e-6;
-    ok("rope pairs ADJACENT elements (GGUF NORM), not halves", okPair,
-      `x[0..1] = ${gpu[0].toFixed(6)}, ${gpu[1].toFixed(6)} vs cos/sin(${theta.toFixed(6)})`);
+      Math.abs(gpu[partner] - Math.sin(theta)) < 1e-6;
+    ok(`rope[${pairing}] pairs element 0 with element ${partner}`, okPair,
+      `x[0]=${gpu[0].toFixed(6)}, x[${partner}]=${gpu[partner].toFixed(6)} ` +
+      `vs cos/sin(${theta.toFixed(6)})`);
+    // And the OTHER convention's partner must be untouched, which is what makes
+    // this a discriminating test rather than a consistency one.
+    const other = pairing === "norm" ? HEAD_DIM / 2 : 1;
+    ok(`rope[${pairing}] leaves element ${other} alone (the other convention's partner)`,
+      gpu[other] === 0, `x[${other}] = ${gpu[other]}`);
     for (const b of bufs) b.destroy();
   }
 }

@@ -444,6 +444,31 @@ export function attnSource(src: string, maxKeys: number): string {
 }
 
 /**
+ * Which two elements of a head RoPE rotates together.
+ *
+ *   "norm"  GGUF / llama.cpp: adjacent, (0,1), (2,3), ...
+ *   "neox"  HuggingFace:      halves,   (0,64), (1,65), ...
+ *
+ * A parameter rather than a constant because which one is correct depends on the
+ * WEIGHTS and not on the file format. llama.cpp's converter permutes q/k for
+ * Llama-style models so that NORM reproduces HF; a GGUF converted without that
+ * permutation still needs HF pairing. Qwen3-0.6B-Q8_0 is the latter -- measured,
+ * see test_rope_convention.ts and the note in rope.wgsl.
+ *
+ * Both are self-consistent rotations, so the wrong choice degrades the model
+ * silently instead of failing. That is why it is measured against ONNX rather than
+ * inferred from the container.
+ */
+export type RopePairing = "norm" | "neox";
+
+export function ropeSource(src: string, pairing: RopePairing): string {
+  const [ia, ib] = pairing === "norm"
+    ? ["j * 2u", "j * 2u + 1u"]
+    : ["j", "j + half_dim"];
+  return src.replaceAll("$ROPE_IA", ia).replaceAll("$ROPE_IB", ib);
+}
+
+/**
  * f16 -> f32 in f32 arithmetic, for backends without unpack2x16float. Kept as a
  * string rather than duplicated into each kernel so there is one copy to be
  * right about. inf clamps to the largest finite f32, matching lib.ts halfToF32.
