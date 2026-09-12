@@ -61,46 +61,53 @@ download in full.
 ## Run it
 
 ```bash
-pip install -r requirements-export.txt          # export tooling only
-python3 build_shards.py --start 24 --end 27 --birds 1 --int8
-python3 flock_export_coordinator.py --cut 24
 cd node && npm install && npm start
 ```
 
-Two phones? `--birds 2` splits the same range in half (126MB each) and each
-device claims a free slot when it joins:
+That is the whole setup. **There is no build step** — no export, no Python, no
+artifacts on disk. The coordinator reads Q8_0 weights straight out of a GGUF file
+and runs Qwen3's first 24 layers as WGSL compute kernels; each bird range-fetches
+its own layers from HuggingFace.
 
-```bash
-python3 build_shards.py --start 24 --end 27 --birds 2 --int8
-```
-
-`--int8` quantizes the weights: a bird downloads **63MB instead of 252MB** and
-generates *identical* text (verified by a full greedy decode against the fp32
-shard). This is what makes the ONNX path competitive with GGUF on size without
-writing a single GPU kernel — ONNX Runtime already ships quantized matmul.
+`npm start` runs **Deno**, not Node, and that is a requirement rather than a
+preference: the coordinator needs a GPU and Node has no WebGPU at all. See
+[Why the server runs under Deno](#why-the-server-runs-under-deno).
 
 `npm start` prints the LAN addresses to use:
 
 - **phone** → `http://<your-ip>:8000/flock` → tap **join the flock**
 - **any browser** → `http://<your-ip>:8000` → chat
 
-Mac holds the embedding, layers 0–23, and the vocab projection. The phone holds
-layers 24–27 and the final norm, executed by **ONNX Runtime Web on WebGPU**
-(iOS 26+ enables WebGPU by default; older iOS falls back to WASM, slower but
-working — the page tells you which backend it got).
+The Mac holds the embedding, layers 0–23, `output_norm` and the tied vocab
+projection. The phone holds layers 24–27, executed as **WGSL compute shaders on
+WebGPU** — the same kernels the test suite validates against ONNX token for token.
+WebGPU is required on a bird; there is no CPU fallback any more, and the page says
+so plainly rather than promising a slower one.
 
-No phone handy? `npm run solo` runs every bird in one Node process, so the whole
-chain works on one machine:
+Two phones? `FLOCK_BIRDS=2` splits the same range in half and each device claims a
+free slot when it joins. Because a split is now just a choice about byte ranges,
+this is an environment variable rather than a rebuild:
+
+```bash
+FLOCK_BIRDS=2 npm start                 # 2 birds, 2 layers each
+FLOCK_BIRD_LAYERS=8 npm start           # give the birds 8 layers instead of 4
+FLOCK_GGUF=<url> npm start              # a different GGUF
+```
+
+No phone handy? `npm run solo` runs every bird in one process, so the whole chain
+works on one machine:
 
 ```bash
 npm start                   # one shell
 npm run solo                # another: claims every layer slot
 npm run health              # is the flock covered?
-npm test                    # syntax + range planning
+npm test                    # syntax + range planning + the bird's load path
 npm run test:ui             # drives both pages against the live coordinator
 ```
 
 Set `PORT` to run somewhere other than 8000.
+
+---
 
 ---
 
@@ -114,32 +121,23 @@ f16 binary    2.0 KB per decode step
 ```
 
 On real activation values (|x| < 0.1, derived from bf16 weights) the f16 round
-trip is effectively lossless. The Python and JS implementations are
-byte-compatible and verified against each other in both directions.
+trip is effectively lossless. There is exactly one implementation
+(`web/js/wire.mjs`), imported by the server and by the browser pages alike, so the
+two ends cannot disagree about the format.
 
-The coordinator runs on **Node**, so it is itself a WebRTC peer: it offers a
-data channel to each bird, and once that opens the websocket carries nothing
-but offers/answers/ICE — the same role PeerJS plays for swarmllm. Replacing
-long-polling with event-driven sockets took the roundtrip through two birds
-from **132ms to ~5ms**.
+The coordinator is a real WebRTC peer: it offers a data channel to each bird, and
+once that opens the websocket carries nothing but offers/answers/ICE — the same
+role PeerJS plays for swarmllm. Replacing long-polling with event-driven sockets
+took the roundtrip through two birds from **132ms to ~5ms**.
 
-Python survives only as the export and verification tool: PyTorch is the
-reference every ONNX graph is checked against, so a bad export can't be
-silently wrong.
+## Weights come straight from HuggingFace, with no build step
 
-## Weights can come straight from HuggingFace, with no build step
-
-The ONNX path above needs Python to run first: export the layer range,
-quantize it, write 63MB per bird to disk, and let the coordinator serve those
-bytes. A GGUF file does not need any of that. The first ~6MB of it is a
-directory listing every tensor's exact byte offset, and everything after is raw
-weights — so **a bird range-fetches its own layers directly from the model
-host** and the coordinator never touches them.
-
-```bash
-FLOCK_GGUF=https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf npm start
-# then open the bird page with ?gguf=1
-```
+There used to be a Python build step here: export the layer range with
+`torch.onnx.export`, quantize it, write 63MB per bird to disk, and have the
+coordinator serve those bytes. A GGUF file needs none of that. The first ~6MB of
+it is a directory listing every tensor's exact byte offset, and everything after
+is raw weights — so **every device range-fetches its own layers directly from the
+model host** and the coordinator never touches them.
 
 Four layers of Qwen3-0.6B is **66.9MB in one HTTP range request** — one, not
 44, because layers are laid out contiguously in GGUF and the loader opens a
@@ -178,19 +176,22 @@ the kernels are already validated against, for every tensor of a layer.
 
 `npm run test:gpu` runs all of it against real hardware and the real file.
 
-**The ONNX path is untouched and still the default.** It is the reference the
-WGSL engine is validated against, so the GGUF path is opt-in until that engine
-lands, and a GGUF failure logs and falls through rather than costing a bird its
-slot.
+**This is now the only path.** ONNX is gone from inference entirely — no
+`onnxruntime-web` in the bird page, no `onnxruntime-node` in the coordinator, no
+exported shards. What remains of it is test-only: see
+[ONNX survives as the reference](#onnx-survives-as-the-reference).
 
 ## The KV cache is sharded too
 
 Each device caches K/V for **only its own layers**, so conversation state is
 sharded exactly like the weights are — no single device holds all of it.
 
-An ONNX graph is static, so the phone's cache can't live inside it as hidden
-state. Past K/V come in as explicit graph inputs, new K/V go out as outputs,
-and the phone's JS holds them between steps. Measured effect per decode step:
+The cache now lives in GPU memory inside each `Layer` object and is never
+marshalled: a decode step appends one key and one value to a device buffer, and
+the host sees neither. That is a simplification the WGSL engine bought — under
+ONNX the graph was static, so past K/V had to come in as explicit graph inputs and
+new K/V go out as outputs, with the page's JS holding a dict of tensors between
+steps. Measured effect per decode step, when the cache was first added:
 
 ```
               before          after
@@ -220,8 +221,8 @@ device's shard of the cache.
 **The phone never gets `lm_head`.** It's 151936×1024 (~600MB fp32) and is
 *tied* to the embedding matrix the Mac already holds. Shipping it would
 quadruple the phone's download to buy nothing, so the phone returns a hidden
-state and the Mac does the vocab projection. First export was 874MB; this
-brought it to 252MB.
+state and the Mac does the vocab projection. A bird's whole download is 66.9MB in
+one range request.
 
 **A browser cannot accept inbound connections.** The original design had the
 phone long-poll for work, which cost ~132ms per token. Now the coordinator is
@@ -233,22 +234,51 @@ PeerJS plays for swarmllm, and it is why the network overhead is now ~11ms.
 locked tab: timers stop, fetches never return, and the node silently vanishes.
 This is a genuine constraint of browser-based compute nodes, not an oversight.
 
-**The export is verified against PyTorch** (`max abs err ~1e-4`) on every run,
-so a phone can't be silently wrong.
+**A bird's weights never sit in the JS heap.** Each ~4MB staging chunk goes
+straight into its GPU buffer as it streams, because the obvious loader
+(`arrayBuffer()` then `writeBuffer`) held a 126MB shard while the driver made its
+own copy — ~250MB peak, which is what killed an iPad.
 
 ---
 
-## Why there is any Python
+## Why the server runs under Deno
 
-Only at build time, and only because there is no alternative: `torch.onnx.export`
-has no JavaScript equivalent. ONNX Runtime *runs* models in every language, but
-Python is the only thing that *produces* them from PyTorch weights.
+The coordinator holds layers 0–23, so it needs a GPU. **Node has no WebGPU.**
+Measured on node v20.11.0: there is no `navigator` at all, `globalThis.GPUDevice`
+is undefined, and `--experimental-webgpu` is not a Node flag (that is Deno's —
+Node rejects it with `bad option`).
 
-Keeping it also buys something real — PyTorch is the reference every exported
-graph is checked against (`max abs err ~1e-4` on every build), which is what
-catches an export that would otherwise produce plausible-looking garbage.
+Deno 2.1.2 solves it with no compromise. It provides a real adapter whose
+`maxStorageBufferBindingSize` is 4 GiB — which the 155.6MB tied LM head needs,
+because overflowing the 128 MiB default is a **silent** wrong answer rather than a
+throw — and it runs the rest of the stack unchanged through its node compatibility
+layer: `express`, `ws`, `node-datachannel` and `@huggingface/transformers` all
+import and work. So the whole server stayed one process on one runtime.
 
-Nothing Python runs at inference time. Export once, then `npm start`.
+The alternatives were considered and are worse. A browser-hosted coordinator
+(swarmllm's design) makes the thing you must keep open a browser tab rather than a
+server. A CPU coordinator means writing a second implementation of 24 layers that
+nothing validates. Neither was necessary.
+
+## ONNX survives as the reference
+
+Nothing in the inference path imports ONNX. But `onnxruntime-node` is kept as a
+**devDependency**, and that is deliberate: `kernels/onnx_full.mjs` runs the whole
+five-graph ONNX pipeline under Node, and `kernels/test_model.ts` diffs the WGSL
+engine against it token for token. It is the only *independent* implementation in
+the repo.
+
+Delete it and the engine could only ever be compared against itself — a CPU
+reference built from the same per-op references shares their assumptions, and
+`kernels/README.md` documents a real bug (RoPE's pairing convention) that exactly
+that kind of self-consistency test could not see. So the regression proof is worth
+keeping a test-only dependency and a set of gitignored graphs for.
+
+```
+prompt  "Capital of France?"
+WGSL    [785,6722,315,9625,374,3070,59604,334,13]   "The capital of France is **Paris**."
+ONNX    [785,6722,315,9625,374,3070,59604,334,13]   identical, both stop at EOS
+```
 
 ## Limitations
 
@@ -275,29 +305,31 @@ Read these before drawing conclusions from it.
 
 | file | role |
 |---|---|
-| `build_shards.py` | splits a layer range across N birds, writes `web/flock.json` |
-| `flock_export.py` | carves one layer range into ONNX; verifies vs PyTorch |
-| `flock_export_coordinator.py` | exports the coordinator's embed/layers/head graphs |
-| `node/src/server.js` | the coordinator: chat loop, signaling, HTTP |
-| `node/src/coordinator.js` | embedding + layers 0–23 + vocab projection |
+| `kernels/` | the WGSL engine: 9 compute kernels, `Layer`, `Model`, and their tests |
+| `kernels/README.md` | what each kernel is validated against, and ten traps worth reading |
+| `node/src/server.js` | the coordinator: chat loop, signaling, HTTP, kernel serving |
+| `node/src/coordinator.js` | embedding + layers 0–23 + output_norm + tied head |
 | `node/src/mesh.js` | the flock, slot claiming, chain topology, WebRTC links |
-| `web/js/wire.mjs` | the f16 frame format — one copy, imported by node and browsers |
+| `node/src/gguf.mjs` | GGUF range planning: which bytes does each device need |
+| `web/js/wire.mjs` | the f16 frame format — one copy, imported by server and browsers |
 | `web/js/gguf-dir.mjs` | reads a GGUF directory in a browser, over range requests |
 | `web/js/gguf-stream.mjs` | streams GGUF tensors into GPU buffers, ~4MB at a time |
-| `web/bird.html` | a bird — ONNX Runtime Web on WebGPU |
+| `web/bird.html` | a bird — WGSL compute shaders on WebGPU |
 | `web/chat.html` | chat UI: conversation, live topology, per-token stats |
 | `node/sim_bird.mjs` | a bird without a browser, for testing the chain |
 | `node/test/` | range planning, and both pages driven against a live coordinator |
 
 ## Things to try
 
-- Move the split: `--start 20 --end 27` gives the phones 8 layers — watch them
-  become the bottleneck.
+- Move the split: `FLOCK_BIRD_LAYERS=8` gives the phones 8 layers — watch them
+  become the bottleneck. No rebuild; a split is just a byte range now.
 - Kill a peer mid-generation: the swarm reports exactly which layers are
   uncovered, and recovers when a device claims that slot.
-- Export with `--no-cache` and compare `wire KB` growth against the cached run.
-- Add a second device with `--birds 2` and watch tok/s go *down* — pipeline
+- Add a second device with `FLOCK_BIRDS=2` and watch tok/s go *down* — pipeline
   parallelism buys capacity, not speed.
+- Run `kernels/test_model.ts` to see the WGSL engine and the ONNX pipeline
+  generate the same token ids, then read `kernels/README.md` on why a per-token
+  cosine that is perfect at position 0 and decays after it indicts RoPE.
 
 ## Prior art
 
