@@ -1,18 +1,27 @@
 // Drive bird.html's real logic against a live coordinator, without a browser.
 //
+// RUN IT WITH DENO, NOT NODE:
+//
+//   deno run --unstable-webgpu --allow-all test/bird_ui.test.mjs
+//
 // Same idea as chat_ui.test.mjs: extract the page's module script, stub the
 // browser surface it touches, and let it actually join the flock and compute
-// frames -- with onnxruntime-node standing in for onnxruntime-web, since the
-// page's inference calls are the same shape in both.
+// frames. What is new is that NOTHING about the inference is stubbed any more.
 //
-// This is what proves the page's UI state (my layers, backend, kv cache size,
-// link type, frames, download progress, plain-language errors) is driven by real
-// data rather than only parsing.
+// The old version shimmed onnxruntime-node in place of onnxruntime-web and was
+// explicit that it tested the page's UI state machine and not the numerics,
+// because the two ONNX runtimes take their weights differently and shimming one
+// for the other tests the shim. That compromise is gone: the page now runs WGSL
+// kernels, Deno provides a real WebGPU device, and the page's own
+// gguf-stream + Layer path runs unmodified. So this test streams real Q8_0
+// weights from HuggingFace into real GPU buffers and computes real frames --
+// the UI state AND the inference, on the same code a phone runs.
 //
-//   node src/server.js &   node test/bird_ui.test.mjs
-import {readFileSync, writeFileSync, unlinkSync} from 'fs';
-import path from 'path';
-import {fileURLToPath, pathToFileURL} from 'url';
+// What is still stubbed is only the browser: the DOM, localStorage, indexedDB and
+// RTCPeerConnection. Those are the parts a headless runtime genuinely lacks.
+import {readFileSync} from 'node:fs';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
 import WebSocket from 'ws';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -63,67 +72,48 @@ globalThis.localStorage = {
   getItem(k) { return this._m.has(k) ? this._m.get(k) : null; },
   setItem(k, v) { this._m.set(k, String(v)); },
 };
-globalThis.navigator = {platform: 'test-bird', userAgent: 'node test harness'};
+// navigator.gpu is the REAL one -- Deno's. The page requires WebGPU now (the
+// layers are compute shaders, so there is no fallback to degrade to), and giving
+// it a real device is what lets this test cover the inference rather than a stub.
+globalThis.navigator = {
+  platform: 'test-bird', userAgent: 'deno test harness', gpu: navigator.gpu,
+};
 globalThis.indexedDB = undefined;             // exercise the no-cache path
 globalThis.location = {host: BASE.replace(/^https?:\/\//, '')};
 globalThis.WebSocket = WebSocket;
 globalThis.RTCPeerConnection = undefined;     // websocket transport only
 
-// The page imports its inference runtime from a CDN and wire.mjs from /js.
+// The page imports wire.mjs, gguf-stream.mjs and the kernels by absolute path
+// (/js/..., /kernels/...), which only resolve against the coordinator. Point them
+// at this file's own copies instead, so the test runs the working tree's code
+// rather than whatever the server happens to be serving.
 //
-// Inference itself is stubbed rather than shimmed onto onnxruntime-node: the two
-// runtimes take their weights differently (a path vs a graph buffer plus an
-// external-data view), so shimming tests the shim. What is under test here is
-// the page's UI state machine -- which layers it claims, what it reports as its
-// backend, download progress, the shape of its K/V bookkeeping, the link label,
-// and whether failures arrive as plain language. A stub that returns correctly
-// shaped tensors exercises all of that, and is honest about what it does not
-// cover: the numerics, which node/test/gguf.test.mjs and the export step own.
+// The kernels are imported as '/kernels/layer.ts.js' by the page, because a
+// BROWSER cannot execute TypeScript and the server transpiles on request. Deno
+// can, so here it resolves straight to the .ts file. Same source either way --
+// the transpile is type stripping, not a rewrite.
 const wireURL = new URL('../../web/js/wire.mjs', import.meta.url).href;
-const shimPath = path.join(ROOT, 'node/test/.ort-shim.mjs');
-writeFileSync(shimPath, `
-class Tensor {
-  constructor(type, data, dims) { this.type = type; this.data = data; this.dims = dims; }
-}
-// Echoes the hidden state through and grows K/V by seq, the same contract the
-// page depends on: out.output.data to forward, out.new_k0.dims[2] for cache size.
-const InferenceSession = {
-  async create() {
-    let held = 0;
-    return {
-      async run(feed) {
-        const [, seq, hidden] = feed.hidden.dims;
-        held += seq;
-        const out = {output: new Tensor('float32', feed.hidden.data, [1, seq, hidden])};
-        for (let i = 0; ; i++) {
-          if (!(\`past_k\${i}\` in feed)) break;
-          out[\`new_k\${i}\`] = new Tensor('float32', new Float32Array(0), [1, 8, held, 128]);
-          out[\`new_v\${i}\`] = new Tensor('float32', new Float32Array(0), [1, 8, held, 128]);
-        }
-        return out;
-      },
-    };
-  },
-};
-export {Tensor, InferenceSession};
-export const env = {wasm: {}};
-export default {Tensor, InferenceSession, env};
-`);
-const ortShim = pathToFileURL(shimPath).href;
+const ggufURL = new URL('../../web/js/gguf-stream.mjs', import.meta.url).href;
+const layerURL = new URL('../../kernels/layer.ts', import.meta.url).href;
 
 const rewritten = src
-  .replace(/from 'https:\/\/cdn\.jsdelivr\.net\/[^']*'/, `from '${ortShim}'`)
   .replace("from '/js/wire.mjs'", `from '${wireURL}'`)
-  // Same-origin paths -> the coordinator under test. The shard URLs are built at
-  // the grab() call sites rather than at a fetch(), so rewrite those too.
+  .replace("from '/js/gguf-stream.mjs'", `from '${ggufURL}'`)
+  .replace("from '/kernels/layer.ts.js'", `from '${layerURL}'`)
+  // Same-origin paths -> the coordinator under test.
   .replace(/fetch\('\//g, `fetch('${BASE}/`)
-  .replace(/grab\(`\//g, `grab(\`${BASE}/`)
   // The page routes load failures to log()+report()+problem(); also print, so a
   // harness gap is not mistaken for a page bug.
   .replace('})().catch(e => {', '})().catch(e => { console.log(\'  load threw:\', e && e.message || e);');
 
 process.on('unhandledRejection', e => console.log('  unhandled:', e?.stack || e));
-const mod = `data:text/javascript;base64,${Buffer.from(rewritten).toString('base64')}`;
+// A data: URL rather than a temp file, so nothing is written to disk. Encoded via
+// TextEncoder + btoa rather than Buffer: this runs under Deno, where Buffer is not
+// a global, and btoa alone would mangle the page's non-ASCII characters (it has
+// en-dashes and an ellipsis) because it takes latin-1 code units.
+const bytes = new TextEncoder().encode(rewritten);
+const b64 = btoa(Array.from(bytes, b => String.fromCharCode(b)).join(''));
+const mod = `data:text/javascript;base64,${b64}`;
 await import(mod);
 
 // Wait for the page's own load path to finish claiming + building.
@@ -144,12 +134,23 @@ check('claimed a slot and shows its layer range',
   /^\d+–\d+$/.test(nodes.get('layers').textContent), nodes.get('layers').textContent);
 check('shows total layers and its own count',
   /of \d+ · \d+ layer/.test(nodes.get('of').textContent), nodes.get('of').textContent);
-check('reports a backend', ['webgpu', 'wasm'].includes(nodes.get('backend').textContent),
+check('reports webgpu as its backend (there is no CPU fallback any more)',
+  nodes.get('backend').textContent === 'webgpu',
   nodes.get('backend').textContent);
 check('download progress reached ready', nodes.get('dlpct').textContent === 'ready',
   nodes.get('dlpct').textContent);
 check('no problem banner after a clean load', !problem);
 check('join became enabled', !nodes.get('join').disabled);
+
+// The load path is now GGUF-only, so the log has to show it actually streamed
+// weights rather than falling back to something. These are the lines that would
+// be absent if the page had quietly taken another route.
+const allLog = logLines().join('\n');
+check('streamed its layers from the GGUF file',
+  /gguf: \d+MB in [\d.]+s, \d+ tensors/.test(allLog),
+  (allLog.match(/gguf: [^\n]*/) || ['(no gguf line)'])[0]);
+check('the log mentions no ONNX anywhere', !/onnx/i.test(allLog),
+  (allLog.match(/[^\n]*onnx[^\n]*/i) || ['clean'])[0]);
 
 // --- join, then make the coordinator drive a real turn --------------------
 console.log('\njoining and computing a real turn:');
@@ -197,6 +198,5 @@ if (!health.ok) {
     !nodes.get('problem').classList.contains('on'));
 }
 
-try { unlinkSync(shimPath); } catch {}
 console.log(`\n${fails ? `${fails} CHECKS FAILED` : 'ALL CHECKS PASSED'}`);
 process.exit(fails ? 1 : 0);

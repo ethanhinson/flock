@@ -29,7 +29,7 @@ import {createServer} from 'node:http';
 import {randomBytes} from 'node:crypto';
 import {networkInterfaces} from 'node:os';
 import path from 'node:path';
-import {fileURLToPath} from 'node:url';
+import {fileURLToPath, pathToFileURL} from 'node:url';
 
 import {Coordinator} from './coordinator.js';
 import {Flock} from './mesh.js';
@@ -87,11 +87,55 @@ function localAddresses() {
 const app = express();
 app.use(express.json());
 app.use('/js', express.static('web/js'));
-// A bird runs the SAME kernels the tests validate, so it fetches them from here
-// rather than carrying a copy. `wgslSource()` in kernels/layer.ts resolves them
-// relative to its own module URL, which is what makes one file work under Deno
-// (a file: URL) and in the page (an http: URL) with no build step. Serving the
-// directory rather than bundling it means a kernel fix reaches birds on reload.
+
+// A bird runs the SAME kernels the tests validate, fetched from here rather than
+// carrying a copy -- so a kernel fix reaches every bird on reload, and there is
+// no second implementation to keep in step with kernels/.
+//
+// The .wgsl files go out as-is: wgslSource() in kernels/layer.ts resolves them
+// against its own module URL, which is a file: URL under Deno and an http: one in
+// the page, so one expression serves both runtimes.
+//
+// The .ts files cannot go out as-is, because browsers do not execute TypeScript.
+// They are transpiled ON REQUEST and their `./x.ts` import specifiers rewritten to
+// `./x.ts.js`, so the browser follows the same module graph Deno does. This is
+// deliberately not a build step: nothing is written to disk, there is no artifact
+// to rebuild or forget to rebuild, and the file the bird runs is derived from the
+// file the tests run every time it is asked for. Transpiling is type STRIPPING
+// only -- no type checking, which is what `deno check` is for -- and the result is
+// cached in memory per mtime so a reload does not re-emit.
+const TS_CACHE = new Map();
+app.get(/^\/kernels\/(.+\.ts)\.js$/, async (req, res) => {
+  const rel = req.params[0];
+  // Only the kernels directory, and no traversal out of it: `rel` reaches the
+  // filesystem, so a crafted path must not escape.
+  if (rel.includes('..') || !/^[\w./-]+$/.test(rel)) {
+    return res.status(400).type('text/plain').send('bad kernel path');
+  }
+  const abs = path.join(ROOT, 'kernels', rel);
+  try {
+    const {mtimeMs} = await import('node:fs/promises').then(fs => fs.stat(abs));
+    const hit = TS_CACHE.get(abs);
+    if (hit && hit.mtimeMs === mtimeMs) {
+      return res.type('application/javascript').send(hit.js);
+    }
+    const {transpile} = await import('jsr:@deno/emit');
+    const url = pathToFileURL(abs);
+    const out = await transpile(url);
+    // Rewrite relative .ts specifiers to the .ts.js route above, so the graph
+    // resolves in the browser. Only RELATIVE ones: a bare specifier would be a
+    // dependency the page has no import map for, and silently rewriting it would
+    // produce a 404 that looks like a missing kernel.
+    const js = out.get(url.href)
+      .replace(/(from\s*["'])(\.\.?\/[^"']+\.ts)(["'])/g, '$1$2.js$3')
+      .replace(/(import\s*\(\s*["'])(\.\.?\/[^"']+\.ts)(["']\s*\))/g, '$1$2.js$3');
+    TS_CACHE.set(abs, {mtimeMs, js});
+    res.type('application/javascript').send(js);
+  } catch (e) {
+    console.error(`[kernels] ${rel}: ${e.message}`);
+    res.status(404).type('text/plain').send(`cannot serve ${rel}: ${e.message}`);
+  }
+});
 app.use('/kernels', express.static('kernels'));
 
 app.post('/join', (req, res) => {
