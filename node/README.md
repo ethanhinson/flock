@@ -29,8 +29,9 @@ silently wrong.
 | `npm run bird` | one simulated bird, claiming the lowest free slot |
 | `npm run health` | is the flock covered? exits non-zero if not |
 | `npm run status` | full state: birds, transports, cache, recent device errors |
-| `npm test` | syntax over every file, then GGUF range planning |
+| `npm test` | syntax, GGUF range planning, both parsers cross-checked, the bird's GGUF gate |
 | `npm run test:ui` | drives chat.html and bird.html against a live coordinator |
+| `npm run test:gpu` | streams real weights into real GPU buffers (needs Deno) |
 | `npm run plan` | what each device would fetch, reading only a GGUF header |
 | `npm run build` | export the shards and the coordinator graphs |
 
@@ -41,7 +42,9 @@ silently wrong.
 | `src/server.js` | HTTP, SSE chat loop, websocket signaling |
 | `src/coordinator.js` | embedding, layers 0..cut-1, vocab projection, tokenizer |
 | `src/mesh.js` | the flock: slot claiming, liveness, chain topology, WebRTC links |
-| `src/gguf.mjs` | GGUF range planning over HTTP range requests |
+| `src/gguf.mjs` | GGUF range planning over HTTP range requests (Node-only: npm import) |
+| `../web/js/gguf-dir.mjs` | the same directory parse, browser-safe |
+| `../web/js/gguf-stream.mjs` | streams GGUF tensors from HuggingFace into GPU buffers |
 | `sim_bird.mjs` | a bird without a browser |
 | `check_html.mjs` | `node --check` over the inline `<script>` of each page |
 

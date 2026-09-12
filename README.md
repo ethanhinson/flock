@@ -127,6 +127,62 @@ Python survives only as the export and verification tool: PyTorch is the
 reference every ONNX graph is checked against, so a bad export can't be
 silently wrong.
 
+## Weights can come straight from HuggingFace, with no build step
+
+The ONNX path above needs Python to run first: export the layer range,
+quantize it, write 63MB per bird to disk, and let the coordinator serve those
+bytes. A GGUF file does not need any of that. The first ~6MB of it is a
+directory listing every tensor's exact byte offset, and everything after is raw
+weights — so **a bird range-fetches its own layers directly from the model
+host** and the coordinator never touches them.
+
+```bash
+FLOCK_GGUF=https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf npm start
+# then open the bird page with ?gguf=1
+```
+
+Four layers of Qwen3-0.6B is **66.9MB in one HTTP range request** — one, not
+44, because layers are laid out contiguously in GGUF and the loader opens a
+single response over the merged range and hands it to each tensor in turn.
+Removing those 43 round trips also made the download 5x faster.
+
+It also makes the split *dynamic*: layer ranges are just byte ranges, so the
+coordinator can decide them when devices join instead of baking them into
+exported files.
+
+### Peak memory is the staging buffer, not the tensor
+
+The obvious loader — `await res.arrayBuffer()` then `writeBuffer` — holds the
+whole slice in JS while the driver makes its own copy. That is what killed an
+iPad on the ONNX path: ~250MB peak for a 126MB shard. So nothing here ever
+holds a tensor. The response is read as a **stream** and each 4MB staging chunk
+is copied into the GPU buffer as it arrives, de-interleaved on the way through
+into the separate `qs`/`scales` buffers the WGSL kernels want.
+
+Measured against the real 639MB file, comparing JS memory held per byte
+delivered:
+
+```
+                        slice     peak JS    per byte
+naive (arrayBuffer)     16.7MB     30.3MB      1.81x
+streaming               66.9MB     15.7MB      0.24x
+```
+
+Streaming four layers costs *less* JS memory than holding one. Above a measured
+floor for Deno's own fetch buffering, the loader's share is 3.7MB — the
+coalescing buffer plus one flush of quants and scales, independent of slice
+size, which is the whole claim.
+
+The bytes are verified byte-identical to `fetchRange` + `splitQ8`, the reference
+the kernels are already validated against, for every tensor of a layer.
+
+`npm run test:gpu` runs all of it against real hardware and the real file.
+
+**The ONNX path is untouched and still the default.** It is the reference the
+WGSL engine is validated against, so the GGUF path is opt-in until that engine
+lands, and a GGUF failure logs and falls through rather than costing a bird its
+slot.
+
 ## The KV cache is sharded too
 
 Each device caches K/V for **only its own layers**, so conversation state is
@@ -226,6 +282,8 @@ Read these before drawing conclusions from it.
 | `node/src/coordinator.js` | embedding + layers 0–23 + vocab projection |
 | `node/src/mesh.js` | the flock, slot claiming, chain topology, WebRTC links |
 | `web/js/wire.mjs` | the f16 frame format — one copy, imported by node and browsers |
+| `web/js/gguf-dir.mjs` | reads a GGUF directory in a browser, over range requests |
+| `web/js/gguf-stream.mjs` | streams GGUF tensors into GPU buffers, ~4MB at a time |
 | `web/bird.html` | a bird — ONNX Runtime Web on WebGPU |
 | `web/chat.html` | chat UI: conversation, live topology, per-token stats |
 | `node/sim_bird.mjs` | a bird without a browser, for testing the chain |
