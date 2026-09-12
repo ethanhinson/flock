@@ -329,6 +329,74 @@ let peerId = localStorage.getItem('flock_peer') || null;
       try { structuredClone(weights, {transfer: [weights]}); } catch {}
     }
   }
+  // --- GGUF weights, straight from the model host ------------------------
+  //
+  // The ONNX path below needs a host build step (export, quantize, write 63MB to
+  // disk per bird) and the coordinator then serves those bytes. The GGUF path
+  // needs neither: layer ranges are just byte ranges in a file already sitting on
+  // HuggingFace, so a bird range-fetches its own ~67MB directly and the split is
+  // decided at join time rather than baked into exported files.
+  //
+  // It runs ALONGSIDE the ONNX path, not instead of it, and deliberately so. The
+  // WGSL engine that will consume these buffers is still being finished, and the
+  // ONNX session is the reference it is validated against -- so flipping birds
+  // over before that engine lands would remove the only thing proving it right.
+  // What this does today is prove the LOADING is right on real hardware: it
+  // builds the GPU buffers, reports what they cost, and hands them to
+  // window.flockWeights for the engine to pick up.
+  //
+  // Gated on three things, all of which have to be true at once: a coordinator
+  // that handed out a GGUF url (FLOCK_GGUF), a device with WebGPU, and either
+  // ?gguf=1 or a remembered opt-in. Nothing here can break a bird that has none
+  // of them.
+  const wantGGUF = new URLSearchParams(location.search).get('gguf')
+                 ?? localStorage.getItem('flock_gguf');
+  if (meta.gguf && hasGPU && wantGGUF === '1') {
+    localStorage.setItem('flock_gguf', '1');
+    try {
+      const {loadBirdWeights} = await import('/js/gguf-stream.mjs');
+      const ad = await navigator.gpu.requestAdapter();
+      const device = await ad.requestDevice();
+      log(`streaming layers ${meta.start}–${meta.end} from GGUF…`, 'ok');
+      const t = performance.now();
+      const got = await loadBirdWeights(device, meta.gguf, meta.start, meta.end, {
+        onNote: m => log('gguf: ' + m),
+        // One DOM write per whole percent, not per staging chunk: this fires
+        // thousands of times for 67MB and a write per call competes with the
+        // very allocations the streaming is being careful about.
+        onProgress: (() => {
+          let lastPct = -1;
+          return p => {
+            const pct = Math.floor(p.bytesDone / p.bytesTotal * 100);
+            if (pct === lastPct) return;
+            lastPct = pct;
+            progress(`gguf ${p.tensor.replace(/^blk\./, 'blk ')}`,
+                     p.bytesDone, p.bytesTotal);
+          };
+        })(),
+      });
+      const secs = (performance.now() - t) / 1000;
+      const s = got.stats;
+      log(`gguf: ${(s.bytesTotal / 1e6).toFixed(0)}MB in ${secs.toFixed(1)}s, ` +
+          `${s.tensors} tensors, ${s.requests} range request` +
+          `${s.requests === 1 ? '' : 's'}` +
+          `${s.fromCache ? ' (from cache)' : ''}`, 'ok');
+      // Handed off rather than used: whoever finishes the WGSL engine picks these
+      // up without this page having to know anything about kernels.
+      window.flockWeights = {device, model: got.model, layers: got.layers, stats: s};
+      await report('gguf-loaded', {
+        mb: +(s.bytesTotal / 1e6).toFixed(1), secs: +secs.toFixed(1),
+        tensors: s.tensors, requests: s.requests, cached: s.fromCache,
+      });
+    } catch (e) {
+      // A GGUF failure must not cost the bird its slot: the ONNX path below is
+      // still there and still the one that actually runs frames today.
+      const m = String(e.message || e);
+      log('gguf load failed, continuing on the onnx path: ' + m, 'bad');
+      await report('gguf-failed', m);
+    }
+  }
+
   log(`loading my ${meta.n_layers} layers…`);
   const buf  = await grab(`/shard/${meta.slot}.onnx`, 'graph');
   const wbuf = await grab(`/shard/${meta.slot}.onnx.data`, 'weights');
