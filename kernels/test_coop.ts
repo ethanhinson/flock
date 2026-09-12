@@ -21,6 +21,7 @@ import {
   probeUnpack, probeUnpackF16, quantMatrixQ4, quantMatrixQ8, randVec, readBack,
   splitQ4, splitQ8, storageBuffer, summary, uniformBuffer,
 } from "./lib.ts";
+import { absErrScaled, amax } from "./ops_ref.ts";
 import { realQ8Tensor } from "./real_weights.ts";
 
 const LANES = 64, ROWS_PER_WG = 4;
@@ -124,9 +125,15 @@ for (const path of paths) {
 }
 
 // The coop kernel and the reference kernel are different summation orders of the
-// same sum, so they will NOT agree bit-for-bit -- but they must agree to about
-// f32's noise floor. This catches a coop kernel that reads the wrong weights
-// entirely, which a self-consistent reference could not.
+// same sum, so they will NOT agree bit-for-bit -- but they must agree to f32's
+// noise floor. This is the check that catches a coop kernel reading the wrong
+// weights entirely, which a reference sharing its own indexing could not.
+//
+// Judged on absolute error against the output scale, not per-element relative
+// error. A matvec output is a sum of 1024 signed terms, so some rows land near
+// zero by cancellation and report a large relative error over ordinary rounding
+// noise -- measured 3.9e-5 on one random draw and 2.2e-4 on the next, from the
+// same correct kernel. The absolute figure is stable.
 {
   const rows = 1024, cols = 1024;
   const w = randVec(rows * cols, 0.05), x = randVec(cols);
@@ -135,9 +142,9 @@ for (const path of paths) {
   const pipe = makePipeline(q8src, paths[0]);
   const gpu = await run(pipe, s.qs, s.scales, x, rows, cols);
   const serial = cpuMatmulQ8F32(packed, x, rows, cols);
-  const err = maxRelErr(gpu, serial);
-  ok("coop agrees with the serial kernel to f32 noise", err > 0 && err < 1e-4,
-    `rel err ${err.toExponential(1)} (nonzero is expected: different summation order)`);
+  const err = absErrScaled(gpu, serial, amax(serial));
+  ok("coop agrees with the serial kernel to f32 noise", err > 0 && err < 1e-6,
+    `abs err / scale ${err.toExponential(1)} (nonzero is expected: different summation order)`);
 }
 
 // Repacking must be lossless: same bytes, different arrangement.
