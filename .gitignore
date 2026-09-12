@@ -12,3 +12,6 @@ __pycache__/
 # Node
 node/node_modules
 web/coord
+
+# agent worktrees
+.claude/worktrees/
