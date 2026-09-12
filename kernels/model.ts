@@ -43,7 +43,10 @@ import {
   attnSource, coopSource, probeUnpack, probeUnpackF16, splitQ8, storageBuffer,
   uniformBuffer,
 } from "./lib.ts";
-import { Layer, QWEN3_06B, type LayerConfig, type LayerWeights } from "./layer.ts";
+import {
+  Layer, QWEN3_06B, wgslSource, type GpuTensor, type LayerBuffers,
+  type LayerConfig, type LayerWeights,
+} from "./layer.ts";
 import type { RealModel } from "./real_weights.ts";
 
 const ROWS_PER_WG = 4;      // must match q8_coop.wgsl
@@ -91,7 +94,7 @@ export class Model {
     const M = new Model(dev, cfg);
     const unpack8 = await probeUnpack(dev);
     const unpackF16 = await probeUnpackF16(dev);
-    const src = (f: string) => Deno.readTextFile(new URL("./" + f, import.meta.url));
+    const src = wgslSource;
     const mk = (code: string, entryPoint = "main") => dev.createComputePipeline({
       layout: "auto", compute: { module: dev.createShaderModule({ code }), entryPoint },
     });
