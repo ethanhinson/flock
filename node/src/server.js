@@ -26,6 +26,8 @@
 import express from 'express';
 import {WebSocketServer} from 'ws';
 import {createServer} from 'node:http';
+import {createServer as createHttpsServer} from 'node:https';
+import {existsSync, readFileSync} from 'node:fs';
 import {randomBytes} from 'node:crypto';
 import {networkInterfaces} from 'node:os';
 import path from 'node:path';
@@ -49,6 +51,9 @@ const GGUF_URL = process.env.FLOCK_GGUF ||
 // How the layers are divided. Only the model's HEADER is read to decide this --
 // a few MB, not the weights -- which is what makes the topology a startup
 // decision rather than a build artifact.
+// How many devices share the bird-side layers. Every bird gets a DIFFERENT
+// contiguous range: with 1 the single bird holds them all, which looks like
+// "every device has the same layers" to anyone pointing two phones at it.
 const N_BIRDS = +(process.env.FLOCK_BIRDS || 1);
 console.log(`reading GGUF header: ${GGUF_URL.split('/').pop()}`);
 const header = await readModel(GGUF_URL);
@@ -375,7 +380,18 @@ app.post('/chat', async (req, res) => {
   }
 });
 
-const server = createServer(app);
+// Chrome and Edge expose WebGPU only in a SECURE CONTEXT, so a bird reached over
+// plain http:// on a LAN sees no navigator.gpu at all -- which looks exactly like
+// a device with no GPU and is not. Safari does not gate it this way, which is why
+// it works where Chrome cannot. Serving https with a self-signed cert makes every
+// browser usable; the cert has to be trusted once per device.
+const CERT = path.join(ROOT, '.certs', 'cert.pem');
+const KEY = path.join(ROOT, '.certs', 'key.pem');
+const hasCert = existsSync(CERT) && existsSync(KEY);
+const SCHEME = hasCert ? 'https' : 'http';
+const server = hasCert
+  ? createHttpsServer({cert: readFileSync(CERT), key: readFileSync(KEY)}, app)
+  : createServer(app);
 const wss = new WebSocketServer({server, path: '/ws'});
 
 wss.on('connection', ws => {
@@ -446,6 +462,27 @@ server.on('error', e => {
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  for (const a of localAddresses()) console.log(`  http://${a}:${PORT}`);
-  console.log(`flock listening on port ${PORT} — chat at / , birds join at /flock`);
+  // Only the real LAN address is reachable from a phone; bridge and vpn
+  // interfaces just add noise to a line someone has to type on a tablet.
+  const addrs = localAddresses();
+  const lan = addrs.filter(a => /^192\.168\.|^10\.|^172\.(1[6-9]|2\d|3[01])\./.test(a)
+                                && !a.endsWith('.0'));
+  for (const a of (lan.length ? lan : addrs)) {
+    console.log(`  ${SCHEME}://${a}:${PORT}`);
+  }
+  console.log(`flock listening on port ${PORT} — chat at / , birds join at /flock` +
+              `, device check at /check`);
+  console.log(`  ${N_BIRDS} bird slot${N_BIRDS === 1 ? '' : 's'}: ` +
+              RANGES.map(([s, e]) => `${s}-${e}`).join(', ') +
+              (N_BIRDS === 1
+                ? '  (FLOCK_BIRDS=2 to split these across two devices)'
+                : ''));
+  if (!hasCert) {
+    console.log('\n  NOTE: serving plain http, so Chrome and Edge will hide WebGPU');
+    console.log('  (they require a secure context; Safari does not). To fix:');
+    console.log('    npm run cert');
+  } else {
+    console.log('\n  https with a self-signed cert: each device must trust it once');
+    console.log('  (open the URL, accept the warning), then WebGPU works in any browser');
+  }
 });
