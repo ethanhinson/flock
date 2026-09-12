@@ -1,0 +1,24 @@
+{
+  "model": "Qwen/Qwen3-0.6B",
+  "n_total": 28,
+  "hidden": 1024,
+  "kv_heads": 8,
+  "head_dim": 128,
+  "kv_cache": true,
+  "coord_layers": [
+    0,
+    23
+  ],
+  "birds": [
+    {
+      "slot": 0,
+      "start": 24,
+      "end": 25
+    },
+    {
+      "slot": 1,
+      "start": 26,
+      "end": 27
+    }
+  ]
+}

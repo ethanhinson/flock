@@ -126,9 +126,15 @@ app.get(/^\/kernels\/(.+\.ts)\.js$/, async (req, res) => {
     // resolves in the browser. Only RELATIVE ones: a bare specifier would be a
     // dependency the page has no import map for, and silently rewriting it would
     // produce a 404 that looks like a missing kernel.
+    // kernels/ sits next to web/ on disk, so a kernel importing
+    // "../web/js/wire.mjs" is correct as a FILE path but a 404 as a URL: that
+    // file is served at /js/, not /web/js/. Left alone it takes down the whole
+    // module graph before any page code runs, which looks like a page that
+    // simply never loads.
     const js = out.get(url.href)
       .replace(/(from\s*["'])(\.\.?\/[^"']+\.ts)(["'])/g, '$1$2.js$3')
-      .replace(/(import\s*\(\s*["'])(\.\.?\/[^"']+\.ts)(["']\s*\))/g, '$1$2.js$3');
+      .replace(/(import\s*\(\s*["'])(\.\.?\/[^"']+\.ts)(["']\s*\))/g, '$1$2.js$3')
+      .replace(/(["'])\.\.\/web\/js\//g, '$1/js/');
     TS_CACHE.set(abs, {mtimeMs, js});
     res.type('application/javascript').send(js);
   } catch (e) {

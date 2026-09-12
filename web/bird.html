@@ -201,17 +201,31 @@ let peerId = localStorage.getItem('flock_peer') || null;
   // an instant, explainable failure rather than a mysterious OOM.
   if (hasGPU) {
     try {
-      const ad = await navigator.gpu.requestAdapter();
+      // requestAdapter can hang on some mobile drivers rather than rejecting,
+      // which leaves the page on its initial "checking" text forever. Race it.
+      const ad = await Promise.race([
+        navigator.gpu.requestAdapter(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error(
+          'requestAdapter did not answer within 10s')), 10000)),
+      ]);
+      if (!ad) throw new Error('no GPU adapter (WebGPU present but no device)');
       const L = ad.limits;
       const maxBuf = L.maxBufferSize, maxBind = L.maxStorageBufferBindingSize;
       capability.maxBufferSize = maxBuf;
-      capability.vendor = ad.info?.vendor;
+      // adapter.info THROWS on Safari unless a flag is set, so it must never be
+      // read outside its own try -- it used to take the whole probe down.
+      let vendor = null, arch = null;
+      try { vendor = ad.info?.vendor; arch = ad.info?.architecture; } catch {}
+      capability.vendor = vendor;
       log(`gpu limits: buffer ${(maxBuf/1e6).toFixed(0)}MB, ` +
           `binding ${(maxBind/1e6).toFixed(0)}MB`, 'ok');
-      await report('limits', {maxBufferSize: maxBuf,
-                              maxStorageBufferBindingSize: maxBind,
-                              vendor: ad.info?.vendor, arch: ad.info?.architecture});
-    } catch (e) { log('could not query gpu limits: ' + e.message, 'bad'); }
+      report('limits', {maxBufferSize: maxBuf,        // not awaited: a slow or
+                        maxStorageBufferBindingSize: maxBind,   // blocked /diag
+                        vendor, arch});                         // must not block
+    } catch (e) {
+      log('could not query gpu limits: ' + e.message, 'bad');
+      report('limits-failed', String(e.message || e));
+    }
   }
   const j = await (await fetch('/join', {
     method: 'POST', headers: {'Content-Type':'application/json'},
@@ -259,14 +273,21 @@ let peerId = localStorage.getItem('flock_peer') || null;
 
   log(`streaming layers ${meta.start}\u2013${meta.end} from GGUF\u2026`, 'ok');
   const ad = await navigator.gpu.requestAdapter();
-  // Ask for the adapter's REAL limits. A bird's biggest single buffer is an
-  // ffn_down at ~3MB so the 128MiB default would do, but asking is free and an
-  // oversized binding is a SILENT wrong answer on this backend rather than a
-  // throw -- see the note in kernels/lib.ts getDevice().
-  device = await ad.requestDevice({requiredLimits: {
-    maxStorageBufferBindingSize: ad.limits.maxStorageBufferBindingSize,
-    maxBufferSize: ad.limits.maxBufferSize,
-  }});
+  if (!ad) throw new Error('no GPU adapter available');
+  // Ask for what a bird needs, not for the adapter's maximum. Its biggest single
+  // buffer is an ffn_down at ~3MB, so the 128MiB default is already ample --
+  // and WebKit rejects an over-ambitious requiredLimits far more readily than
+  // wgpu does, which turned "raise the ceiling for free" into a failed join.
+  const want = Math.min(64 * 1024 * 1024, ad.limits.maxStorageBufferBindingSize);
+  try {
+    device = await ad.requestDevice({requiredLimits: {
+      maxStorageBufferBindingSize: want,
+      maxBufferSize: Math.min(want, ad.limits.maxBufferSize),
+    }});
+  } catch (e) {
+    log('requested limits refused, using this device defaults: ' + e.message);
+    device = await ad.requestDevice();      // defaults are enough for a bird
+  }
   const t = performance.now();
   const got = await loadBirdWeights(device, meta.gguf, meta.start, meta.end, {
     onNote: m => log('gguf: ' + m),

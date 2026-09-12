@@ -1,0 +1,13 @@
+{
+  "start": 24,
+  "end": 25,
+  "hidden": 1024,
+  "n_layers": 2,
+  "kv_heads": 8,
+  "head_dim": 128,
+  "kv_cache": true,
+  "needs_lm_head": false,
+  "is_last": false,
+  "n_total": 28,
+  "model": "Qwen/Qwen3-0.6B"
+}
