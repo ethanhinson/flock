@@ -84,6 +84,16 @@ function idbPut(db, key, val) {
   });
 }
 
+// Send diagnostics to the coordinator: a phone or tablet has no console we can
+// read, so failures have to travel back over HTTP to be debuggable at all.
+async function report(stage, detail) {
+  try {
+    await fetch('/diag', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({stage, detail, ua: navigator.userAgent,
+                            mem: navigator.deviceMemory || null})});
+  } catch {}
+}
+
 const hasGPU = !!navigator.gpu;
 $('sub').innerHTML = hasGPU
   ? '<span class="ok">WebGPU available — this phone runs real layers</span>'
@@ -93,6 +103,20 @@ $('sub').innerHTML = hasGPU
 // phones joining the same flock get different slices automatically.
 let peerId = localStorage.getItem('flock_peer') || null;
 (async () => {
+  // What can this device actually do? A buffer limit smaller than the shard is
+  // an instant, explainable failure rather than a mysterious OOM.
+  if (hasGPU) {
+    try {
+      const ad = await navigator.gpu.requestAdapter();
+      const L = ad.limits;
+      const maxBuf = L.maxBufferSize, maxBind = L.maxStorageBufferBindingSize;
+      log(`gpu limits: buffer ${(maxBuf/1e6).toFixed(0)}MB, ` +
+          `binding ${(maxBind/1e6).toFixed(0)}MB`, 'ok');
+      await report('limits', {maxBufferSize: maxBuf,
+                              maxStorageBufferBindingSize: maxBind,
+                              vendor: ad.info?.vendor, arch: ad.info?.architecture});
+    } catch (e) { log('could not query gpu limits: ' + e.message, 'bad'); }
+  }
   const j = await (await fetch('/join', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({peer_id: peerId, label: navigator.platform || 'phone'}),
@@ -112,6 +136,7 @@ let peerId = localStorage.getItem('flock_peer') || null;
   // Weights live in a SEPARATE .data sidecar — ORT Web won't go looking for it
   // on its own, so we hand it the bytes explicitly below.
   const db = await idbOpen();
+  const pendingCache = [];
   async function grab(url, label) {
     const hit = await idbGet(db, url);
     if (hit) {
@@ -121,18 +146,41 @@ let peerId = localStorage.getItem('flock_peer') || null;
     const t = performance.now();
     const buf = await (await fetch(url)).arrayBuffer();
     log(`${label} ${(buf.byteLength/1e6).toFixed(0)}MB in ${((performance.now()-t)/1000).toFixed(1)}s`, 'ok');
-    idbPut(db, url, buf).catch(e => log('cache write failed: ' + e.message));
+    // Cache AFTER the session is built, not during: a structured clone of the
+    // weights while ORT is also allocating is what pushes a tight heap over.
+    pendingCache.push([url, buf]);
     return buf;
+  }
+
+  // Hand ORT the bytes, then drop OUR reference immediately. Keeping `wbuf`
+  // alive alongside ORT's own copy doubles peak usage for no benefit.
+  async function build(graph, weights, slot) {
+    const view = new Uint8Array(weights);
+    try {
+      return await ort.InferenceSession.create(graph, {
+        executionProviders: hasGPU ? ['webgpu', 'wasm'] : ['wasm'],
+        externalData: [{path: `shard${slot}.onnx.data`, data: view}],
+      });
+    } finally {
+      // Release the transferable so the GC can reclaim it while ORT holds its own.
+      try { structuredClone(weights, {transfer: [weights]}); } catch {}
+    }
   }
   log(`loading my ${meta.n_layers} layers…`);
   const buf  = await grab(`/shard/${meta.slot}.onnx`, 'graph');
   const wbuf = await grab(`/shard/${meta.slot}.onnx.data`, 'weights');
 
-  session = await ort.InferenceSession.create(buf, {
-    executionProviders: hasGPU ? ['webgpu','wasm'] : ['wasm'],
-    externalData: [{path: `shard${meta.slot}.onnx.data`, data: new Uint8Array(wbuf)}],
-  });
+  session = await build(buf, wbuf, meta.slot);
   $('backend').textContent = hasGPU ? 'webgpu' : 'wasm';
+  // Session is built; the weights are now ORT's problem, so write the cache and
+  // drop our references.
+  // Only cache once inference is actually working; a device that is tight on
+  // memory should not also be storing 126MB blobs.
+  for (const [url, b] of pendingCache) {
+    if (b.byteLength === 0) continue;          // already transferred away
+    await idbPut(db, url, b).catch(e => log('cache write skipped: ' + e.message));
+  }
+  pendingCache.length = 0;
   $('join').disabled = false;
   // A refresh shouldn't drop us out of the flock: if we were a member, rejoin.
   if (localStorage.getItem('flock_joined') === '1') {
@@ -144,7 +192,15 @@ let peerId = localStorage.getItem('flock_peer') || null;
   } else {
     log('model ready — tap join', 'ok');
   }
-})().catch(e => log('load failed: ' + e, 'bad'));
+})().catch(e => {
+  const m = String(e.message || e);
+  log('load failed: ' + m, 'bad');
+  report('load-failed', m);
+  if (/memory|allocation|OOM/i.test(m)) {
+    log('this device ran out of memory building the session. Try: close other ' +
+        'tabs, or ask for a smaller slice (more birds = fewer layers each).', 'bad');
+  }
+});
 
 // --- the actual work ------------------------------------------------------
 // One source of truth for the link label: whichever channel is really open.

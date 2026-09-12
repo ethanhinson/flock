@@ -57,6 +57,16 @@ app.post('/join', (req, res) => {
             kv_cache: META.kv_cache, n_total: META.n_total, model: META.model});
 });
 
+// Birds have no readable console, so they POST failures here.
+app.post('/diag', (req, res) => {
+  const {stage, detail, ua} = req.body || {};
+  const dev = /iPad/.test(ua) ? 'iPad' : /iPhone/.test(ua) ? 'iPhone'
+            : /Macintosh/.test(ua) ? 'Mac/iPad' : 'device';
+  console.log(`[diag ${dev}] ${stage}: ` +
+              (typeof detail === 'object' ? JSON.stringify(detail) : detail));
+  res.json({ok: true});
+});
+
 app.get('/', (_, res) => res.sendFile(path.join(ROOT, 'web/chat.html')));
 app.get('/flock', (_, res) => res.sendFile(path.join(ROOT, 'web/bird.html')));
 app.get('/shard/:slot.onnx', (req, res) =>
