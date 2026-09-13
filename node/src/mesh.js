@@ -498,8 +498,16 @@ export class Flock {
       // How far does the direct chain reach from bird i?
       let j = i;
       while (j + 1 < chain.length && chain[j].forwardsDirectly) j++;
-      const {data} = await chain[i].sendChained(flat, seq, hidden, offset, chain[j]);
-      flat = data;
+      const got = await chain[i].sendChained(flat, seq, hidden, offset, chain[j]);
+      // teardown() resolves a pending waiter with null so the lap does not hang for
+      // the full timeout when a device's socket dies mid-frame. Say what happened:
+      // destructuring the null instead reported "Cannot destructure property 'data'",
+      // which tells the person holding the phone nothing at all.
+      if (!got) {
+        throw new Error(`the device holding layers ${chain[j].start}-${chain[j].end} ` +
+                        `(${chain[j].label}) dropped its connection mid-token`);
+      }
+      flat = got.data;
       i = j + 1;
     }
     return {data: flat};
