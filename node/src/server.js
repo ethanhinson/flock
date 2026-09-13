@@ -63,9 +63,19 @@ const GGUF_URL = process.env.FLOCK_GGUF ||
 console.log(`reading GGUF header: ${GGUF_URL.split('/').pop()}`);
 const header = await readModel(GGUF_URL);
 const N_TOTAL = header.nLayers;
-// Birds hold the last `FLOCK_BIRD_LAYERS` layers; the coordinator holds the rest.
-// Default 4, which is flock's long-standing split (coordinator 0-23, birds 24-27).
-const BIRD_LAYERS = Math.min(N_TOTAL - 1, +(process.env.FLOCK_BIRD_LAYERS || 4));
+// How many layers the DEVICES get; the coordinator keeps the rest.
+//
+// This used to default to 4 -- a fossil from the ONNX era, when the coordinator's
+// half was a pre-exported artifact and only a tiny tail was worth shipping to a
+// phone. With streamed GGUF there is no such asymmetry, and leaving it at 4 means
+// every device competes over layers 24-27 while the coordinator hoards 0-23, which
+// looks exactly like an allocator that assigns everyone the same range.
+//
+// Default now: give the birds MOST of the model and keep a small coordinator
+// share, since the coordinator also pays for the embedding and the LM head.
+const COORD_LAYERS = Math.max(1, +(process.env.FLOCK_COORD_LAYERS || 4));
+const BIRD_LAYERS = Math.min(N_TOTAL - 1,
+  +(process.env.FLOCK_BIRD_LAYERS || (N_TOTAL - COORD_LAYERS)));
 const CUT = N_TOTAL - BIRD_LAYERS;
 // Per-layer BYTES and per-layer largest tensor, straight from the header. Not a
 // layer count: Qwen3-14B Q4_K_M layers range 185.8-210.2 MB, a 13% spread, so an
