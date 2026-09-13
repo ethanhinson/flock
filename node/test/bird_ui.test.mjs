@@ -202,5 +202,58 @@ if (!health.ok) {
     !nodes.get('problem').classList.contains('on'));
 }
 
+// ==========================================================================
+// A SECOND DEVICE JOINS -> this page must SHOW its new range, not the old one.
+//
+// This is the case that was broken and that no test covered: the page displayed
+// whatever /join told it and never updated, so two devices showed overlapping
+// ranges while the coordinator held a correct split. Asserting the DOM rather than
+// the server is the whole point -- /status was right the entire time.
+// ==========================================================================
+{
+  const before = nodes.get('layers').textContent;
+  console.log(`\na second device joins (this page holds ${before}):`);
+
+  // A real second member: claim a slot and hold a socket, so the coordinator
+  // reallocates for two devices rather than treating it as a dead registration.
+  const j = await (await fetch(`${BASE}/join`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({label: 'second', caps: {
+      maxStorageBufferBindingSize: 1073741824, maxBufferSize: 1073741824, cores: 8}}),
+  })).json();
+  const ws = new WebSocket(`${BASE.replace('https', 'wss')}/ws`);
+  await new Promise(r => { ws.onopen = r; ws.onerror = r; });
+  ws.send(JSON.stringify({peer_id: j.peer_id, label: 'second'}));
+
+  // Give the page time to receive its chain message and re-stream.
+  for (let i = 0; i < 150 && nodes.get('layers').textContent === before; i++)
+    await new Promise(r => setTimeout(r, 200));
+  const after = nodes.get('layers').textContent;
+  console.log(`  coordinator gave the second device ${j.start}-${j.end}`);
+  console.log(`  this page now shows ${after} (was ${before})`);
+
+  check('the page updated its range when a second device joined',
+    after !== before, `${before} -> ${after}`);
+
+  // The real symptom: two devices claiming the same layers.
+  const [a0, a1] = after.split('\u2013').map(Number);
+  const overlap = !(a1 < j.start || a0 > j.end);
+  check('this page and the second device do not overlap',
+    !overlap, `page ${after} vs other ${j.start}-${j.end}`);
+
+  const status = await (await fetch(`${BASE}/status`)).json();
+  const live = (status.birds || []).filter(b => b.alive && b.start != null);
+  const held = {};
+  for (const b of live) for (let L = b.start; L <= b.end; L++) held[L] = (held[L] || 0) + 1;
+  const twice = Object.keys(held).filter(L => held[L] > 1);
+  check('the coordinator holds no layer twice', twice.length === 0, twice.join(','));
+
+  check('the page agrees with what the coordinator thinks it holds',
+    live.some(b => `${b.start}\u2013${b.end}` === after),
+    `page ${after}, server ${live.map(b => `${b.start}-${b.end}`).join(' ')}`);
+
+  try { ws.close(); } catch {}
+}
+
 console.log(`\n${fails ? `${fails} CHECKS FAILED` : 'ALL CHECKS PASSED'}`);
 process.exit(fails ? 1 : 0);

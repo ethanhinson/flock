@@ -403,8 +403,10 @@ let loading = false, pendingChain = null;
   loading = false;
   if (pendingChain) {
     const p = pendingChain; pendingChain = null;
-    log('applying the reassignment that arrived during the download', 'ok');
-    await reassign(p);
+    if (p.start !== meta.start || p.end !== meta.end) {
+      log('applying the reassignment that arrived during the download', 'ok');
+      await reassign(p);          // now safe: `loading` is false again
+    }
   }
   await report('gguf-loaded', {
     mb: +(s.bytesTotal / 1e6).toFixed(1), secs: +secs.toFixed(1),
@@ -560,6 +562,29 @@ async function runFrame(floats, m) {
  * would be the one case that silently disagrees with the rest.
  */
 async function reassign(m) {
+  // reassign() ALSO streams, so it must hold the same guard as the initial load:
+  // without it a chain message arriving mid-reassignment starts a second stream
+  // into the same GPU buffers and one of them silently wins, leaving the page on a
+  // range the coordinator no longer believes. Park the newer message and apply it
+  // when this one finishes -- always the latest, since ranges supersede.
+  if (loading) {
+    pendingChain = m;
+    log(`reassigned again mid-reassignment → ${m.start}–${m.end}, queued`);
+    return;
+  }
+  loading = true;
+  try {
+    await applyReassign(m);
+  } finally {
+    loading = false;
+    if (pendingChain) {
+      const p = pendingChain; pendingChain = null;
+      if (p.start !== meta.start || p.end !== meta.end) await reassign(p);
+    }
+  }
+}
+
+async function applyReassign(m) {
   const from = meta.start != null ? `${meta.start}–${meta.end}` : 'nothing';
   log(`reassigned: ${from} → ${m.start}–${m.end}`, 'ok');
   if (m.start == null) {
