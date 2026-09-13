@@ -2,7 +2,7 @@
 //
 // RUN IT WITH DENO, NOT NODE:
 //
-//   deno run --unstable-webgpu --allow-all test/bird_ui.test.mjs
+//   FLOCK_URL=... deno run --unstable-webgpu --allow-all test/e2e/bird_ui.test.mjs
 //
 // Same idea as chat_ui.test.mjs: extract the page's module script, stub the
 // browser surface it touches, and let it actually join the flock and compute

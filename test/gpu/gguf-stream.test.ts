@@ -1,6 +1,6 @@
 // Prove the streaming loader against the real Qwen3-0.6B file on HuggingFace.
 //
-//   npm run test:gpu       (from node/)
+//   npm run test:gpu
 //   deno run --config kernels/deno.json --unstable-webgpu --allow-all \
 //     web/js/gguf-stream.test.ts
 //
