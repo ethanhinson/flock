@@ -62,7 +62,7 @@ console.log('one device holds everything; there is no N to be full at:');
   join(f, 'a');
   f.plan({force: true});
   ok('a single device covers all four layers', ranges(f) === 'a:24-27', ranges(f));
-  ok('  and the flock reports itself ready', f.ready());
+  ok('  and the flock reports itself covered', f.covered());
   ok('  with nothing missing', f.missing().length === 0);
 }
 
@@ -74,7 +74,7 @@ console.log('\ndevices 2..8 join one at a time and the split follows each time:'
     join(f, `d${n}`);
     f.plan({force: true});
     ok(`${n} device${n === 1 ? '' : 's'}: covered, nobody empty, nobody refused`,
-       f.ready() && f.chain().length === n && f.chain().every(b => b.end >= b.start),
+       f.covered() && f.chain().length === n && f.chain().every(b => b.end >= b.start),
        ranges(f));
   }
   ok('no join was ever refused for being "full"', f.members().length === 8);
@@ -87,11 +87,11 @@ console.log('\na device leaves and its layers are handed on:');
   join(f, 'a'); join(f, 'b'); join(f, 'c');
   f.plan({force: true});
   const before = ranges(f);
-  ok('three devices cover 0-7', f.ready(), before);
+  ok('three devices cover 0-7', f.covered(), before);
 
   ok('release() reports it was a member', f.release('b') === true);
   f.plan({force: true});
-  ok('the remaining two still cover every layer', f.ready() && f.chain().length === 2,
+  ok('the remaining two still cover every layer', f.covered() && f.chain().length === 2,
      ranges(f));
   ok('  so no layer is orphaned', f.missing().length === 0, f.missing().join(','));
 
@@ -108,13 +108,13 @@ console.log('\nlosing a device without warning leaves the gap VISIBLE:');
   // must report itself NOT ready and name the layers nobody is running -- reporting
   // ready here is the failure that produces silently wrong text.
   a.ws = null; a.lastSeen = Date.now() - 60000;      // silent for a minute
-  ok('the flock is not ready while a holder is silent', !f.ready());
+  ok('the flock is not ready while a holder is silent', !f.covered());
   ok('  and names the layers nobody is answering for',
      f.missing().length === 1 && /^0-/.test(f.missing()[0]), f.missing().join(','));
   const gone = f.sweep();
   ok('the sweeper removes it', gone.length === 1 && gone[0] === 'a', gone.join(','));
   f.plan({force: true});
-  ok('  and the survivor takes the whole range', f.ready() && ranges(f) === 'b:0-7',
+  ok('  and the survivor takes the whole range', f.covered() && ranges(f) === 'b:0-7',
      ranges(f));
 }
 
@@ -152,7 +152,7 @@ console.log('\na device with a small binding limit never gets an oversized layer
   const phone = f.byPeer('phone');
   ok('the phone does not hold layer 2', !(2 >= phone.start && 2 <= phone.end),
      ranges(f));
-  ok('  and every layer is still covered', f.ready(), ranges(f));
+  ok('  and every layer is still covered', f.covered(), ranges(f));
   ok('  the reported limit is visible in /status', phone.info().max_binding_mb === 134,
      String(phone.info().max_binding_mb));
 }
@@ -174,7 +174,7 @@ console.log('\na flock that cannot hold the model says so and holds NOTHING:');
   f.plan({force: true});
   ok('infeasible is set with the precise reason', !!f.infeasible &&
      /output\.weight/.test(f.infeasible.message), f.infeasible?.message.slice(0, 70));
-  ok('  it is NOT reported ready', !f.ready());
+  ok('  it is NOT reported ready', !f.covered());
   ok('  no device is left holding a range it cannot serve',
      f.birds.every(b => !b.placed()));
   ok('  and the detail is structured for the UI', f.infeasible.detail.kind === 'tensor');
@@ -182,7 +182,7 @@ console.log('\na flock that cannot hold the model says so and holds NOTHING:');
   // A device that CAN hold it turns up. The failure must clear.
   join(f, 'mac', {label: 'Mac', caps: {maxStorageBufferBindingSize: 4 * 1024 ** 3}});
   f.plan({force: true});
-  ok('adding a capable device clears the failure', !f.infeasible && f.ready(),
+  ok('adding a capable device clears the failure', !f.infeasible && f.covered(),
      ranges(f));
 }
 
@@ -261,7 +261,7 @@ console.log('\na mid-token change is deferred to the token boundary:');
   ok('  but holds no layers yet', !b.placed());
   ok('  and the device that IS serving the token keeps its whole range',
      ranges(f) === 'a:0-7', ranges(f));
-  ok('  a change is recorded as pending', f.pending);
+  ok('  a change is recorded as pending', f.deferred);
 
   // The token finishes.
   b.ws = fakeWs(); b.lastSeen = f.now();
@@ -269,7 +269,7 @@ console.log('\na mid-token change is deferred to the token boundary:');
   ok('at the boundary it lands', d.move && b.placed(), ranges(f));
   ok('  and it is reported as a MOVE, so the caller knows the cache is stale',
      d.moved.length > 0, d.moved.join(','));
-  ok('  pending is cleared', !f.pending);
+  ok('  pending is cleared', !f.deferred);
   ok('  a second applyPending is a no-op', f.applyPending() === null);
 }
 
@@ -307,10 +307,10 @@ console.log('\nmore devices than layers is a reported failure, not silent emptie
   ok('infeasible names the shortfall', !!f.infeasible &&
      /only 2 layer/.test(f.infeasible.message), f.infeasible?.message.slice(0, 80));
   ok('  and nothing is placed', f.birds.every(b => !b.placed()));
-  ok('  so it cannot report itself ready', !f.ready());
+  ok('  so it cannot report itself ready', !f.covered());
   f.release('c');
   f.plan({force: true});
-  ok('dropping one device fixes it', !f.infeasible && f.ready(), ranges(f));
+  ok('dropping one device fixes it', !f.infeasible && f.covered(), ranges(f));
 }
 
 // =========================================================================
@@ -343,7 +343,7 @@ console.log('\na sweep re-plans, so the freed layers are not left orphaned:');
   // assigned to nobody, so the flock reports itself uncovered until some caller
   // remembers to rebalance. Correct only for as long as every caller remembers.
   ok('  and its layers are already re-assigned, with no caller doing anything',
-     f.ready() && ranges(f) === 'b:0-7', ranges(f));
+     f.covered() && ranges(f) === 'b:0-7', ranges(f));
   ok('a sweep that removes nothing does not touch the plan',
      f.sweep().length === 0 && ranges(f) === 'b:0-7');
 }
@@ -362,7 +362,7 @@ console.log('\na REJOIN reporting worse limits cannot poison a working flock:');
   const b = join(f, 'b', {caps: {maxStorageBufferBindingSize: 4 * 1024 ** 3}});
   f.plan({force: true});
   const before = ranges(f);
-  ok('two healthy devices cover the layers', f.ready(), before);
+  ok('two healthy devices cover the layers', f.covered(), before);
 
   // `a` reloads and now reports a limit below the smallest layer's largest tensor.
   const prevCaps = {...a.caps};
@@ -377,7 +377,7 @@ console.log('\na REJOIN reporting worse limits cannot poison a working flock:');
   f.setCaps(a, prevCaps);
   f.plan({force: true});
   ok('restoring its previous caps restores the whole flock',
-     f.ready() && !f.infeasible && ranges(f) === before, ranges(f));
+     f.covered() && !f.infeasible && ranges(f) === before, ranges(f));
   ok('  and it is still a member on the range it already loaded',
      f.byPeer('a') !== null && a.placed(), `a holds ${a.start}-${a.end}`);
 }
@@ -412,6 +412,122 @@ console.log('\n200 rounds of churn never break the invariants:');
   }
   ok('no gaps, no overlaps, no duplicate slots, nothing outside the layer plan',
      bad.length === 0, bad.slice(0, 3).join('; ') || '200 rounds, 1-8 devices each');
+}
+
+// =========================================================================
+console.log('\nREADINESS: assigned is not holding, and a lap waits for holding:');
+{
+  // The bug this pins. A moved bird re-streams its weights for seconds and holds
+  // NO layers in that window; the coordinator used to send it the next frame
+  // anyway, the frame failed, the bird left, the leave reallocated everyone, and
+  // the next bird was caught mid-stream. /status was correct throughout.
+  const f = new Flock(LAYERS(8, 0));
+  const a = join(f, 'a');
+  f.plan({force: true});
+  ok('covered as soon as it is assigned', f.covered());
+  ok('  but NOT ready: it has not said it holds 0-7', !f.ready() && f.pending().length === 1);
+  ok('  /status names it as loading', f.allocation().loading[0]?.range === '0-7',
+     JSON.stringify(f.allocation().loading));
+  ok('a confirmation for the wrong range does not count', !a.confirm(0, 3) && !f.ready());
+  ok('a confirmation for the assigned range does', a.confirm(0, 7) && f.ready());
+
+  // A second device joins: a is moved, and its old confirmation is stale.
+  const b = join(f, 'b');
+  f.plan({force: true});
+  ok('after a reassignment the moved bird is pending again', !a.isReady() && !f.ready(),
+     `a holds ${a.start}-${a.end}, confirmed ${a.confirmed.start}-${a.confirmed.end}`);
+  ok('  and so is the newcomer', !b.isReady());
+  a.confirm(a.start, a.end);
+  ok('  one confirmation is not enough', !f.ready() && f.pending()[0] === b);
+  b.confirm(b.start, b.end);
+  ok('  both confirmed: ready', f.ready());
+
+  // A bird that never confirms is reported, not evicted, and not sent to.
+  const c = join(f, 'c');
+  f.plan({force: true});
+  ok('a third device leaves the flock not-ready until it confirms',
+     !f.ready() && f.members().length === 3);
+}
+
+// =========================================================================
+console.log('\nawaitReady resolves when the last bird confirms, and says who it waited for:');
+{
+  const f = new Flock(LAYERS(8, 0));
+  const a = join(f, 'a'), b = join(f, 'b');
+  f.plan({force: true});
+  a.confirm(a.start, a.end);
+  const waits = [];
+  const p = f.awaitReady({timeoutMs: 5000, pollMs: 10,
+                          onWait: pend => waits.push(pend.map(x => x.peerId).join(','))});
+  setTimeout(() => b.confirm(b.start, b.end), 60);
+  const r = await p;
+  ok('resolves ok once every placed bird has confirmed', r.ok === true, JSON.stringify(r));
+  ok('  and named the bird it was waiting on', waits.length > 0 && waits[0] === 'b',
+     waits.join(' | '));
+
+  const g = new Flock(LAYERS(8, 0));
+  const x = join(g, 'x');
+  g.plan({force: true});
+  const r2 = await g.awaitReady({timeoutMs: 50, pollMs: 10});
+  ok('times out with the unconfirmed bird and range in the reason',
+     r2.ok === false && /x has not confirmed layers 0-7/.test(r2.reason), r2.reason);
+  ok('  and the bird is STILL a member: waiting is not a reason to evict',
+     g.byPeer('x') === x && x.placed());
+}
+
+// =========================================================================
+console.log('\nSTICKINESS: a join moves one incumbent, a leave moves the neighbours:');
+{
+  const f = new Flock(LAYERS(24, 4));
+  const a = join(f, 'a'); f.plan({force: true});
+  const b = join(f, 'b'); f.plan({force: true});
+  const c = join(f, 'c'); f.plan({force: true});
+  const before = f.chain().map(x => [x.peerId, x.start, x.end]);
+  const d = join(f, 'd');
+  const dec = f.plan({force: true});
+  const after = new Map(f.chain().map(x => [x.peerId, `${x.start}-${x.end}`]));
+  const unmoved = before.filter(([id, s, e]) => after.get(id) === `${s}-${e}`).length;
+  ok('a fourth device joining moves exactly ONE of the three incumbents',
+     dec.moved.length === 2 && unmoved === 2,
+     `moved ${dec.moved.join(',')}; ${ranges(f)}`);
+  ok('  the newcomer holds a contiguous run next to its donor', d.placed() && f.covered(),
+     ranges(f));
+  ok('  the decision says it was a local edit', /local edit/.test(dec.reason), dec.reason);
+
+  // A device leaves: only its neighbours change.
+  const held = new Map(f.chain().map(x => [x.peerId, `${x.start}-${x.end}`]));
+  f.release(b.peerId);
+  const dec2 = f.plan({force: true});
+  const still = [...held].filter(([id, r]) => f.byPeer(id) &&
+    `${f.byPeer(id).start}-${f.byPeer(id).end}` === r).map(([id]) => id);
+  ok('a departure moves at most its two neighbours', dec2.moved.length <= 2 && f.covered(),
+     `moved ${dec2.moved.join(',')}; unmoved ${still.join(',')}; ${ranges(f)}`);
+  ok('  and every survivor still holds a contiguous run in layer order',
+     f.chain().every((x, i, arr) => i === 0 || x.start === arr[i - 1].end + 1));
+}
+
+// =========================================================================
+console.log('\nspeed rebalancing refines the current chain rather than reshuffling it:');
+{
+  const t = clock();
+  const f = new Flock(LAYERS(24, 4, 5 * MB), {now: t});
+  const a = join(f, 'a'); f.plan({force: true});
+  const b = join(f, 'b'); f.plan({force: true});
+  const c = join(f, 'c'); f.plan({force: true});
+  const order = f.chain().map(x => x.peerId).join('<');
+  // Everyone the same speed; the sticky 6/6/12 split has a 12-layer bottleneck.
+  for (let i = 0; i < 6; i++) {
+    for (const x of [a, b, c]) x.lastMs = x.bytes / 2e6;
+    t.advance(COOLDOWN_MS + 1000);
+    f.recordTimings();
+  }
+  const d = f.plan();
+  ok('the exact search fires once the rates are trusted and the gain is real',
+     d.move && d.moved.length > 0, d.reason);
+  ok('  the chain keeps its ORDER: a refinement, not a reshuffle',
+     f.chain().map(x => x.peerId).join('<') === order, ranges(f));
+  ok('  and the makespan came down', f.chain().every(x => x.end - x.start + 1 <= 8),
+     ranges(f));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

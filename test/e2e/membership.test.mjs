@@ -16,13 +16,23 @@
 //   deno run --unstable-webgpu --allow-all sim_bird.mjs solo 3
 //   curl -X POST .../chat -d '{"prompt":"Capital of France?","reset":true}'
 //
-// Needs a coordinator, and no GPU of its own:
-//   PORT=8123 npm start &
-//   FLOCK_URL=http://127.0.0.1:8123 node test/membership_e2e.mjs
+// Needs a coordinator, and no GPU of its own. `npm test` starts one on a spare
+// port; by hand:
+//   FLOCK_NO_TLS=1 PORT=8123 npm start &
+//   FLOCK_URL=http://127.0.0.1:8123 node test/e2e/membership.test.mjs
 import WebSocket from 'ws';
 import {pack, unpack} from '../../web/js/wire.mjs';
 
 const BASE = process.env.FLOCK_URL || 'http://127.0.0.1:8000';
+// This test EVICTS every device it finds before it starts. Port 8000 is where a
+// real flock lives, and leftover stand-ins from tests have knocked real phones
+// out of it more than once -- the reverse must not happen either.
+if (/:8000(\/|$)/.test(BASE) && !process.env.FLOCK_E2E_FORCE) {
+  console.error(`refusing to run against ${BASE}: that is the default port of a real ` +
+                `flock and this test evicts every member. Start a coordinator on ` +
+                `another port, or set FLOCK_E2E_FORCE=1.`);
+  process.exit(2);
+}
 let pass = 0, fail = 0;
 const ok = (name, cond, extra = '') => {
   if (cond) { pass++; console.log(`  ok   ${name}${extra ? '  ' + extra : ''}`); }
@@ -59,6 +69,12 @@ async function fakeBird(label, {caps = null, slowPerLayer = 0} = {}) {
   await new Promise((res, rej) => { ws.on('open', res); ws.on('error', rej); });
   ws.send(JSON.stringify({peer_id: b.peerId, label}));
   ws.send(JSON.stringify({t: 'ping'}));
+  // The readiness handshake: a fake bird "builds" instantly, so it confirms the
+  // range it was given at once, and again whenever it is reassigned. Without this
+  // the coordinator would (correctly) never send it a frame.
+  const ready = () => { if (b.start != null) ws.send(JSON.stringify(
+    {t: 'ready', start: b.start, end: b.end})); };
+  ready();
   b.beat = setInterval(() => { try { ws.send(JSON.stringify({t: 'ping'})); } catch {} },
                        3000);
   ws.on('close', () => { b.closed = true; clearInterval(b.beat); });
@@ -68,6 +84,7 @@ async function fakeBird(label, {caps = null, slowPerLayer = 0} = {}) {
       if (m.t === 'chain' && (m.start !== b.start || m.end !== b.end)) {
         b.reassigns.push(`${b.start}-${b.end} -> ${m.start}-${m.end}`);
         b.start = m.start; b.end = m.end;
+        ready();
       }
       return;
     }
@@ -212,7 +229,9 @@ if (LAYERS >= 3) {
 
   // Run turns until the rebalancer has seen enough and the cooldown has expired. The
   // cooldown is 20s, so this takes a few turns' worth of wall time -- which is the
-  // honest cost of a policy that refuses to thrash.
+  // honest cost of a policy that refuses to thrash. Each turn starts a NEW
+  // conversation (reset:true), because that is the only moment a speed rebalance
+  // is allowed to fire: never during one.
   let moved = false;
   for (let i = 0; i < 8 && !moved; i++) {
     await turn('hello', 6, true);
@@ -231,14 +250,15 @@ if (LAYERS >= 3) {
      sl.n_layers < f.n_layers, `fast ${f.n_layers}, slow ${sl.n_layers}`);
   ok('  and /status says why, in bytes and MB/ms', /% of the bird bytes/.test(sl.why),
      sl.why);
-  // The rate the DECISION was made on is quoted in `why`; the live counters are
-  // deliberately back at zero, because a device whose range just changed is
-  // re-learned rather than trusted on samples that described different work.
+  // The rate the DECISION was made on is quoted in `why`; the live counters were
+  // reset at the move, because a device whose range just changed is re-learned
+  // rather than trusted on samples that described different work. The move lands
+  // at the START of a conversation, so the turn that followed it has already
+  // contributed its tokens -- at most one turn's worth, never the dozens before.
   ok('  quoting the measured rate the decision was made on',
      /at 0\.\d+MB\/ms/.test(sl.why), sl.why);
-  ok('  and its counters are reset, so the new share is re-measured',
-     sl.rate_samples < after.allocation.min_samples,
-     `${sl.rate_samples} samples since the move`);
+  ok('  and its counters were reset at the move, so the new share is re-measured',
+     sl.rate_samples <= 6, `${sl.rate_samples} samples since the move`);
   ok('  the weighted split beats the even one it replaced',
      after.allocation.makespan_ms <= after.allocation.even_split_ms,
      `${after.allocation.makespan_ms}ms vs even ${after.allocation.even_split_ms}ms`);
@@ -249,14 +269,14 @@ if (LAYERS >= 3) {
 }
 
 // =========================================================================
-console.log('\njoining MID-GENERATION: the token finishes, then layers move:');
+console.log('\njoining MID-GENERATION: the answer completes, THEN layers move:');
 if (LAYERS >= 2) {
   const a = await fakeBird('incumbent', {slowPerLayer: 60});
   await sleep(400);
   ok('one device holds everything', (await status()).ready);
 
   // Start a long turn, then join a device while it is generating.
-  const running = turn('count to twenty', 40, true);
+  const running = turn('count to twenty', 12, true);
   await sleep(900);
   const s = await status();
   ok('the turn is in flight', s.busy);
@@ -264,25 +284,19 @@ if (LAYERS >= 2) {
   ok('the joining device is told to wait rather than refused',
      !joiner.error, joiner.error || 'admitted');
   const r = await running;
-  ok('the turn ENDED, it did not produce wrong output silently',
-     r.stop === 'rebalanced' || r.stop === 'eos' || r.stop === 'length', r.stop);
-  if (r.stop === 'rebalanced') {
-    ok('  and it said the context was dropped, in words',
-       /context was dropped/.test(r.events.find(e => e.type === 'done')?.note || ''),
-       r.events.find(e => e.type === 'done')?.note);
-    ok('  naming which devices moved',
-       (r.events.find(e => e.type === 'rebalanced')?.moved || []).length > 0);
-    const s2 = await status();
-    ok('  the context really is zero, not stale', s2.cached_tokens === 0,
-       String(s2.cached_tokens));
-    ok('  and last_rebalance explains it for the UI',
-       !!s2.last_rebalance?.dropped_context, JSON.stringify(s2.last_rebalance));
-  }
+  // The join used to land at the next token boundary and cut the answer short
+  // with stop:'rebalanced'. It now lands at the END of the turn: the whole answer
+  // is generated against the topology it started with.
+  ok('the turn COMPLETED: a join does not cut an answer short',
+     !r.error && (r.stop === 'eos' || r.stop === 'length'), r.error || r.stop);
   await sleep(600);
-  const s3 = await status();
+  const s2 = await status();
+  ok('after the turn the context was dropped, and /status says why',
+     s2.cached_tokens === 0 && !!s2.last_rebalance?.dropped_context,
+     `cached ${s2.cached_tokens}; ${JSON.stringify(s2.last_rebalance)}`);
   ok('both devices now hold layers and the flock is covered',
-     s3.ready && s3.birds.length === 2 && s3.missing.length === 0,
-     s3.birds.map(b => `${b.label}:${b.start}-${b.end}`).join(' '));
+     s2.ready && s2.birds.length === 2 && s2.missing.length === 0,
+     s2.birds.map(b => `${b.label}:${b.start}-${b.end}`).join(' '));
   ok('the incumbent was TOLD its new range, not left guessing',
      (a.reassigns || []).length > 0, (a.reassigns || []).join('; ') || 'never told');
 
@@ -305,6 +319,7 @@ if (LAYERS >= 2) {
   const running = turn('count to twenty', 40, true);
   await sleep(700);
   // Pull the plug the way a phone does: the socket dies mid-lap.
+  const held = `${go.start}-${go.end}`;
   clearInterval(go.beat);
   go.ws.terminate();
   const r = await running;
@@ -312,7 +327,7 @@ if (LAYERS >= 2) {
      r.error || r.stop);
   ok('  and the reason names the device and the layers it was holding',
      /dropped its connection|stopped responding|no device|not holding/
-       .test(r.error || '') && /26-27/.test(r.error || ''),
+       .test(r.error || '') && r.error.includes(held),
      (r.error || '(no error)').slice(0, 100));
 
   // The sweeper removes it after the liveness grace period; /leave is the fast path.

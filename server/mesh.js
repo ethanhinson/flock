@@ -22,7 +22,7 @@ import nodeDataChannel from 'node-datachannel';
 // transport keeps using exactly what it used before.
 import {Buffer} from 'node:buffer';
 import {pack, unpack} from '../web/js/wire.mjs';
-import {allocate, device, Infeasible, explain, DEFAULT_RATE} from './allocate.js';
+import {allocate, adjust, device, Infeasible, explain, DEFAULT_RATE} from './allocate.js';
 import {Rate, shouldRebalance, currentMakespan, MIN_SAMPLES} from './speed.js';
 
 const ICE = ['stun:stun.l.google.com:19302'];
@@ -41,6 +41,17 @@ export class Bird {
     this.forwardsDirectly = false;   // set when the bird reports a live peer link
     this.ws = null; this.pc = null; this.chan = null;
     this._waiter = null;
+    // THE READINESS HANDSHAKE. Being assigned a range and HOLDING it are different
+    // states separated by a weight stream of 3-18 seconds on a phone, and the gap
+    // used to be invisible: the coordinator assigned, announced, and sent the next
+    // frame at once. `confirmed` is the range this device has said it built, sent
+    // as {t:'ready', start, end} once its layers are on the GPU; a lap does not
+    // start until every placed bird's confirmation matches its assignment.
+    this.confirmed = null;
+    // Consecutive frames this device failed to compute (a NACK with reason
+    // 'failed'). A device that cannot compute is a device that cannot serve, and
+    // that -- not a transient frame during a transition -- is what removes it.
+    this.failures = 0;
 
     // What this device said it can do, from the /check probe it runs before
     // joining. Unknown means unconstrained: a device that did not report is
@@ -91,13 +102,44 @@ export class Bird {
     try { return !!(this.chan && this.chan.isOpen()); } catch { return false; }
   }
 
-  /** Does it hold layers right now? A member between reallocations may not. */
+  /** Is it assigned layers right now? A member between reallocations may not be. */
   placed() { return this.start != null && this.end != null; }
+
+  /** Has it confirmed that it holds the range it is assigned? */
+  isReady() {
+    return this.placed() && !!this.confirmed &&
+           this.confirmed.start === this.start && this.confirmed.end === this.end;
+  }
+
+  /** The device says its layers for [start, end] are built and on the GPU. A
+   *  confirmation for a range it is no longer assigned is kept -- it is true, just
+   *  stale -- and simply does not count until the assignment matches again. */
+  confirm(start, end) {
+    if (start == null || end == null) { this.confirmed = null; return false; }
+    this.confirmed = {start, end};
+    this.failures = 0;
+    return this.isReady();
+  }
+
+  /** The device refused a frame. `reason` is 'not-ready' (it is between
+   *  assignments, or still streaming) or 'failed' (it tried and could not). Wakes
+   *  the lap waiting on it, so the coordinator learns now rather than at the 120s
+   *  timeout. */
+  nack(m) {
+    this.lastSeen = Date.now();
+    if (m.reason === 'failed') this.failures++;
+    if (this._waiter) this._waiter({nack: m});
+  }
 
   info() {
     return {slot: this.slot, start: this.start, end: this.end,
             n_layers: this.placed() ? this.end - this.start + 1 : 0,
             alive: this.alive(), last_ms: this.lastMs,
+            // Assigned is not holding: a bird re-streams for seconds after a
+            // reassignment, and this is where /status says which ones still are.
+            ready: this.isReady(),
+            confirmed: this.confirmed ? `${this.confirmed.start}-${this.confirmed.end}` : null,
+            failures: this.failures,
             label: this.label, transport: this.transport,
             frames: this.frames, peer_id: this.peerId,
             // How long since we last heard anything: the UI can say "12s ago"
@@ -146,22 +188,13 @@ export class Bird {
   deliver(buf) {
     this.lastSeen = Date.now();
     this.frames++;
+    this.failures = 0;
     const {data, meta} = unpack(
       buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
     if (this._waiter) this._waiter({data, meta});
   }
 
   reset() { this.resetPending = true; }
-
-  /** Hand this slot back so another device can take these layers. */
-  release() {
-    this.teardown();
-    this.peerId = null;
-    this.label = '?';
-    this.lastSeen = 0;
-    this.lastMs = null;
-    this.frames = 0;
-  }
 
   /** Drop every link to this bird. Called when its websocket goes away, so a
    *  refresh starts from a clean slate instead of leaking a PeerConnection. */
@@ -241,7 +274,7 @@ export class Flock {
     this.infeasible = null;
     // Membership changes that arrived mid-token, applied at the next token
     // boundary. See applyPending().
-    this.pending = false;
+    this.deferred = false;
   }
 
   /**
@@ -366,8 +399,19 @@ export class Flock {
   /**
    * Recompute the assignment for whoever is present.
    *
-   * `force` skips the gain gate and the cooldown -- used when membership changed,
-   * because then the alternative is not covering some layers at all.
+   * Two kinds of change, and they are handled differently on purpose:
+   *
+   *   `force`   membership changed. The alternative to moving is not covering
+   *             some layers, so the gain gate and cooldown do not apply -- but the
+   *             move is a STICKY EDIT (allocate.adjust): a joiner takes a run off
+   *             one incumbent, a leaver's run goes to its neighbours, and nobody
+   *             else moves. Every device that moves re-streams its weights and
+   *             holds nothing meanwhile, so the number of movers is the cost.
+   *
+   *   not       the timings say the split could be better. This is the exact
+   *             search, under the gain gate and the cooldown in ./speed.js. The
+   *             caller decides WHEN this is allowed to happen (see the server:
+   *             only at the start of a conversation, never during one).
    *
    * Returns the decision: {move, reason, gain, moved: [peerIds]}. Never throws for
    * an unsatisfiable flock; that lands in this.infeasible, where /status and /chat
@@ -375,6 +419,14 @@ export class Flock {
    */
   plan({force = false} = {}) {
     const members = this.members();
+    // The exact search keeps the order it is given, so give it the CURRENT chain
+    // order (placed birds by layer, then the unplaced in join order) rather than
+    // join order: a speed rebalance should refine the split, not reshuffle who is
+    // next to whom.
+    const ordered = [...this.birds].sort((x, y) => {
+      if (x.placed() && y.placed()) return x.start - y.start;
+      return (x.placed() ? 0 : 1) - (y.placed() ? 0 : 1);
+    }).filter(b => members.includes(b));
     const current = this.birds.filter(b => b.placed()).map(b => ({
       id: b.peerId, start: b.start, end: b.end, bytes: b.bytes,
       rate: b.rate.rate(DEFAULT_RATE),
@@ -388,7 +440,7 @@ export class Flock {
 
     let proposed;
     try {
-      proposed = allocate(this.layers, members.map(b => device({
+      const devices = ordered.map(b => device({
         id: b.peerId, label: b.label, bind: b.caps.bind, budget: b.caps.budget,
         rate: b.rate.rate(DEFAULT_RATE),
         // A bird running in a browser ON the coordinator machine shares that GPU
@@ -399,7 +451,9 @@ export class Flock {
         // point is to use spare capacity, not to exclude the best hardware -- but
         // stops it being double-counted.
         reservedMs: b.onCoordinator ? (this.coordMs || 0) : 0,
-      })));
+      }));
+      proposed = force ? adjust(this.layers, current, devices)
+                       : allocate(this.layers, devices);
       this.infeasible = null;
     } catch (e) {
       if (!(e instanceof Infeasible)) throw e;
@@ -414,7 +468,9 @@ export class Flock {
 
     const trusted = members.filter(b => b.rate.trusted()).length;
     const d = force
-      ? {move: true, reason: 'membership changed', gain: null}
+      ? {move: true, gain: null,
+         reason: proposed.sticky ? 'membership changed (local edit)'
+                                 : 'membership changed'}
       : shouldRebalance({
           current, proposed, now: this.now(), lastMoveAt: this.lastMoveAt,
           trustedCount: trusted, deviceCount: members.length,
@@ -435,7 +491,9 @@ export class Flock {
         moved.push(b.peerId);
         // A device whose range changed has to re-download the layers it gained and
         // its K/V cache is stale for the ones it lost, so its old timings describe
-        // work it is no longer doing.
+        // work it is no longer doing. It is also no longer READY: whatever it
+        // confirmed was the old range, and nothing may be sent to it until it
+        // confirms the new one.
         b.rate.reset();
       }
       b.start = a.start; b.end = a.end;
@@ -471,27 +529,34 @@ export class Flock {
   }
 
   /**
-   * Feed one token's timings back in, and say whether the assignment should move.
+   * Feed one token's timings into each device's rate. Called at a TOKEN BOUNDARY,
+   * so a rate is a bytes/ms pair whose halves belong to the same token.
    *
-   * Called at a TOKEN BOUNDARY, never mid-lap: a reallocation invalidates the
-   * sharded K/V cache for every layer that moved, so acting on it halfway through a
-   * token would mix keys computed on two different devices for the same positions
-   * and produce text that is wrong without being obviously wrong.
+   * Recording and acting are split on purpose. Acting -- moving layers because
+   * the timings say so -- drops the conversation (the K/V cache is sharded by
+   * layer), so the server only calls plan() for speed at the START of a
+   * conversation, when there is nothing to lose. Recording happens every token
+   * so that decision has evidence when it comes.
    */
-  observe() {
+  recordTimings() {
     for (const b of this.birds) {
       if (b.lastMs != null && b.bytes > 0) b.rate.observe(b.bytes, b.lastMs);
     }
+  }
+
+  /** Record this token's timings and ask whether the assignment should move. */
+  observe() {
+    this.recordTimings();
     return this.plan();
   }
 
   /** A membership change arrived while a token was in flight. */
-  defer() { this.pending = true; }
+  defer() { this.deferred = true; }
 
   /** Apply a deferred membership change. Returns the decision, or null if none. */
   applyPending() {
-    if (!this.pending) return null;
-    this.pending = false;
+    if (!this.deferred) return null;
+    this.deferred = false;
     return this.plan({force: true});
   }
 
@@ -558,6 +623,21 @@ export class Flock {
         throw new Error(`the device holding layers ${chain[j].start}-${chain[j].end} ` +
                         `(${chain[j].label}) dropped its connection mid-token`);
       }
+      // A NACK: the device refused the frame. The token is torn either way (every
+      // device before it has already appended this position to its cache), so the
+      // turn has to end -- but the device stays a member. The reason travels up so
+      // the caller can tell "still streaming" from "cannot compute".
+      if (got.nack) {
+        const n = got.nack;
+        const who = chain.find(b => b.peerId === n.peer_id) || chain[j];
+        const e = new Error(n.reason === 'failed'
+          ? `${who.label} (layers ${who.start}-${who.end}) could not compute a ` +
+            `frame: ${n.detail || 'no detail'}`
+          : `${who.label} was sent a frame before it held layers ` +
+            `${who.start}-${who.end} (it reported: ${n.reason})`);
+        e.nack = n; e.bird = who;
+        throw e;
+      }
       flat = got.data;
       i = j + 1;
     }
@@ -566,16 +646,78 @@ export class Flock {
 
   byPeer(id) { return this.birds.find(b => b.peerId === id) || null; }
 
-  /** Is every bird-side layer covered by a device that is answering? */
+  /** Can a lap run right now: covered, AND every placed bird has confirmed the
+   *  range it is assigned? The second half is the readiness handshake; without it
+   *  a lap could start into a device that is still streaming its weights. */
   ready() {
+    return this.covered() && this.pending().length === 0;
+  }
+
+  /** The placed birds that have not yet confirmed the range they were assigned:
+   *  what /status shows as "still loading", and what a turn waits on. */
+  pending() {
+    return this.chain().filter(b => !b.isReady());
+  }
+
+  /**
+   * Wait until every placed bird has confirmed, or until it is clear that will
+   * not happen. Resolves {ok: true} or {ok: false, reason}. `onWait` is called
+   * about once a second with the birds still pending, so a turn can say what it
+   * is waiting for instead of appearing to hang.
+   */
+  async awaitReady({timeoutMs = 90000, onWait = null, pollMs = 200} = {}) {
+    const t0 = Date.now();
+    let lastSaid = 0;
+    for (;;) {
+      if (this.infeasible) return {ok: false, reason: this.infeasible.message};
+      // Assigned to a member that is still connecting is a reason to wait;
+      // assigned to nobody, or to a device that has gone quiet, is not.
+      if (!this.assigned()) {
+        const miss = this.missing();
+        return {ok: false, reason: miss.length
+          ? `waiting for devices to cover layer${miss.length > 1 || miss[0].includes('-')
+              ? 's' : ''} ${miss.join(', ')}`
+          : 'waiting for the devices that hold the layers to answer'};
+      }
+      const pend = this.chain().filter(b => !b.isReady() || !b.alive());
+      if (!pend.length && this.covered()) return {ok: true};
+      const waited = Date.now() - t0;
+      if (waited > timeoutMs) {
+        return {ok: false, reason: `gave up after ${(waited / 1000).toFixed(0)}s: ` +
+          pend.map(b => `${b.label} has not confirmed layers ${b.start}-${b.end}`).join('; ')};
+      }
+      if (onWait && Date.now() - lastSaid > 1000) {
+        lastSaid = Date.now();
+        onWait(pend, waited);
+      }
+      await new Promise(r => setTimeout(r, pollMs));
+    }
+  }
+
+  /** Is every bird-side layer assigned to a device that is answering? */
+  covered() {
     if (this.infeasible) return false;
     const chain = this.chain();
-    if (!chain.length) return false;
-    if (!chain.every(b => b.alive())) return false;
-    // Covered means every layer, contiguously. A gap here would silently skip
-    // layers and produce plausible wrong text, which is the failure this checks
-    // for -- it cannot happen through plan(), but the chain is also filtered by
-    // liveness, and a dead bird in the middle leaves exactly such a gap.
+    if (!chain.length || !chain.every(b => b.alive())) return false;
+    return this.contiguous(chain);
+  }
+
+  /** Is every bird-side layer assigned to a MEMBER -- answering, or admitted and
+   *  still connecting? The difference from covered() is the join window: a device
+   *  that was just given layers over HTTP has no socket for a moment, and a turn
+   *  sent in that moment should wait for it, not report its layers uncovered. */
+  assigned() {
+    if (this.infeasible) return false;
+    const chain = this.chain();
+    if (!chain.length || !chain.every(b => b.claimed())) return false;
+    return this.contiguous(chain);
+  }
+
+  /** Every layer, contiguously. A gap here would silently skip layers and produce
+   *  plausible wrong text, which is the failure this checks for -- it cannot
+   *  happen through plan(), but the chain is also filtered by liveness, and a dead
+   *  bird in the middle leaves exactly such a gap. */
+  contiguous(chain) {
     let want = this.layers[0].layer;
     for (const b of chain) {
       if (b.start !== want) return false;
@@ -622,7 +764,10 @@ export class Flock {
       proposed_ms: this.proposedMs ?? null,
       min_samples: MIN_SAMPLES,
       decision: this.decision,
-      pending: this.pending,
+      deferred: this.deferred,
+      // Assigned but not yet confirmed: the devices a turn would wait for.
+      loading: this.pending().map(b => ({peer_id: b.peerId, label: b.label,
+                                          range: `${b.start}-${b.end}`})),
       infeasible: this.infeasible,
       // Per-layer bytes, so the 13% size spread is visible rather than asserted.
       layer_mb: this.layers.map(l => +(l.bytes / 1e6).toFixed(1)),

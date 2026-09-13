@@ -228,6 +228,218 @@ export function allocate(layers, devices) {
           evenMs: +evenMs.toFixed(2)};
 }
 
+// ---------------------------------------------------------------------------
+// STICKY EDITS: membership changes as local moves, not a re-partition.
+//
+// allocate() above is exact, and that is the problem with using it for every
+// join. Its optimum for N+1 devices generally shares no boundary with its optimum
+// for N, so one phone joining moved EVERY bird -- and a moved bird re-streams its
+// weights for 3-18 seconds, during which it holds no layers at all. Measured on
+// real devices: one join produced a cascade of re-streams, each one a window in
+// which a frame could arrive at a device holding nothing.
+//
+// A membership change is therefore applied as the SMALLEST edit to the current
+// assignment that covers the layers:
+//
+//   a device joins    it takes a contiguous run off ONE incumbent, chosen (with
+//                     the size of the run) to minimise the makespan; nobody else
+//                     moves and the donor keeps a contiguous remainder.
+//   a device leaves   its run is split between its two neighbours (either may
+//                     take all of it); nobody else moves.
+//
+// The exact optimum is still what the SPEED rebalancer aims at, under its gain
+// gate and cooldown, at a moment the caller chooses -- so the cost of stickiness
+// is bounded (some makespan until the next rebalance) and the cost of the
+// alternative (every device re-streaming on every join) is gone.
+//
+// If no local edit is feasible under the devices' limits, adjust() falls back to
+// the exact search, and says so in the result.
+// ---------------------------------------------------------------------------
+
+/** Per-token cost of one device holding `bytes`, including work it already owes. */
+const stageMs = (d, bytes) => bytes / d.rate + d.reservedMs;
+
+/** Can this device hold this run of layers at all? */
+function fits(d, run) {
+  let bytes = 0;
+  for (const l of run) {
+    if (l.maxTensor > d.bind) return false;
+    bytes += l.bytes;
+  }
+  return bytes <= d.budget;
+}
+
+/** The makespan of an even-by-layer-count split over the same devices, for
+ *  /status to show what the weighting bought. */
+function evenSplitMs(layers, devices) {
+  const D = devices.length, L = layers.length;
+  const prefix = [0];
+  for (const l of layers) prefix.push(prefix[prefix.length - 1] + l.bytes);
+  let evenMs = 0;
+  const per = Math.floor(L / D), extra = L % D;
+  for (let d = 0, at = 0; d < D; d++) {
+    const k = per + (d < extra ? 1 : 0);
+    evenMs = Math.max(evenMs, (prefix[at + k] - prefix[at]) / devices[d].rate);
+    at += k;
+  }
+  return +evenMs.toFixed(2);
+}
+
+/** The result shape allocate() returns, built from explicit ranges. */
+function describe(layers, devices, chain) {
+  const byId = new Map(devices.map(d => [d.id, d]));
+  const totalBytes = layers.reduce((a, l) => a + l.bytes, 0);
+  let makespan = 0;
+  const assign = [...chain].sort((a, b) => a.start - b.start).map(r => {
+    const d = byId.get(r.id);
+    const run = layers.filter(l => l.layer >= r.start && l.layer <= r.end);
+    const bytes = run.reduce((a, l) => a + l.bytes, 0);
+    makespan = Math.max(makespan, stageMs(d, bytes));
+    return {id: d.id, label: d.label, start: r.start, end: r.end,
+            layers: run.length, bytes, rate: d.rate,
+            ms: +(bytes / d.rate).toFixed(2),
+            share: +(bytes / totalBytes).toFixed(4)};
+  });
+  return {assign, makespanMs: +makespan.toFixed(2), totalBytes,
+          evenMs: evenSplitMs(layers, assign.map(a => byId.get(a.id)))};
+}
+
+/** The cost of a candidate chain: its stage times, slowest first.
+ *
+ *  Compared lexicographically rather than by the makespan alone. When the
+ *  bottleneck is a device the edit does not touch, every split of the donor has
+ *  the same makespan, and picking the first would hand a newcomer ONE layer while
+ *  the donor kept the rest. Comparing the whole sorted vector breaks that tie the
+ *  right way: the second-slowest stage is minimised too, so the donor and the
+ *  newcomer end up balanced against each other. */
+function chainCost(layers, byId, chain) {
+  const out = [];
+  for (const r of chain) {
+    const d = byId.get(r.id);
+    let bytes = 0;
+    for (const l of layers) if (l.layer >= r.start && l.layer <= r.end) bytes += l.bytes;
+    out.push(stageMs(d, bytes));
+  }
+  return out.sort((a, b) => b - a);
+}
+function cheaper(a, b) {
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    if (a[i] !== b[i]) return a[i] < b[i];
+  }
+  return a.length < b.length;
+}
+
+/**
+ * Apply a membership change to `current` with the fewest moves.
+ *
+ * `current` is the assignment as it stands: [{id, start, end}] for placed devices
+ * (ids no longer in `devices` are treated as departed, and their layers as free).
+ * `devices` is every member now, in join order; ones not in `current` are
+ * newcomers. Returns the same shape as allocate(), plus `sticky: true` when a
+ * local edit was found and `sticky: false` when it fell back to the exact search.
+ */
+export function adjust(layers, current, devices) {
+  const D = devices.length, L = layers.length;
+  if (!D) throw new Infeasible('no devices in the flock', {kind: 'empty'});
+  if (L < D) {
+    throw new Infeasible(
+      `${D} devices but only ${L} layer(s) to give out: ${D - L} device(s) would ` +
+      `hold nothing. Give the birds more layers (FLOCK_BIRD_LAYERS) or use fewer ` +
+      `devices.`,
+      {kind: 'too-many-devices', devices: D, layers: L});
+  }
+  const byId = new Map(devices.map(d => [d.id, d]));
+  const first = layers[0].layer, last = layers[L - 1].layer;
+  const run = (s, e) => layers.slice(s - first, e - first + 1);
+
+  // The chain being edited: present devices only, clipped to the plan, in layer
+  // order. Anything left uncovered after this is a free run.
+  let chain = current
+    .filter(c => byId.has(c.id) && c.start != null)
+    .map(c => ({id: c.id, start: Math.max(c.start, first), end: Math.min(c.end, last)}))
+    .filter(c => c.start <= c.end)
+    .sort((a, b) => a.start - b.start);
+  if (!chain.length) return {...allocate(layers, devices), sticky: false};
+
+  const exact = () => ({...allocate(layers, devices), sticky: false});
+
+  // An incumbent whose limits changed under it (a reload that reports a smaller
+  // binding size) may no longer be able to hold what it holds. That is not a
+  // local edit; let the exact search decide, and let it throw Infeasible with
+  // the precise reason if nothing works.
+  for (const c of chain) {
+    if (!fits(byId.get(c.id), run(c.start, c.end))) return exact();
+  }
+
+  // 1. Free runs (a departed device's layers, or layers nobody held) go to the
+  //    neighbours on either side. Every split point is tried, including "all to
+  //    the left" and "all to the right", and the cheapest wins; a split is refused
+  //    if it would push a neighbour over its limits.
+  const covered = new Set();
+  for (const c of chain) for (let l = c.start; l <= c.end; l++) covered.add(l);
+  for (let l = first; l <= last; l++) {
+    if (covered.has(l)) continue;
+    let e = l;
+    while (e + 1 <= last && !covered.has(e + 1)) e++;
+    const left = chain.find(c => c.end === l - 1) || null;
+    const right = chain.find(c => c.start === e + 1) || null;
+    let best = null;
+    for (let k = 0; k <= e - l + 1; k++) {
+      // left takes [l, l+k-1], right takes [l+k, e]
+      if (k > 0 && !left) continue;
+      if (k < e - l + 1 && !right) continue;
+      const trial = chain.map(c => ({...c}));
+      if (k > 0) {
+        const tl = trial.find(c => c.id === left.id);
+        tl.end = l + k - 1;
+        if (!fits(byId.get(tl.id), run(tl.start, tl.end))) continue;
+      }
+      if (k < e - l + 1) {
+        const tr = trial.find(c => c.id === right.id);
+        tr.start = l + k;
+        if (!fits(byId.get(tr.id), run(tr.start, tr.end))) continue;
+      }
+      const cost = chainCost(layers, byId, trial);
+      if (!best || cheaper(cost, best.cost)) best = {cost, trial};
+    }
+    if (!best) return exact();
+    chain = best.trial;
+    for (let x = l; x <= e; x++) covered.add(x);
+    l = e;
+  }
+
+  // 2. Newcomers, one at a time in join order. Each takes a prefix or a suffix of
+  //    one incumbent's run; the donor and the size are whatever is cheapest. Ties
+  //    go to the first candidate in chain order, suffix before prefix, so the
+  //    outcome is stable and a lone newcomer lands after its donor -- the same
+  //    shape join order produced before.
+  for (const dev of devices) {
+    if (chain.some(c => c.id === dev.id)) continue;
+    let best = null;
+    for (const donor of chain) {
+      const n = donor.end - donor.start + 1;
+      for (let k = 1; k < n; k++) {
+        for (const side of ['suffix', 'prefix']) {
+          const mine = side === 'suffix'
+            ? {id: dev.id, start: donor.end - k + 1, end: donor.end}
+            : {id: dev.id, start: donor.start, end: donor.start + k - 1};
+          const kept = side === 'suffix'
+            ? {id: donor.id, start: donor.start, end: donor.end - k}
+            : {id: donor.id, start: donor.start + k, end: donor.end};
+          if (!fits(dev, run(mine.start, mine.end))) continue;
+          const trial = chain.map(c => (c.id === donor.id ? kept : {...c})).concat([mine]);
+          const cost = chainCost(layers, byId, trial);
+          if (!best || cheaper(cost, best.cost)) best = {cost, trial};
+        }
+      }
+    }
+    if (!best) return exact();
+    chain = best.trial.sort((a, b) => a.start - b.start);
+  }
+
+  return {...describe(layers, devices, chain), sticky: true};
+}
+
 /** One line saying why a device got the share it did, for /status and the log. */
 export function explain(a) {
   return `${a.layers} layer${a.layers === 1 ? '' : 's'} (${a.start}-${a.end}), ` +
