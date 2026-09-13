@@ -40,9 +40,16 @@
 // range so the bytes never sit in the JS heap (see web/js/gguf-stream.mjs).
 // Both end up calling the same Layer with the same numbers.
 import WebSocket from 'ws';
+import {existsSync} from 'node:fs';
 import {pack, unpack} from '../web/js/wire.mjs';
 
-const BASE = process.env.FLOCK_URL || 'http://127.0.0.1:8000';
+// The coordinator serves https when .certs/ exists (Chrome hides WebGPU outside a
+// secure context), so default to it and fall back to http for a plain run. A
+// self-signed cert also means Deno must be told not to verify -- see the
+// DENO_TLS_CA_STORE note in the header comment.
+const BASE = process.env.FLOCK_URL ||
+  (existsSync(new URL('../.certs/cert.pem', import.meta.url))
+    ? 'https://127.0.0.1:8000' : 'http://127.0.0.1:8000');
 
 // --- arguments -------------------------------------------------------------
 const argv = process.argv.slice(2);

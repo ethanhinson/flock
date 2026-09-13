@@ -89,6 +89,10 @@
 
 <div class="grid">
   <div class="cell"><div class="k">backend</div><div class="v" id="backend">—</div></div>
+  <!-- The number that decides whether a layer fits here at all. Worth showing:
+       the 128MiB WebGPU default is what produces binding-size errors, and real
+       devices grant far more when asked. -->
+  <div class="cell"><div class="k">largest tensor</div><div class="v" id="binding">—</div></div>
   <div class="cell"><div class="k">link</div><div class="v" id="link">—</div></div>
   <div class="cell"><div class="k">my kv cache</div><div class="v" id="cache">—</div></div>
   <div class="cell"><div class="k">last compute</div><div class="v" id="ms">—</div></div>
@@ -311,16 +315,31 @@ let peerId = localStorage.getItem('flock_peer') || null;
   // buffer is an ffn_down at ~3MB, so the 128MiB default is already ample --
   // and WebKit rejects an over-ambitious requiredLimits far more readily than
   // wgpu does, which turned "raise the ceiling for free" into a failed join.
-  const want = Math.min(64 * 1024 * 1024, ad.limits.maxStorageBufferBindingSize);
-  try {
-    device = await ad.requestDevice({requiredLimits: {
-      maxStorageBufferBindingSize: want,
-      maxBufferSize: Math.min(want, ad.limits.maxBufferSize),
-    }});
-  } catch (e) {
-    log('requested limits refused, using this device defaults: ' + e.message);
-    device = await ad.requestDevice();      // defaults are enough for a bird
+  // Ask for what the adapter SAYS it can do, then step down. Capping this at a
+  // guessed 64MB was a mistake: real devices here report 1.07GB (iPhone) and
+  // 4.29GB (this Mac), so a fixed cap threw away an order of magnitude of
+  // capacity and forced tensor splitting that was never necessary. The default
+  // is 128MiB, which is the number that produces binding-size errors -- it is a
+  // default, not a hardware limit.
+  const adBind = ad.limits.maxStorageBufferBindingSize;
+  const adBuf = ad.limits.maxBufferSize;
+  for (const frac of [1, 0.5, 0.25, 0]) {
+    try {
+      device = frac === 0
+        ? await ad.requestDevice()                       // last resort: defaults
+        : await ad.requestDevice({requiredLimits: {
+            maxStorageBufferBindingSize: Math.floor(adBind * frac),
+            maxBufferSize: Math.floor(adBuf * frac),
+          }});
+      break;
+    } catch (e) {
+      if (frac === 0) throw e;
+      log(`limits at ${frac * 100}% refused, stepping down: ${e.message}`);
+    }
   }
+  set('binding', `${(device.limits.maxStorageBufferBindingSize / 1e6).toFixed(0)} MB`);
+  log(`largest tensor this device can hold: ` +
+      `${(device.limits.maxStorageBufferBindingSize / 1e6).toFixed(0)} MB`, 'ok');
   const t = performance.now();
   const got = await loadBirdWeights(device, meta.gguf, meta.start, meta.end, {
     onNote: m => log('gguf: ' + m),
@@ -555,6 +574,12 @@ async function reassign(m) {
     progressDone('ready');
     cachedTokens = 0;
     set('cache', '0 tokens');
+    // The headline range must follow a reassignment. Logging it is not enough:
+    // leaving the join-time value on screen makes every device look like it holds
+    // the same layers, which is indistinguishable from a broken allocator.
+    $('layers').textContent = `${meta.start}–${meta.end}`;
+    $('of').textContent = `of ${meta.n_total} · ${meta.end - meta.start + 1} layer` +
+                          (meta.end === meta.start ? '' : 's');
     log(`holding layers ${meta.start}–${meta.end} now`, 'ok');
     if (m.next_peer && !chan) openRTC(m.next_peer);
     showLink();

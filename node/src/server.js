@@ -801,11 +801,9 @@ server.listen(PORT, '0.0.0.0', () => {
   }
   console.log(`flock listening on port ${PORT} — chat at / , birds join at /flock` +
               `, device check at /check`);
-  console.log(`  ${N_BIRDS} bird slot${N_BIRDS === 1 ? '' : 's'}: ` +
-              RANGES.map(([s, e]) => `${s}-${e}`).join(', ') +
-              (N_BIRDS === 1
-                ? '  (FLOCK_BIRDS=2 to split these across two devices)'
-                : ''));
+  // No slot count to print any more: layers are divided among whoever joins.
+  console.log(`  birds share layers ${CUT}-${N_TOTAL - 1}; ` +
+              `however many devices show up, the split follows them`);
   if (!hasCert) {
     console.log('\n  NOTE: serving plain http, so Chrome and Edge will hide WebGPU');
     console.log('  (they require a secure context; Safari does not). To fix:');
