@@ -56,7 +56,7 @@ const GGUF_URL = process.env.FLOCK_GGUF ||
 // of the model is still a startup choice (FLOCK_BIRD_LAYERS, because the
 // coordinator's half is loaded onto this GPU once and cannot move), but how many
 // devices cover it, and which layers each one gets, is decided from whoever is
-// present -- see src/allocate.js.
+// present -- see allocate.js.
 console.log(`reading GGUF header: ${GGUF_URL.split('/').pop()}`);
 const header = await readModel(GGUF_URL);
 const N_TOTAL = header.nLayers;
@@ -123,9 +123,10 @@ setInterval(() => {
 }, SWEEP_MS);
 
 /**
- * Recompute the assignment and tell everyone. Called on join, on leave, on a
- * sweep, and at token boundaries; `force` is for membership changes, where the
- * alternative is not covering some layers at all.
+ * Recompute the assignment and tell everyone. Called on join, on leave and on a
+ * sweep, always with `force`: membership changed, and the alternative to moving
+ * is not covering some layers at all. (The speed rebalancer is rebalanceForSpeed,
+ * below, and has its own rules about when it may run.)
  *
  * ANY reassignment drops the conversation. The K/V cache is sharded BY LAYER across
  * the devices, so a layer that moves leaves its keys on the device that no longer
@@ -850,9 +851,7 @@ wss.on('connection', ws => {
       // what actually carried the frame is the only honest answer.
       // Liveness heartbeat. Without it an idle bird ages past alive()'s grace
       // period and the flock reports itself uncovered until a turn starts.
-      // `pull` is the old name from the long-polling transport -- still accepted
-      // so an un-refreshed bird page keeps its slot.
-      else if (m.t === 'ping' || m.t === 'pull') bird.lastSeen = Date.now();
+      else if (m.t === 'ping') bird.lastSeen = Date.now();
     } else if (bird) {
       bird.deliver(data);
     }

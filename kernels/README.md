@@ -2,7 +2,7 @@
 
 Nine WebGPU compute kernels and a `Model` that composes them into the whole of
 Qwen3-0.6B — token ids in, next token id out — consuming Q8_0 weights straight
-out of a GGUF file. No ONNX export, no Python build step, no pre-built artifacts.
+out of a GGUF file. No ONNX export, no build step, no pre-built artifacts.
 
 **This is now flock's only inference path.** The coordinator runs `Model` with a
 `cut` (layers 0..cut-1, plus the embedding, output_norm and the tied head); a bird
@@ -46,7 +46,7 @@ WGSL    [17,488,220,17,284,220,19,13]               "2 + 2 = 4."
 ONNX    [17,488,220,17,284,220,19,13]               identical
 ```
 
-ONNX here is the full five-graph pipeline flock ships — `embed.onnx`,
+ONNX here is the five-graph export flock used to ship — `embed.onnx`,
 `layers.onnx` (layers 0-23), `shard0.onnx`, `shard1.onnx`, `head.onnx` — under
 onnxruntime-node, with the same tokenizer and chat template.
 

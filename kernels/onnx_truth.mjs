@@ -1,4 +1,4 @@
-// Run web/shard0.onnx (Qwen3 layers 24-25) under onnxruntime-node and dump its
+// Run the ONNX shard (Qwen3 layers 24-25) under onnxruntime-node and dump its
 // output, so the WGSL layer can be diffed against the engine flock uses today.
 //
 //   node kernels/onnx_truth.mjs <in.json> <out.json>
@@ -47,7 +47,7 @@ const ort = (await import(`file://${ortPath}`)).default;
 
 const req = req0;
 const {
-  shard = new URL('../web/shard0.onnx', import.meta.url).pathname,
+  shard = new URL('./.ref/shard0.onnx', import.meta.url).pathname,
   hidden,          // flat f32, length nTokens * 1024
   nTokens = 1,
   positions,       // int64 position ids, length nTokens

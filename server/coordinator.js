@@ -2,7 +2,7 @@
 //
 // Holds the embedding, layers 0..cut-1, output_norm and the tied vocab
 // projection, all as WGSL compute kernels over Q8_0 weights read straight out of
-// a GGUF file. No ONNX, no Python export, no build step, no artifacts on disk
+// a GGUF file. No ONNX, no export, no build step, no artifacts on disk
 // beyond the cached model file itself.
 //
 // WHY THIS RUNS UNDER DENO AND NOT NODE. The coordinator needs a GPU, and Node

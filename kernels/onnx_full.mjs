@@ -49,7 +49,7 @@ if (!existsSync(ortPath)) {
 const ort = (await import(`file://${ortPath}`)).default;
 
 const {
-  coordDir,            // web/coord: embed.onnx, layers.onnx, head.onnx, coord.json, tok/
+  coordDir,            // the export dir: embed.onnx, layers.onnx, head.onnx, coord.json, tok/
   shards = [],         // [{path, n_layers}] in order, covering the layers coord does not
   prompt,              // raw text; the chat template is applied here
   ids: rawIds,         // OR explicit token ids, skipping the tokenizer
