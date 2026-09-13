@@ -84,15 +84,31 @@ WebGPU** — the same kernels the test suite validates against ONNX token for to
 WebGPU is required on a bird; there is no CPU fallback any more, and the page says
 so plainly rather than promising a slower one.
 
-Two phones? `FLOCK_BIRDS=2` splits the same range in half and each device claims a
-free slot when it joins. Because a split is now just a choice about byte ranges,
-this is an environment variable rather than a rebuild:
+Two phones? Open `/flock` on the second one and tap join. **There is no device count
+to configure** -- the coordinator re-splits the layers across whoever is present, and
+it does so by measured speed and real GPU limits rather than evenly, because an even
+split is wrong three different ways:
+
+- a phone did 4 layers in **15.4 ms** while this Mac did 24 in **19.6 ms**, and a
+  pipeline runs at the pace of its slowest stage;
+- Qwen3-14B Q4_K_M layers range **185.8-210.2 MB**, a 13% spread, so half the layers
+  is not half the bytes;
+- that model's `output.weight` is **638 MB as one tensor** against WebGPU's default
+  128 MiB `maxStorageBufferBindingSize`, so a device can be shut out of a layer at any
+  split -- which the coordinator says in words, naming the tensor and both numbers,
+  before anything downloads.
+
+Open `/check` on a device to see what it reports. `/status` shows why each device got
+the share it did.
 
 ```bash
-FLOCK_BIRDS=2 npm start                 # 2 birds, 2 layers each
 FLOCK_BIRD_LAYERS=8 npm start           # give the birds 8 layers instead of 4
 FLOCK_GGUF=<url> npm start              # a different GGUF
 ```
+
+(`FLOCK_BIRD_LAYERS` is still a startup choice: the coordinator's half is loaded onto
+its GPU once and cannot move. How many devices cover the birds' half, and which layers
+each gets, is decided live.)
 
 No phone handy? `npm run solo` runs every bird in one process, so the whole chain
 works on one machine:
@@ -332,10 +348,18 @@ Read these before drawing conclusions from it.
 
 - Move the split: `FLOCK_BIRD_LAYERS=8` gives the phones 8 layers — watch them
   become the bottleneck. No rebuild; a split is just a byte range now.
-- Kill a peer mid-generation: the swarm reports exactly which layers are
-  uncovered, and recovers when a device claims that slot.
-- Add a second device with `FLOCK_BIRDS=2` and watch tok/s go *down* — pipeline
-  parallelism buys capacity, not speed.
+- Kill a peer mid-generation: the turn fails naming the device and the layers it
+  held, the flock reports exactly which layers are uncovered, and the survivors take
+  them over.
+- Join a device *while it is generating*: the token in flight finishes against the old
+  topology, then the split lands and the turn ends saying the conversation context was
+  dropped. Silently producing wrong output was the alternative -- the K/V cache is
+  sharded by layer, so a moved layer leaves its keys behind.
+- Add a second device and watch tok/s go *down* — pipeline parallelism buys capacity,
+  not speed.
+- Give one device a deliberately small limit: `npm run bird -- --bind 64MB --slow 40ms`
+  reports 64 MB per tensor and pretends to be slow, so the allocator's two hard cases
+  can be tried without owning a drawer of phones.
 - Run `kernels/test_model.ts` to see the WGSL engine and the ONNX pipeline
   generate the same token ids, then read `kernels/README.md` on why a per-token
   cosine that is perfect at position 0 and decays after it indicts RoPE.

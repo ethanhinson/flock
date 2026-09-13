@@ -47,19 +47,88 @@ The npm dependencies are still npm dependencies, installed by `npm install`;
 |---|---|---|
 | `PORT` | 8000 | HTTP port |
 | `FLOCK_GGUF` | Qwen3-0.6B-Q8_0 on HuggingFace | where every device reads weights |
-| `FLOCK_BIRDS` | 1 | how many bird slots the tail is split across |
 | `FLOCK_BIRD_LAYERS` | 4 | how many layers the birds hold in total |
+
+**There is no `FLOCK_BIRDS`.** It used to fix the device count at startup, so a third
+phone pointed at a coordinator started with 2 got "flock full" and changing the count
+meant a restart. Any number of devices can now join, and the layers are re-split
+across whoever is present. `FLOCK_BIRD_LAYERS` is still a startup choice because the
+coordinator's half is loaded onto this GPU once and cannot move.
+
+## How the split is decided
+
+Not evenly, and not by layer count. Three measured reasons:
+
+- **Devices differ by ~5x.** A phone did 4 layers in 15.4 ms; this Mac did 24 in
+  19.6 ms. A pipeline runs at the pace of its slowest stage, so an even split wastes
+  the fast device.
+- **Layers are not the same size.** Qwen3-14B Q4_K_M layers range **185.8-210.2 MB**,
+  a 13% spread, so "half the layers" is not "half the bytes".
+- **Some tensors cannot be divided and are huge.** That model's `output.weight` is
+  **638 MB as one tensor** and WebGPU's default `maxStorageBufferBindingSize` is
+  128 MiB, so a device can be excluded from a layer at any split.
+
+So `src/allocate.js` minimises the **makespan** -- `max(bytes assigned / measured
+bytes-per-ms)` -- over contiguous runs of layers, subject to each device's real
+`maxStorageBufferBindingSize` and memory budget. It is an exact DP, not a heuristic
+(`test/allocate.test.mjs` brute-forces it against an exhaustive search).
+
+`src/speed.js` decides whether to act on the timings, and it is built against
+**oscillation** rather than slowness:
+
+| brake | why |
+|---|---|
+| a **rate** (bytes/ms), not a time | size-invariant, so the controller cannot read its own last decision as new evidence |
+| EWMA, α = 0.25 | one slow token (a GC pause, the user switching apps) moves the estimate by a quarter, not all the way |
+| 3 samples before a rate is trusted | the first token after a join cannot trigger a reshuffle |
+| a 15% predicted-gain gate | near the optimum every move is a small gain, every small gain is refused, and the assignment stops moving |
+| a 20 s cooldown | a move costs the moved layers a re-download and the flock its K/V cache |
+
+Measured: the same closed loop on two similar-speed devices makes **56 moves in 300
+tokens** with the gates off and **1** with them on.
+
+`/status` reports the whole decision -- each device's bytes, share, measured rate,
+sample count and reported limits, plus the predicted per-token cost next to what an
+even split of the same layers would have cost. The chat page renders it under the
+topology strip.
+
+## Joining and leaving mid-generation
+
+Membership can change at any time; the **assignment** only changes at a token
+boundary. The token in flight completes against the topology it started with.
+
+Any reallocation that actually moves layers **drops the conversation context**, and
+this is a deliberate, reported cost rather than a bug. The K/V cache is sharded *by
+layer*, so a layer that moves leaves its keys on the device that no longer holds it,
+while the device that now does starts from an empty cache at an offset the rest of the
+flock believes is already filled. Continuing would mix keys for the same positions
+computed on two different devices -- text that is wrong without looking wrong.
+Re-prefilling the history instead is not available: `Coordinator.turnTokens` documents
+why re-encoding a conversation diverges from what was actually fed.
+
+So:
+
+| event | what happens |
+|---|---|
+| join between turns | layers re-split immediately; context dropped if anything moved |
+| join mid-token | staged; the token finishes, then the split lands, the turn ends with `stop: "rebalanced"` and a `note` saying the context was dropped |
+| `POST /leave` | layers handed on at once (or at the next boundary if a token is in flight) |
+| socket closes | **nothing**, for up to 40 s. A refresh and a departure look identical, and reallocating on the close would drop the conversation for what is about to be the same device holding the same range. The sweeper removes it once it has really been silent. |
+| a device stops answering mid-lap | the turn fails naming the device and the layers it held; the caches are reset |
+| a device joins that makes the flock unsatisfiable | it is **refused and un-admitted**, so one bad device cannot poison a working flock |
 
 ## Scripts
 
 | command | what it does |
 |---|---|
 | `npm start` | run the coordinator (`PORT` to move off 8000) |
-| `npm run solo` | one process holding every bird slot — no phone needed |
-| `npm run bird` | one simulated bird, claiming the lowest free slot |
+| `npm run solo` | one process holding every layer — no phone needed; `-- solo 3` for three devices |
+| `npm run bird` | one simulated bird |
+| `npm run fake` | a bird that reports arbitrary limits and speed and needs no GPU |
 | `npm run health` | is the flock covered? exits non-zero if not |
 | `npm run status` | full state: birds, transports, cache, recent device errors |
-| `npm test` | syntax, GGUF range planning, both parsers cross-checked, the bird's load path |
+| `npm test` | syntax, allocation, membership, the capability probe, GGUF range planning, both parsers cross-checked, the bird's load path |
+| `npm run test:membership` | dynamic membership against a live coordinator (fake birds, no GPU) |
 | `npm run test:ui` | drives chat.html and bird.html against a live coordinator |
 | `npm run test:gpu` | streams real weights into real GPU buffers |
 | `npm run plan` | what each device would fetch, reading only a GGUF header |
@@ -84,8 +153,12 @@ against itself, which would catch no future kernel regression at all.
 | `src/server.js` | HTTP, SSE chat loop, websocket signaling, kernel serving |
 | `src/coordinator.js` | embedding, layers 0..cut-1, output_norm, tied head, tokenizer |
 | `src/mesh.js` | the flock: slot claiming, liveness, chain topology, WebRTC links |
+| `src/allocate.js` | who holds which layers: makespan over bytes, under each device's limits |
+| `src/speed.js` | per-token timings -> a rate, and whether to act on it |
 | `src/gguf.mjs` | GGUF range planning over HTTP range requests (npm import) |
 | `../kernels/` | the WGSL engine — the same kernels the test suite validates |
+| `../web/js/probe.mjs` | what a device can do: GPU limits plus a real compute pass |
+| `../web/inspect.html` | that probe as a page, at `/check` |
 | `../web/js/gguf-dir.mjs` | the same directory parse, browser-safe |
 | `../web/js/gguf-stream.mjs` | streams GGUF tensors from HuggingFace into GPU buffers |
 | `sim_bird.mjs` | a bird without a browser |
@@ -99,13 +172,16 @@ against itself, which would catch no future kernel regression at all.
 | `GET /flock` | the bird page |
 | `GET /kernels/*.wgsl` | the compute kernels, as-is |
 | `GET /kernels/*.ts.js` | the same kernels, transpiled on request for browsers |
-| `POST /join` | claim a layer slot, get its range, model dims and the GGUF url |
-| `POST /chat` | SSE: `turn`, `hop`, `token`, `done`, `error` |
+| `GET /check` | what can this device do? the same probe a bird runs before joining |
+| `POST /join` | join the flock with your measured `caps`; get a range, model dims and the GGUF url. Answers `{wait: true}` if a token is in flight (send the `peer_id` back when you retry) |
+| `POST /leave` | leave on purpose, so the layers are handed on without waiting out the 40 s grace period |
+| `POST /evict` | throw a device out from the coordinator side |
+| `POST /chat` | SSE: `turn`, `hop`, `token`, `rebalanced`, `done`, `error` |
 | `POST /reset` | drop every device's shard of the KV cache |
-| `GET /status` | birds, transports, cached tokens, recent `/diag` reports |
+| `GET /status` | birds, transports, cached tokens, the full allocation decision, recent `/diag` reports |
 | `GET /health` | 200 when the layers are covered, 503 when not |
 | `POST /diag` | where birds report failures; phones have no readable console |
-| `GET /ws` | websocket: hello, signaling, `ping`, `stats`, binary frames |
+| `GET /ws` | websocket: hello, signaling, `ping`, `stats`, `caps`, `chain` (which can carry a NEW range), binary frames |
 
 ### Serving TypeScript to a browser
 
