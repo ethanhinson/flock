@@ -6,7 +6,7 @@
 // this proves it works.
 //
 // Needs a coordinator with its layers covered:
-//   node src/server.js &  node sim_bird.mjs solo &  node test/chat_ui.test.mjs
+//   npm start &  npm run solo &  FLOCK_URL=... node test/e2e/chat_ui.test.mjs
 import {readFileSync} from 'fs';
 import path from 'path';
 import {fileURLToPath} from 'url';

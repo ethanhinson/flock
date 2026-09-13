@@ -1,6 +1,6 @@
 // How long does one layer's decode step take, and where does the time go?
 //
-//   deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/bench_layer.ts
+//   deno run --unstable-webgpu --allow-all kernels/bench_layer.ts
 //
 // This is the number that decides whether the WGSL engine is viable, so it is
 // measured the same careful way bench.ts is -- see the long note there about

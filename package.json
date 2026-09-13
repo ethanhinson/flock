@@ -1,0 +1,33 @@
+{
+  "name": "flock",
+  "version": "0.2.0",
+  "description": "One language model, split across the devices in the room",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "start": "deno run --unstable-webgpu --allow-all server/server.js",
+    "cert": "bash tools/cert.sh",
+    "bird": "deno run --unstable-webgpu --allow-all tools/sim_bird.mjs",
+    "solo": "deno run --unstable-webgpu --allow-all tools/sim_bird.mjs solo",
+    "fake": "deno run --unstable-webgpu --allow-all tools/sim_bird.mjs --fake",
+    "health": "curl -fsSk ${FLOCK_URL:-https://127.0.0.1:${PORT:-8000}}/health",
+    "status": "curl -fsSk ${FLOCK_URL:-https://127.0.0.1:${PORT:-8000}}/status",
+    "plan": "node tools/plan.mjs",
+    "check": "node tools/check_html.mjs web/*.html && node --check server/*.js server/*.mjs tools/*.mjs test/unit/*.mjs test/e2e/*.mjs web/js/*.mjs",
+    "test": "node test/run.mjs",
+    "test:unit": "node test/run.mjs unit",
+    "test:e2e": "node test/run.mjs e2e",
+    "test:kernels": "node test/run.mjs kernels",
+    "test:gpu": "node test/run.mjs gpu"
+  },
+  "dependencies": {
+    "@huggingface/gguf": "^0.4.6",
+    "@huggingface/transformers": "^4.2.0",
+    "express": "^5.2.1",
+    "node-datachannel": "^0.33.3",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "onnxruntime-node": "^1.29.0"
+  }
+}

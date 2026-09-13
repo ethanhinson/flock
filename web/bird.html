@@ -144,24 +144,49 @@ let ws = null, chan = null, inChan = null, chain = null;
 let rtc = null;      // link FROM the coordinator (or previous bird)
 let outRtc = null;   // link TO the next bird, if we have a successor
 
-/** A failure a person can act on, not a stack trace.
- *
- *  Also hands the slot back: every failure here means this device will never
- *  compute, and holding layers it cannot run stalls the whole flock until the
- *  coordinator restarts.
- */
+/** A failure a person can act on, not a stack trace. Shows it; nothing else. */
 function problem(title, detail, fix) {
   $('ptitle').textContent = title;
   $('pdetail').textContent = detail;
   $('pfix').textContent = fix || '';
   $('problem').classList.add('on');
+}
+const clearProblem = () => $('problem').classList.remove('on');
+
+/** A failure that means this device CANNOT serve: no WebGPU, out of memory, the
+ *  weights would not download or build. Shows it AND hands the layers back, so the
+ *  flock does not stall on a device that will never compute.
+ *
+ *  This used to be every problem(). It must not be: a frame arriving during a
+ *  reassignment -- while the new weights are still streaming -- is not a failure
+ *  of this device, and leaving over it is a membership change, which reallocates
+ *  everyone, which catches the next device mid-stream. That was the cascade
+ *  (joined, left, dropped, joined) that stopped chat completing a turn. */
+function fatal(title, detail, fix) {
+  problem(title, detail, fix);
   if (peerId) {
     fetch('/leave', {method: 'POST', headers: {'Content-Type': 'application/json'},
                      body: JSON.stringify({peer_id: peerId, why: title})})
       .catch(() => {});          // best effort: we are already failing
   }
 }
-const clearProblem = () => $('problem').classList.remove('on');
+
+/** Tell the coordinator the layers for our range are built and on the GPU. It
+ *  sends nothing to a device that has not said this for the range it assigned --
+ *  the readiness handshake -- so it goes after every successful build. */
+function sendReady() {
+  if (!ws || ws.readyState !== 1 || !layers || !layers.length || meta?.start == null) return;
+  ws.send(JSON.stringify({t: 'ready', start: meta.start, end: meta.end}));
+  log(`ready: holding layers ${meta.start}–${meta.end}`, 'ok');
+}
+
+/** Refuse a frame, saying why. The coordinator ends the turn at once instead of
+ *  waiting out its timeout, and this device stays a member. */
+function nack(m, reason, detail) {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({t: 'nack', reason, detail, seq: m?.seq, offset: m?.offset,
+                          start: meta?.start ?? null, end: meta?.end ?? null}));
+}
 
 // NOTE: there is no shard cache here any more. Caching is web/js/gguf-stream.mjs's
 // job now -- it stores the RAW GGUF byte ranges in IndexedDB, which is the same
@@ -246,8 +271,10 @@ let loading = false, pendingChain = null;
   // coordinator admitted us but a token was in flight, so our layers get assigned at
   // the next token boundary -- a reassignment mid-token would move K/V cache the
   // running token is still writing into. That is milliseconds, not a failure.
+  // A join during a turn is applied when the turn ENDS, so this can take as long
+  // as an answer takes to generate; the coordinator keeps our id across retries.
   let j = null;
-  for (let attempt = 0; attempt < 40; attempt++) {
+  for (let attempt = 0; attempt < 150; attempt++) {
     j = await (await fetch('/join', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({peer_id: peerId, label: navigator.platform || 'phone',
@@ -262,14 +289,14 @@ let loading = false, pendingChain = null;
     // There is no "flock full" any more -- any number of devices is allowed in.
     // What CAN fail is that the devices present cannot hold the model, and the
     // coordinator says which tensor on which device and by how much.
-    problem('this flock cannot hold the model', j.error,
-            'Add a device with a bigger maxStorageBufferBindingSize, use a more ' +
-            'quantized model, or open /check on each device to see its limits.');
+    fatal('this flock cannot hold the model', j.error,
+          'Add a device with a bigger maxStorageBufferBindingSize, use a more ' +
+          'quantized model, or open /check on each device to see its limits.');
     return;
   }
   if (j.wait) {
-    problem('the coordinator never assigned any layers', j.reason || 'still waiting',
-            'Reload to try again. If a turn is generating, it will finish first.');
+    fatal('the coordinator never assigned any layers', j.reason || 'still waiting',
+          'Reload to try again. If a turn is generating, it will finish first.');
     return;
   }
   meta = j; peerId = j.peer_id;
@@ -295,7 +322,7 @@ let loading = false, pendingChain = null;
   if (!hasGPU) {
     // Careful with this wording: the GPU is fine, the API is not exposed. Saying
     // "no GPU" sends people looking at hardware that is not the problem.
-    problem('this browser is not exposing WebGPU',
+    fatal('this browser is not exposing WebGPU',
       'The GPU itself is fine — the browser just is not offering the WebGPU API ' +
       'to this page. A bird runs transformer layers as compute shaders, so there ' +
       'is nothing to fall back to.',
@@ -309,7 +336,7 @@ let loading = false, pendingChain = null;
     return;
   }
   if (!meta.gguf) {
-    problem('the coordinator did not say where the weights are',
+    fatal('the coordinator did not say where the weights are',
       'It sent no GGUF url, so there is nothing to download.',
       'Restart the coordinator; it serves one by default.');
     return;
@@ -401,12 +428,13 @@ let loading = false, pendingChain = null;
   // The initial stream is done; anything that arrived while it was in flight can
   // now be applied safely.
   loading = false;
-  if (pendingChain) {
+  if (pendingChain && (pendingChain.start !== meta.start || pendingChain.end !== meta.end)) {
     const p = pendingChain; pendingChain = null;
-    if (p.start !== meta.start || p.end !== meta.end) {
-      log('applying the reassignment that arrived during the download', 'ok');
-      await reassign(p);          // now safe: `loading` is false again
-    }
+    log('applying the reassignment that arrived during the download', 'ok');
+    await reassign(p);            // now safe: `loading` is false again; it confirms
+  } else {
+    pendingChain = null;
+    sendReady();
   }
   await report('gguf-loaded', {
     mb: +(s.bytesTotal / 1e6).toFixed(1), secs: +secs.toFixed(1),
@@ -433,23 +461,25 @@ let loading = false, pendingChain = null;
   const m = String(e.message || e);
   log('load failed: ' + m, 'bad');
   report('load-failed', m);
+  // All three are fatal: a device that could not get its weights onto the GPU
+  // cannot serve, and must hand its layers back rather than stall the flock.
   if (/memory|allocation|OOM/i.test(m)) {
     // The underlying message is included, not swallowed. A phone has no console,
     // so this banner is the ONLY place the real error can be read -- and "ran out
     // of memory" alone does not distinguish a 67MB stream that failed from a
     // buffer the driver refused, which are different fixes.
-    problem('this device ran out of memory',
+    fatal('this device ran out of memory',
       'The weights needed more memory than this device would give the browser.\n' +
       m,
       'Try: close other tabs and apps, then reload. Or open /flock on another ' +
       'device and tap join — the coordinator re-splits the layers across however ' +
       'many devices are present, so each one holds fewer.');
   } else if (/fetch failed|short read|NetworkError|Load failed/i.test(m)) {
-    problem('the download did not finish', m,
+    fatal('the download did not finish', m,
       'Check that this device is still on the same wifi as the coordinator, ' +
       'then reload.');
   } else {
-    problem('could not load my layers', m,
+    fatal('could not load my layers', m,
       'The coordinator was told about this. Reload to try again.');
   }
 });
@@ -636,24 +666,40 @@ async function applyReassign(m) {
     log(`holding layers ${meta.start}–${meta.end} now`, 'ok');
     if (m.next_peer && !chan) openRTC(m.next_peer);
     showLink();
+    // Only now may the coordinator send frames for this range.
+    sendReady();
   } catch (e) {
     const msg = String(e.message || e);
     layers = [];
     log('reassignment failed: ' + msg, 'bad');
     report('reassign-failed', msg);
-    problem('could not take the new layers', msg,
+    fatal('could not take the new layers', msg,
       'The coordinator gave this device a different share and the weights did not ' +
       'load. Reload to rejoin; the coordinator will hand these layers to another ' +
       'device meanwhile.');
   }
 }
 
-/** Run one frame and hand the result on; any throw here is fatal to the lap, so
- *  report it rather than letting the coordinator just time out. */
+/** Run one frame and hand the result on.
+ *
+ *  A frame we cannot serve is REFUSED (a nack), never a reason to leave. The two
+ *  cases are different and are told apart: between assignments or mid-stream we
+ *  hold nothing -- the coordinator should not have sent it, and its readiness
+ *  handshake exists so it does not -- and a frame that fails to compute is
+ *  reported with its error. The coordinator removes a device only after it has
+ *  failed to compute several frames in a row. */
 async function handleFrame(buf) {
+  let m = null;
   try {
-    const {data, meta: m} = unpack(buf);
-    const {out, ms} = await runFrame(data, m);
+    const parsed = unpack(buf);
+    m = parsed.meta;
+    if (loading || !layers || !layers.length) {
+      const why = loading ? 'still streaming the weights' : 'holding no layers';
+      log(`refused a frame: ${why} (seq ${m.seq})`, 'bad');
+      nack(m, 'not-ready', why);
+      return;
+    }
+    const {out, ms} = await runFrame(parsed.data, m);
     forward(out, m);
     ws.send(JSON.stringify({t: 'stats', ms}));
     clearProblem();
@@ -661,9 +707,10 @@ async function handleFrame(buf) {
     const msg = String(e.message || e);
     log('frame failed: ' + msg, 'bad');
     report('frame-failed', msg);
+    nack(m, 'failed', msg);
     problem('a frame failed to compute', msg,
-      'The coordinator will report this conversation as stalled. Reload this ' +
-      'page to rejoin with a clean cache.');
+      'The coordinator ended that turn. If this keeps happening it will drop this ' +
+      'device; reload this page to rejoin with a clean cache.');
   }
 }
 
@@ -760,6 +807,9 @@ function connect() {
     ws.send(JSON.stringify({t: 'ping'}));
     clearInterval(beat);
     beat = setInterval(() => running && ws.send(JSON.stringify({t: 'ping'})), 4000);
+    // A reconnect with layers already built: the coordinator may have been told
+    // once, but a fresh socket is cheap to re-confirm on and silence is not.
+    if (!loading) sendReady();
   };
   ws.onmessage = ev => {
     if (typeof ev.data === 'string') {

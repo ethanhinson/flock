@@ -2,7 +2,7 @@
 //
 // Holds the embedding, layers 0..cut-1, output_norm and the tied vocab
 // projection, all as WGSL compute kernels over Q8_0 weights read straight out of
-// a GGUF file. No ONNX, no Python export, no build step, no artifacts on disk
+// a GGUF file. No ONNX, no export, no build step, no artifacts on disk
 // beyond the cached model file itself.
 //
 // WHY THIS RUNS UNDER DENO AND NOT NODE. The coordinator needs a GPU, and Node
@@ -12,7 +12,7 @@
 // rest of the stack unchanged through its node compatibility layer -- express,
 // ws, node-datachannel and @huggingface/transformers all import and work -- so
 // the whole server moved to one runtime rather than being split across two
-// processes with a socket between them. See node/README.md.
+// processes with a socket between them. See README.md.
 //
 // The alternative designs were considered and rejected: a browser-hosted
 // coordinator (what swarmllm does) makes the thing you have to keep open a tab
@@ -25,10 +25,10 @@
 // proves that engine generates the same token ids as the ONNX pipeline, and
 // kernels/test_split.ts proves cutting it changes nothing -- so the inference
 // path here inherits both.
-import { getDevice } from '../../kernels/lib.ts';
-import { Model } from '../../kernels/model.ts';
-import { QWEN3_06B } from '../../kernels/layer.ts';
-import { realModel } from '../../kernels/real_weights.ts';
+import { getDevice } from '../kernels/lib.ts';
+import { Model } from '../kernels/model.ts';
+import { QWEN3_06B } from '../kernels/layer.ts';
+import { realModel } from '../kernels/real_weights.ts';
 import { AutoTokenizer } from '@huggingface/transformers';
 
 /** Where the tokenizer comes from.

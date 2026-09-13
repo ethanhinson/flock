@@ -24,10 +24,10 @@
 // including why an oversized binding is a silent wrong answer rather than a throw.
 //
 // WHERE output_norm GOES, because the ONNX export puts it somewhere surprising and
-// copying that layout would be wrong. flock_export_coordinator.py builds
+// copying that layout would be wrong. the export built
 // head.onnx as `Head(model.model.norm, model.lm_head)` whose forward is
 // `self.head(hidden).argmax(-1)` -- it stores the norm and never calls it. The
-// final RMSNorm is instead applied by the LAST SHARD (flock_export.py, `hidden =
+// final RMSNorm is instead applied by the LAST SHARD (the export applied `hidden =
 // self.norm(hidden) if self.is_last`). So the real ONNX pipeline is
 // embed -> layers -> [last shard applies output_norm] -> lm_head -> argmax, and
 // that is what this reproduces: output_norm here, before the projection, exactly

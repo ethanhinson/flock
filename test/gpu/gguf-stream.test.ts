@@ -1,6 +1,6 @@
 // Prove the streaming loader against the real Qwen3-0.6B file on HuggingFace.
 //
-//   npm run test:gpu       (from node/)
+//   npm run test:gpu
 //   deno run --config kernels/deno.json --unstable-webgpu --allow-all \
 //     web/js/gguf-stream.test.ts
 //
@@ -31,7 +31,7 @@
 import {
   loadLayersToGPU, readDirectory, layerTensors, byteRanges, totalBytes,
   streamTensorToGPU, fetchRange, STAGING, allocStorage,
-} from "./gguf-stream.mjs";
+} from "../../web/js/gguf-stream.mjs";
 import { splitQ8 } from "../../kernels/lib.ts";
 import { realLayer } from "../../kernels/real_weights.ts";
 

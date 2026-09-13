@@ -160,7 +160,7 @@ let busy = false;         // a turn is streaming right now
 let shape = '';
 function drawPipe(s) {
   const sig = JSON.stringify(s.birds.map(b =>
-    [b.slot, b.start, b.end, b.alive, b.transport, b.label]));
+    [b.slot, b.start, b.end, b.alive, b.transport, b.label, b.ready]));
   if (sig === shape) {
     // Same devices: refresh only the volatile fields.
     for (const b of s.birds) {
@@ -197,7 +197,12 @@ function drawPipe(s) {
     const w = el('div', 'who');
     w.append(el('span', 'dot ' + (b.alive ? 'up' : 'down')),
              el('span', null, b.label && b.label !== '?' ? b.label : `bird ${b.slot}`));
-    const ms = el('div', 'ms', b.alive ? (b.last_ms ? fmt(b.last_ms) + ' ms' : 'ready') : 'waiting');
+    // Assigned is not holding: a device that was just given a range is streaming
+    // its weights and has confirmed nothing yet. Say "loading" rather than
+    // "ready" for that window, because a turn will wait on it.
+    const ms = el('div', 'ms', !b.alive ? 'waiting'
+      : b.ready === false ? 'loading'
+      : (b.last_ms ? fmt(b.last_ms) + ' ms' : 'ready'));
     ms.id = `ms${b.slot}`;
     const via = el('div', 'via', b.alive ? (b.transport || 'ws') : 'offline');
     via.id = `via${b.slot}`;
@@ -260,9 +265,15 @@ function drawAlloc(s) {
 
 function drawHead(s) {
   const devices = s.birds.filter(b => b.alive).length + 1;
+  const esc = t => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;');
   if (s.ready) {
     $('sub').innerHTML = `<span class="ok">${s.n_total} layers · ${devices} devices</span>` +
       ` · ${s.model || 'model'} · kv ${s.kv_cache ? 'on' : 'off'} · wire ${s.wire}`;
+  } else if (s.covered && (s.pending || []).length) {
+    // Every layer is assigned; some devices are still streaming their share. A
+    // turn sent now waits for them, so this is a note rather than an error.
+    $('sub').innerHTML = `<span class="w">loading: ` +
+      esc(s.pending.map(p => `${p.label} (layers ${p.range})`).join(', ')) + `</span>`;
   } else {
     $('sub').innerHTML = `<span class="bad">waiting for layers ${s.missing.join(', ')}</span>` +
       ` — open <a href="/flock" style="color:var(--dim)">/flock</a> on each device`;
@@ -274,7 +285,9 @@ function drawHead(s) {
     ? `<span style="color:var(--bad)">${d.length} device error${d.length > 1 ? 's' : ''}</span>`
     : '';
   $('diag').title = d.map(x => `${x.device}: ${x.stage} — ${x.detail}`).join('\n');
-  $('send').disabled = busy || !s.ready;
+  // Covered is enough to send: the coordinator waits for loading devices itself
+  // and streams `waiting` events while it does.
+  $('send').disabled = busy || !(s.covered ?? s.ready);
 }
 
 async function poll() {
@@ -391,6 +404,15 @@ async function send(prompt, {reset = false} = {}) {
           body.textContent = text;
           body.append(cur);
           $('convo').scrollTop = $('convo').scrollHeight;
+        } else if (ev.type === 'waiting') {
+          // The coordinator is holding the turn until the devices that were just
+          // (re)assigned have their weights. Show who, so a 10-second pause reads
+          // as "the iPhone is loading layers 4-15" and not as a hang.
+          cur.remove();
+          body.textContent = `waiting for ` + ev.pending
+            .map(p => `${p.label} to load layers ${p.range}`).join(', ') +
+            ` (${Math.round(ev.waited_ms / 1000)}s)`;
+          body.append(cur);
         } else if (ev.type === 'hop') {
           hops.push(ev);
           flash('coord', 0);
@@ -413,7 +435,7 @@ async function send(prompt, {reset = false} = {}) {
           return;
         } else if (ev.type === 'done') {
           cur.remove();
-          if (!text) body.textContent = ev.text || '(nothing generated)';
+          body.textContent = text || ev.text || '(nothing generated)';
           const wall = (Date.now() - t0) / 1000;
           const why = {eos: '', length: ' · hit the token cap',
                        aborted: ' · stopped',

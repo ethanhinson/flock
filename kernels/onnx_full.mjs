@@ -17,8 +17,8 @@
 //   head.onnx       hidden -> argmax token id
 //
 // The final RMSNorm (model.model.norm / output_norm.weight) lives in the LAST
-// SHARD, not in head.onnx. flock_export.py applies it when is_last, and
-// flock_export_coordinator.py builds head.onnx as `Head(norm, lm_head)` whose
+// SHARD, not in head.onnx. The export applied it when is_last, and
+// built head.onnx as `Head(norm, lm_head)` whose
 // forward is `self.head(hidden).argmax(-1)` -- it takes the norm in its
 // constructor and never calls it. Reading head.onnx as "norm then project" and
 // applying output_norm twice on the WGSL side would be a subtle, plausible-looking
@@ -41,7 +41,7 @@ if (!inPath || !outPath) {
 const req = JSON.parse(readFileSync(inPath, 'utf8'));
 
 const ortPath = req.ort ??
-  new URL('../node/node_modules/onnxruntime-node/dist/index.js', import.meta.url).pathname;
+  new URL('../node_modules/onnxruntime-node/dist/index.js', import.meta.url).pathname;
 if (!existsSync(ortPath)) {
   console.error(`onnxruntime-node not found at ${ortPath}`);
   process.exit(3);
@@ -49,7 +49,7 @@ if (!existsSync(ortPath)) {
 const ort = (await import(`file://${ortPath}`)).default;
 
 const {
-  coordDir,            // web/coord: embed.onnx, layers.onnx, head.onnx, coord.json, tok/
+  coordDir,            // the export dir: embed.onnx, layers.onnx, head.onnx, coord.json, tok/
   shards = [],         // [{path, n_layers}] in order, covering the layers coord does not
   prompt,              // raw text; the chat template is applied here
   ids: rawIds,         // OR explicit token ids, skipping the tokenizer
@@ -62,14 +62,14 @@ const meta = JSON.parse(readFileSync(join(coordDir, 'coord.json'), 'utf8'));
 
 // --- tokenizer -------------------------------------------------------------
 // The chat template with enable_thinking:false, then encode with
-// add_special_tokens:false -- matching node/src/coordinator.js exactly, because a
+// add_special_tokens:false -- matching server/coordinator.js exactly, because a
 // different template produces a different prompt and therefore different text,
 // which would look like an engine bug.
 let ids = rawIds;
 let tok = null;
 if (!ids) {
   const tfPath = req.transformers ??
-    new URL('../node/node_modules/@huggingface/transformers/dist/transformers.mjs',
+    new URL('../node_modules/@huggingface/transformers/dist/transformers.mjs',
       import.meta.url).pathname;
   const { AutoTokenizer } = await import(`file://${tfPath}`);
   tok = await AutoTokenizer.from_pretrained(join(coordDir, 'tok'), { local_files_only: true });

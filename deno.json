@@ -1,4 +1,6 @@
 {
+  "//": "Everything runs under Deno because the coordinator needs a GPU and Node has no WebGPU. The dependencies are still npm packages installed by `npm install`, so nodeModulesDir is 'manual': Deno resolves express/ws/node-datachannel out of node_modules rather than fetching its own copies. The import map lets kernels/*.ts reach @huggingface/gguf by its bare name from any directory.",
+  "nodeModulesDir": "manual",
   "imports": {
     "@huggingface/gguf": "npm:@huggingface/gguf@^0.4.6"
   }

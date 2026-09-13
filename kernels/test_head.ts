@@ -1,7 +1,7 @@
 // Validate the three kernels that surround the layer stack, EACH ON ITS OWN,
 // against a CPU reference -- before any of them is composed into a forward pass.
 //
-//   deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_head.ts
+//   deno run --unstable-webgpu --allow-all kernels/test_head.ts
 //
 //   embed.wgsl              Q8_0 row gather + dequantize
 //   argmax.wgsl             two-stage max-index reduction

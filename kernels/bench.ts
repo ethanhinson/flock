@@ -1,6 +1,6 @@
 // Benchmark the matvec kernels at the shapes Qwen3-0.6B actually uses.
 //
-//   deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/bench.ts
+//   deno run --unstable-webgpu --allow-all kernels/bench.ts
 //
 // READ THIS BEFORE TRUSTING ANY GPU NUMBER FROM DENO.
 //

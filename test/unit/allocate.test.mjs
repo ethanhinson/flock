@@ -10,10 +10,10 @@
 // Needs no GPU and no network, which is why it belongs in `npm test`.
 //
 //   node test/allocate.test.mjs
-import {allocate, device, layerPlan, Infeasible, explain, DEFAULT_RATE}
-  from '../src/allocate.js';
+import {allocate, adjust, device, layerPlan, Infeasible, explain, DEFAULT_RATE}
+  from '../../server/allocate.js';
 import {Rate, shouldRebalance, currentMakespan, MIN_SAMPLES, MIN_GAIN, COOLDOWN_MS,
-        MIN_MS} from '../src/speed.js';
+        MIN_MS} from '../../server/speed.js';
 
 let pass = 0, fail = 0;
 const ok = (name, cond, extra = '') => {
@@ -454,6 +454,62 @@ console.log('\nlayerPlan reads bytes and the largest tensor out of a header:');
 console.log('\ncurrentMakespan is the slowest stage, not the sum:');
 ok('two 10ms stages cost 10ms, not 20',
    currentMakespan([{bytes: 10 * MB, rate: 1e6}, {bytes: 10 * MB, rate: 1e6}]) === 10);
+
+// =========================================================================
+console.log('\nadjust(): a membership change is a local edit, not a re-partition:');
+{
+  const ls = layers(4, 24);
+  const a = device({id: 'a'}), b = device({id: 'b'}), c = device({id: 'c'});
+  const show = r => r.assign.map(x => `${x.id}:${x.start}-${x.end}`).join(' ');
+  const moved = (before, after) => after.assign
+    .filter(x => { const p = before.find(y => y.id === x.id);
+                   return !p || p.start !== x.start || p.end !== x.end; })
+    .map(x => x.id);
+
+  let r = adjust(ls, [], [a]);
+  ok('with nothing to be sticky to it falls through to the exact search',
+     r.sticky === false && show(r) === 'a:4-27', show(r));
+  const one = r.assign;
+  r = adjust(ls, one, [a, b]);
+  ok('a second device takes half off the first', r.sticky && show(r) === 'a:4-15 b:16-27',
+     show(r));
+  const two = r.assign;
+  r = adjust(ls, two, [a, b, c]);
+  ok('a third takes a run off ONE incumbent and the other is untouched',
+     r.sticky && moved(two, r).length === 2 && covers(r.assign, ls), show(r));
+  ok('  and the donor and newcomer are balanced, not 1 layer vs 11',
+     r.assign.every(x => x.layers >= 6), show(r));
+  const three = r.assign;
+
+  // Departure: only the neighbours absorb the run.
+  r = adjust(ls, three, [a, c]);
+  ok('when b leaves its layers go to a neighbour and nobody else moves',
+     r.sticky && moved(three, r).length <= 2 && covers(r.assign, ls), show(r));
+
+  // Limits are respected by the edit, and an impossible edit falls back.
+  const small = device({id: 's', budget: 2 * 20 * MB});
+  r = adjust(ls, three, [a, b, c, small]);
+  ok('a newcomer with a small budget gets a run it can hold',
+     r.assign.find(x => x.id === 's').layers <= 2 && covers(r.assign, ls), show(r));
+  const cannot = device({id: 'x', bind: 1});
+  let e = null;
+  try { adjust(ls, three, [a, b, c, cannot]); } catch (err) { e = err; }
+  ok('a newcomer that fits nowhere is Infeasible with the precise reason, via the exact search',
+     e instanceof Infeasible, e?.message.slice(0, 60));
+
+  // An incumbent whose limits shrank under it is not silently kept.
+  const shrunk = device({id: 'a', bind: 1});
+  e = null;
+  try { adjust(ls, two, [shrunk, b]); } catch (err) { e = err; }
+  ok('an incumbent that no longer fits its own run is re-examined, not trusted',
+     e instanceof Infeasible, e?.message.slice(0, 60));
+
+  // The coordinator's own work still counts.
+  const busy = device({id: 'k', reservedMs: 1000});
+  r = adjust(ls, two, [a, b, busy]);
+  ok('a device charged reservedMs is given a correspondingly small run',
+     r.assign.find(x => x.id === 'k').layers === 1, show(r));
+}
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

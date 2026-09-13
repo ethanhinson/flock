@@ -9,7 +9,7 @@
 //
 // Only the tensor's own byte range is fetched (1-3MB), not the model.
 
-import { readModel, fetchRange, layerTensors } from "../node/src/gguf.mjs";
+import { readModel, fetchRange, layerTensors } from "../server/gguf.mjs";
 import type { LayerWeights } from "./layer.ts";
 
 const MODEL = "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf";

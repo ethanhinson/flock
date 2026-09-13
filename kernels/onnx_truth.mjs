@@ -1,4 +1,4 @@
-// Run web/shard0.onnx (Qwen3 layers 24-25) under onnxruntime-node and dump its
+// Run the ONNX shard (Qwen3 layers 24-25) under onnxruntime-node and dump its
 // output, so the WGSL layer can be diffed against the engine flock uses today.
 //
 //   node kernels/onnx_truth.mjs <in.json> <out.json>
@@ -31,23 +31,23 @@ if (!inPath || !outPath) {
   process.exit(2);
 }
 
-// onnxruntime-node is a native addon installed under node/node_modules, and the
+// onnxruntime-node is a native addon installed under node_modules, and the
 // caller may pass an explicit path because a git worktree does not have its own
 // node_modules. Import by URL so no resolution config is needed.
 const req0 = JSON.parse(readFileSync(inPath, 'utf8'));
 const ortPath = req0.ort ??
-  new URL('../node/node_modules/onnxruntime-node/dist/index.js', import.meta.url).pathname;
+  new URL('../node_modules/onnxruntime-node/dist/index.js', import.meta.url).pathname;
 if (!existsSync(ortPath)) {
   console.error(`onnxruntime-node not found at ${ortPath}. It is a devDependency of ` +
-    `node/ and is not installed in a worktree; pass {"ort": "<path>"} in the input ` +
-    `JSON to point at an existing install, or run npm install in node/.`);
+    `the repo and is not installed in a worktree; pass {"ort": "<path>"} in the input ` +
+    `JSON to point at an existing install, or run npm install.`);
   process.exit(3);
 }
 const ort = (await import(`file://${ortPath}`)).default;
 
 const req = req0;
 const {
-  shard = new URL('../web/shard0.onnx', import.meta.url).pathname,
+  shard = new URL('./.ref/shard0.onnx', import.meta.url).pathname,
   hidden,          // flat f32, length nTokens * 1024
   nTokens = 1,
   positions,       // int64 position ids, length nTokens

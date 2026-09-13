@@ -1,7 +1,7 @@
 // Whole-layer validation: layerForward() against a CPU reference layer, on REAL
 // Qwen3-0.6B weights range-fetched from HuggingFace.
 //
-//   deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_layer.ts
+//   deno run --unstable-webgpu --allow-all kernels/test_layer.ts
 //
 // The per-op tests (test_ops.ts, test_coop.ts) already establish that each kernel
 // computes the right function. What is left for a whole-layer test is the WIRING:
@@ -16,7 +16,7 @@
 // makes a disagreement diagnosable: the arithmetic is already known to match, so
 // any gap is in the order of operations.
 //
-// NOTE ON GROUND TRUTH: the ONNX shards (web/shard0.onnx, layers 24-25) are
+// NOTE ON GROUND TRUTH: the ONNX shards (shard0.onnx, layers 24-25) are
 // gitignored build artifacts and are not present in this worktree, so a direct
 // GPU-vs-ONNX diff was not run. The reference here is independent of the kernels
 // in structure but not in provenance -- it shares the per-op references. What it
@@ -32,7 +32,7 @@ import { realLayer } from "./real_weights.ts";
 const dev = await getDevice();
 const cfg = QWEN3_06B;
 
-const LAYER = 24;   // the layer web/shard0.onnx runs first
+const LAYER = 24;   // the layer shard0.onnx runs first
 console.log(`loading blk.${LAYER}.* from Qwen3-0.6B-Q8_0.gguf ...`);
 const w = await realLayer(LAYER);
 console.log(`  q8 tensors: ${Object.keys(w.q8).join(", ")}`);

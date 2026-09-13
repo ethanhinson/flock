@@ -1,6 +1,6 @@
 // Memory accounting: each shard's buffers stay under a configurable limit.
 //
-//   deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_shard_mem.ts
+//   deno run --unstable-webgpu --allow-all kernels/test_shard_mem.ts
 //
 // THIS IS THE DELIVERABLE TENSOR PARALLELISM EXISTS FOR, so it is asserted as
 // arithmetic and then as an actual upload, not one or the other.

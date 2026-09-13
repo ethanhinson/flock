@@ -1,7 +1,7 @@
 // What tensor parallelism COSTS, on one device: unsharded vs 2/4/8-way, both
 // directions, with the reduction measured separately.
 //
-//   deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/bench_shard.ts
+//   deno run --unstable-webgpu --allow-all kernels/bench_shard.ts
 //
 // WHAT THIS CAN AND CANNOT MEASURE, stated first so no number here is read as
 // something it is not.

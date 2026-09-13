@@ -1,6 +1,6 @@
 // Validate a PREFILL through one real Qwen3 layer, on the GPU, three ways.
 //
-//   deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_prefill.ts
+//   deno run --unstable-webgpu --allow-all kernels/test_prefill.ts
 //
 // The three checks are deliberately different in kind, because prefill has failure
 // modes that a single comparison cannot separate:

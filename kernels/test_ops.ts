@@ -3,7 +3,7 @@
 // CPU reference BEFORE anything composes them, because a wrong op inside a
 // composed layer is nearly impossible to isolate afterwards.
 //
-//   deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_ops.ts
+//   deno run --unstable-webgpu --allow-all kernels/test_ops.ts
 //
 // Which ops can be bit-exact and which cannot:
 //

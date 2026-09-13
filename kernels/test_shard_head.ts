@@ -1,6 +1,6 @@
 // A row-wise sharded LM head picks the same token as the unsharded one.
 //
-//   deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_shard_head.ts
+//   deno run --unstable-webgpu --allow-all kernels/test_shard_head.ts
 //
 // THIS IS THE MOTIVATING CASE, not a synthetic one. The LM head is the largest
 // single tensor in any of these models and the one that cannot be split by layer
