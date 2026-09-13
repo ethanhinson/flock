@@ -742,7 +742,14 @@ wss.on('connection', ws => {
         bird = flock.byPeer(m.peer_id);
         if (!bird) return ws.send(JSON.stringify({error: 'unknown peer — rejoin'}));
         bird.ws = ws; bird.label = m.label || bird.label;
-        bird.transport = 'ws'; bird.lastSeen = Date.now();
+        // Do NOT clobber an open data channel. `transport` is what actually
+        // carries frames, and a hello can arrive after the channel is up (a
+        // reconnect, or a reassignment that re-runs the handshake) -- writing 'ws'
+        // here made the coordinator report 'ws' while the device correctly showed
+        // 'webrtc', because the page reads its real channel state and this field
+        // was just the last thing written.
+        if (!bird.chanOpen()) bird.transport = 'ws';
+        bird.lastSeen = Date.now();
         // A device that was admitted but not placed (it joined mid-token) becomes
         // placeable the moment it is answering. Between turns that is now.
         if (!bird.placed() && !convo.busy) {
