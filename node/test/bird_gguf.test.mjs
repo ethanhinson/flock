@@ -367,5 +367,25 @@ check('and it is NOT reported as "flock full" any more',
   !/full/i.test(r.title + r.detail), r.title);
 check('nothing was downloaded and nothing was built', r.built === 0, `built ${r.built}`);
 
+console.log('\na rejoin whose caps are rejected -> told, and told what it means:');
+globalThis.__built = 0;
+r = await run({gguf: GGUF_URL, gpu: fakeGPU, ggufModule: OK_GGUF, layerModule: OK_LAYER,
+  // What the coordinator answers a REJOINING device whose freshly probed limits would
+  // break the flock: it keeps the device on the limits it joined with rather than
+  // throwing a working device out, and says so. Silently ignoring the new numbers would
+  // leave the device believing a limit the coordinator is not planning against.
+  join: () => ({peer_id: 'test',
+    error: 'this device cannot hold layer 24: its largest tensor ' +
+           'blk.24.ffn_down.weight is 3.3MB, but this device reported a ' +
+           'maxStorageBufferBindingSize of 1.0MB. The coordinator kept this device ' +
+           'on the limits it joined with, so its current layers are unchanged.',
+    detail: {kind: 'caps-rejected'}})});
+check('did NOT proceed to load on rejected caps', !r.joined);
+check('showed a problem banner', r.problem);
+check('the whole explanation reaches the UI, including what was kept',
+  /kept this device on the limits it joined with/.test(r.detail),
+  r.detail.slice(0, 90));
+check('built nothing', r.built === 0, `built ${r.built}`);
+
 console.log(`\n${fails ? `${fails} failed` : 'all checks passed'}`);
 process.exit(fails ? 1 : 0);

@@ -331,6 +331,58 @@ console.log('\nthe lap goes through the placed birds in LAYER order:');
 }
 
 // =========================================================================
+console.log('\na sweep re-plans, so the freed layers are not left orphaned:');
+{
+  const f = new Flock(LAYERS(8, 0));
+  const a = join(f, 'a'); join(f, 'b');
+  f.plan({force: true});
+  a.ws = null; a.lastSeen = Date.now() - 60000;
+  const gone = f.sweep();
+  ok('the silent device is removed', gone.length === 1, gone.join(','));
+  // The bug this pins: sweep() removing a device and NOT re-planning leaves its layers
+  // assigned to nobody, so the flock reports itself uncovered until some caller
+  // remembers to rebalance. Correct only for as long as every caller remembers.
+  ok('  and its layers are already re-assigned, with no caller doing anything',
+     f.ready() && ranges(f) === 'b:0-7', ranges(f));
+  ok('a sweep that removes nothing does not touch the plan',
+     f.sweep().length === 0 && ranges(f) === 'b:0-7');
+}
+
+// =========================================================================
+console.log('\na REJOIN reporting worse limits cannot poison a working flock:');
+{
+  // The commonest path into /join is a reload: bird.html keeps its peer id in
+  // localStorage and re-probes on every load, so "already a member" is normal, not an
+  // edge case. If the new caps make the flock infeasible, the earlier version skipped
+  // its rollback because the id was KNOWN -- and then every device was unplaced and
+  // nothing recovered until 40s of silence let the sweeper run.
+  const ls = LAYERS(4, 0, 20 * MB);
+  const f = new Flock(ls);
+  const a = join(f, 'a', {caps: {maxStorageBufferBindingSize: 4 * 1024 ** 3}});
+  const b = join(f, 'b', {caps: {maxStorageBufferBindingSize: 4 * 1024 ** 3}});
+  f.plan({force: true});
+  const before = ranges(f);
+  ok('two healthy devices cover the layers', f.ready(), before);
+
+  // `a` reloads and now reports a limit below the smallest layer's largest tensor.
+  const prevCaps = {...a.caps};
+  f.claim('a', 'a', {maxStorageBufferBindingSize: 1});
+  f.plan({force: true});
+  ok('the new caps do make it infeasible', !!f.infeasible,
+     f.infeasible?.message.slice(0, 60));
+  ok('  and everyone is unplaced, which is why it must be undone',
+     f.birds.every(x => !x.placed()));
+
+  // The server's rollback for a KNOWN device: put its old caps back, re-plan.
+  f.setCaps(a, prevCaps);
+  f.plan({force: true});
+  ok('restoring its previous caps restores the whole flock',
+     f.ready() && !f.infeasible && ranges(f) === before, ranges(f));
+  ok('  and it is still a member on the range it already loaded',
+     f.byPeer('a') !== null && a.placed(), `a holds ${a.start}-${a.end}`);
+}
+
+// =========================================================================
 console.log('\n200 rounds of churn never break the invariants:');
 {
   // The properties that, if they ever fail, produce WRONG TEXT rather than an error:

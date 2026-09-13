@@ -255,7 +255,15 @@ app.use('/kernels', express.static('kernels'));
 // back through /diag either way.
 app.post('/join', (req, res) => {
   const pid = req.body.peer_id || randomBytes(4).toString('hex');
-  const known = !!flock.byPeer(pid);
+  // Remember the CAPS this device was a member under, so a rejoin whose new caps break
+  // the flock can be put back the way it was. A reload is the commonest path through
+  // here -- bird.html keeps its peer id in localStorage and re-probes on every load --
+  // so "this device was already a member" is not a reason to skip the rollback below.
+  // Measured: a rejoin reporting a smaller limit made every assignment infeasible, and
+  // because the id was known the rollback was skipped, every device was unplaced, and
+  // nothing recovered until 40s of silence let the sweeper run.
+  const was = flock.byPeer(pid);
+  const prevCaps = was ? {...was.caps} : null;
   const bird = flock.claim(pid, req.body.label || 'phone', req.body.caps || null);
 
   // A join mid-token cannot take effect mid-token: the running token is filling
@@ -266,22 +274,43 @@ app.post('/join', (req, res) => {
   else rebalance({force: true, why: `${bird.label} joined`});
 
   if (flock.infeasible) {
-    // ADMITTING THIS DEVICE IS WHAT BROKE IT -- so un-admit it, rather than letting
-    // one bad device poison a flock that was working. Measured: a phone reporting a
-    // 1MB binding limit joined, made every assignment infeasible, and stayed a member
-    // forever, so the flock never recovered even after a capable device arrived. A
-    // device that cannot be part of a working flock is not a member of it.
-    const fault = !known;
-    if (fault) {
+    // THIS JOIN IS WHAT BROKE IT -- so undo it, rather than letting one bad device
+    // poison a flock that was working. Measured: a phone reporting a 1MB binding limit
+    // joined, made every assignment infeasible, and stayed a member forever, so the
+    // flock never recovered even after a capable device arrived. A device that cannot
+    // be part of a working flock is not a member of it.
+    //
+    // Two shapes of undo, because the two arrivals are different. A NEW device is
+    // removed outright. A REJOINING one keeps its membership and gets its old caps
+    // back: its layers and its loaded weights are still good under the numbers it was
+    // admitted with, and throwing it out for reporting a worse limit on a reload would
+    // take a working device out of the flock to punish it for being honest.
+    const refuse = reason => {
+      flock.announce();
+      console.log(`refused ${bird.label} (${pid}): ${reason}`);
+      return res.status(409).json({
+        error: whyRefused(bird), detail: {kind: 'device-cannot-participate'},
+        peer_id: pid, wait: false});
+    };
+    if (!prevCaps) {
       flock.release(pid);
       const after = flock.plan({force: true});
-      // If removing it fixed things, the message the device gets is about ITSELF.
+      if (!flock.infeasible) return refuse(after.reason);
+    } else {
+      const rejected = whyRefused(bird);
+      flock.setCaps(bird, prevCaps);
+      const after = flock.plan({force: true});
       if (!flock.infeasible) {
         flock.announce();
-        console.log(`refused ${bird.label} (${pid}): ${after.reason}`);
+        console.log(`kept ${bird.label} (${pid}) on its previous limits: ${rejected}`);
+        // It stays in the flock on the range it already has, and is told why the new
+        // numbers were not taken -- silently ignoring them would leave a device
+        // believing a limit the coordinator is not planning against.
         return res.status(409).json({
-          error: whyRefused(bird), detail: {kind: 'device-cannot-participate'},
-          peer_id: pid, wait: false});
+          error: `${rejected} The coordinator kept this device on the limits it ` +
+                 `joined with, so its current layers are unchanged. Reload to try ` +
+                 `again, or open /check to see what this device now reports.`,
+          detail: {kind: 'caps-rejected'}, peer_id: pid, wait: false});
       }
     }
     // Say so BEFORE the device downloads anything. This is the whole reason the

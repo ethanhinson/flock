@@ -268,8 +268,15 @@ export class Flock {
       b.label = label;
     }
     if (caps) this.setCaps(b, caps);
-    b.lastSeen = this.now();
-    b.claimedAt = this.now();
+    // Date.now(), NOT this.now(). The two are the same clock in production, but they
+    // are different CLOCKS: `now` is injectable so a test can fast-forward the
+    // rebalancer's cooldown, while LIVENESS is judged against real wall time by
+    // alive(), claimed() and members(), and by Bird.deliver() when a frame arrives.
+    // Writing this field from the injectable one would give it two writers on
+    // different time bases, and a test that jumps the cooldown forward would also
+    // declare every device either decades stale or impossibly fresh.
+    b.lastSeen = Date.now();
+    b.claimedAt = Date.now();
     return b;
   }
 
@@ -320,7 +327,14 @@ export class Flock {
     // layers nobody ever gives away.
     const keep = new Set(this.members(grace));
     const gone = this.birds.filter(b => !keep.has(b));
+    if (!gone.length) return [];
     for (const b of gone) this.release(b.peerId);
+    // Re-plan HERE, not only in the caller. Removing a device leaves its layers
+    // assigned to nobody, so a sweep that does not re-plan leaves the flock not-ready
+    // with a hole in the chain -- correct only for as long as every caller remembers to
+    // rebalance afterwards. Announcing is still the caller's job: it owns the
+    // conversation state that a move invalidates.
+    this.plan({force: true});
     return gone.map(b => b.peerId);
   }
 
