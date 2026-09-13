@@ -282,7 +282,14 @@ app.post('/join', (req, res) => {
   // nothing recovered until 40s of silence let the sweeper run.
   const was = flock.byPeer(pid);
   const prevCaps = was ? {...was.caps} : null;
-  const bird = flock.claim(pid, req.body.label || 'phone', req.body.caps || null);
+  // A bird reaching us over loopback is running on this very machine, so its GPU
+  // is the same one doing the embedding and the LM head. It still gets layers --
+  // wasting the fastest hardware on the network would be foolish -- but the
+  // allocator has to know, or it double-counts that GPU. See Flock.reallocate().
+  const from = (req.socket?.remoteAddress || '').replace('::ffff:', '');
+  const onCoordinator = from === '127.0.0.1' || from === '::1' || from === 'localhost';
+  const bird = flock.claim(pid, req.body.label || 'phone', req.body.caps || null,
+                           {onCoordinator});
 
   // A join mid-token cannot take effect mid-token: the running token is filling
   // K/V caches on the devices that hold those layers now. Stage it and let the
@@ -581,6 +588,9 @@ app.post('/chat', async (req, res) => {
       const t0 = performance.now();
       let flat = await coord.forward(stepIds, offset);
       const coordMs = +(performance.now() - t0).toFixed(1);
+      // Remember what the coordinator's own share costs per token, so a bird
+      // sharing this GPU can be charged for it in the next allocation.
+      flock.noteCoordMs(coordMs);
 
       const t1 = performance.now();
       try {

@@ -47,6 +47,10 @@ export class Bird {
     // trusted, because refusing it would be worse than the OOM it might hit, and
     // the OOM is reported through /diag either way.
     this.caps = {bind: Infinity, budget: Infinity, cores: null, gpu: null};
+    // True when this bird's browser is on the coordinator machine, so its GPU is
+    // shared with the embedding and the LM head. Set from the join request's
+    // source address -- loopback means same machine.
+    this.onCoordinator = false;
     // Its measured throughput, and the bytes it is currently responsible for --
     // the pair is what makes a rate rather than a raw time. See ./speed.js.
     this.rate = new Rate();
@@ -269,7 +273,7 @@ export class Flock {
    * `caps` is what the device reported from the /check probe: bind is
    * maxStorageBufferBindingSize, budget is how many weight bytes it will hold.
    */
-  claim(peerId, label, caps = null) {
+  claim(peerId, label, caps = null, opts = {}) {
     let b = this.byPeer(peerId);
     if (!b) {
       b = new Bird(peerId, label);
@@ -278,6 +282,7 @@ export class Flock {
       b.label = label;
     }
     if (caps) this.setCaps(b, caps);
+    if (opts.onCoordinator !== undefined) b.onCoordinator = !!opts.onCoordinator;
     // Date.now(), NOT this.now(). The two are the same clock in production, but they
     // are different CLOCKS: `now` is injectable so a test can fast-forward the
     // rebalancer's cooldown, while LIVENESS is judged against real wall time by
@@ -291,6 +296,16 @@ export class Flock {
   }
 
   /** Record what a device says it can do, normalising missing fields to unlimited. */
+  /** Per-token cost of the coordinator's own layers, smoothed like a bird's rate.
+   *
+   *  Used as `reservedMs` for a bird on this machine. Smoothed because one slow
+   *  token should not move an allocation -- the same reason bird rates use an EWMA.
+   */
+  noteCoordMs(ms) {
+    if (!(ms > 0)) return;
+    this.coordMs = this.coordMs == null ? ms : this.coordMs * 0.75 + ms * 0.25;
+  }
+
   setCaps(b, caps) {
     const num = v => (typeof v === 'number' && v > 0 && Number.isFinite(v)) ? v : null;
     const bind = num(caps.maxStorageBufferBindingSize ?? caps.bind);
@@ -376,6 +391,14 @@ export class Flock {
       proposed = allocate(this.layers, members.map(b => device({
         id: b.peerId, label: b.label, bind: b.caps.bind, budget: b.caps.budget,
         rate: b.rate.rate(DEFAULT_RATE),
+        // A bird running in a browser ON the coordinator machine shares that GPU
+        // with the embedding, output_norm and LM head. Its measured rate does not
+        // know that, so without this the fastest device on the network gets the
+        // biggest layer share while already being the busiest. Charging it the
+        // coordinator's own measured per-token cost keeps it in the flock -- the
+        // point is to use spare capacity, not to exclude the best hardware -- but
+        // stops it being double-counted.
+        reservedMs: b.onCoordinator ? (this.coordMs || 0) : 0,
       })));
       this.infeasible = null;
     } catch (e) {

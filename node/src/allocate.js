@@ -64,11 +64,20 @@ export const DEFAULT_RATE = 16.8e6 / 15.4;
  * limit no partition can work around. `budget` is how many weight bytes this
  * device is willing to hold in total. `rate` is measured bytes-per-millisecond;
  * higher means a bigger share.
+ *
+ * `reservedMs` is per-token time this device already owes to work the allocator
+ * does not assign. The coordinator machine is the case that matters: when its
+ * browser joins as a bird, the embedding, output_norm and LM head still run on
+ * that same GPU, so its measured rate flatters it -- the allocator would hand the
+ * fastest device the biggest layer share while being blind to the fact that it is
+ * already busy. Excluding it instead would waste the best hardware on the
+ * network, so the honest fix is to charge it for what it already does.
  */
 export function device({id, label = '?', bind = Infinity, budget = Infinity,
-                        rate = DEFAULT_RATE} = {}) {
+                        rate = DEFAULT_RATE, reservedMs = 0} = {}) {
   return {id, label, bind: bind || Infinity, budget: budget || Infinity,
-          rate: rate > 0 ? rate : DEFAULT_RATE};
+          rate: rate > 0 ? rate : DEFAULT_RATE,
+          reservedMs: reservedMs > 0 ? reservedMs : 0};
 }
 
 /** Thrown when no assignment can satisfy every device's limits. */
@@ -166,7 +175,10 @@ export function allocate(layers, devices) {
         if (bytes > dev.budget) break;
         const tail = best[d + 1][j + 1];
         if (tail === INF) continue;
-        const span = Math.max(bytes / dev.rate, tail);
+        // A stage costs everything that device spends on this token, including
+        // work it owes elsewhere (see `reservedMs`) -- otherwise the busiest
+        // device looks like the cheapest place to add more.
+        const span = Math.max(bytes / dev.rate + dev.reservedMs, tail);
         if (span < best[d][i]) { best[d][i] = span; cut[d][i] = j; }
       }
     }
