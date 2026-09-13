@@ -713,6 +713,7 @@ function connect() {
   ws.onmessage = ev => {
     if (typeof ev.data === 'string') {
       const m = JSON.parse(ev.data);
+      if (m.error && /unknown peer/i.test(m.error)) return onServerForgotUs();
       if (m.error) {
         // The coordinator forgot us -- usually it restarted. Claim a slot again.
         log(m.error, 'bad');
@@ -744,6 +745,21 @@ function connect() {
       log('socket closed — reconnecting…', 'bad');
       setTimeout(connect, 1500);
     }
+  };
+  // A coordinator restart forgets every peer id, so reconnecting with the old one
+  // is refused. Without handling that the page keeps showing whatever range it was
+  // last told -- which is how two devices ended up displaying 22-27 and 20-27,
+  // ranges that no longer existed on the server at all. Rejoin from scratch.
+  const onServerForgotUs = async () => {
+    log('the coordinator does not know this device any more — rejoining', 'bad');
+    peerId = null;
+    meta = {...meta, start: null, end: null};
+    $('layers').textContent = '—';
+    $('of').textContent = 'rejoining…';
+    for (const L of layers || []) { try { L.destroy?.(); } catch {} }
+    layers = [];
+    try { ws.close(); } catch {}
+    location.reload();        // simplest correct restart: re-probe, re-join, re-stream
   };
   ws.onerror = () => log('websocket error', 'bad');
 }
