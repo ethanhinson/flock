@@ -158,10 +158,11 @@ stronger than a tolerance against the unsharded answer, because a 1e-6 tolerance
 would not notice one wrong block out of 32.
 
 The measured residual of column-wise against unsharded is **7.4e-8 to 1.7e-7**
-of the output scale, across every shape and shard count. For scale: Q8_0
-quantization itself costs **1.34e-2** (measured, `test_onnx.ts`), so
-reassociation is five orders of magnitude smaller than the error the model
-already carries.
+of the output scale, across every shape and shard count — 1-3 ULP. For scale:
+Q8_0 quantization itself costs **1.34e-2** (measured, `test_onnx.ts`), so
+reassociation is ~5 orders of magnitude smaller than the error the model already
+carries. The assertion's threshold is the looser 1e-5 (3 orders), deliberately,
+so it does not silently become a bit-exactness test on one machine's rounding.
 
 ### Memory, which is the entire point
 

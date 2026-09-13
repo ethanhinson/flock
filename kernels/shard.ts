@@ -427,6 +427,8 @@ export class ShardedHead {
     oVal: GPUBuffer; oIdx: GPUBuffer;
     d1: GPUBuffer; d2: GPUBuffer;
     dummy: GPUBuffer;
+    /** Argmax stage-1 and stage-2 bind groups, built once. */
+    bg1: GPUBindGroup; bg2: GPUBindGroup;
     /** A view of the sharded matvec's output covering just this shard's rows. */
     logitsOffset: number;
   }[] = [];
@@ -465,22 +467,34 @@ export class ShardedHead {
       // model.ts uses (594 groups for 151936). Capped so stage 2's single
       // workgroup can still reduce the partials with a short strided loop.
       const groups = Math.max(1, Math.min(1024, Math.ceil(rg.count / 256)));
-      H.perShard.push({
-        range: rg, groups,
-        pVal: rw(groups), pIdx: rw(groups),
-        oVal: rw(1), oIdx: rw(1),
-        d1: uniformBuffer(dev, [rg.count, groups, 0, 0]),
-        d2: uniformBuffer(dev, [groups, groups, 0, 0]),
-        dummy: rw(1),
-        logitsOffset: rg.start,
-      });
+      const pVal = rw(groups), pIdx = rw(groups);
+      const oVal = rw(1), oIdx = rw(1);
+      const d1 = uniformBuffer(dev, [rg.count, groups, 0, 0]);
+      const d2 = uniformBuffer(dev, [groups, groups, 0, 0]);
+      const dummy = rw(1);
       // Each shard's argmax reads its own rows of the logits. The shards' logits
       // are contiguous in one buffer (row-wise concatenates), but a bind group
       // cannot express "this range of that buffer" without dynamic offsets, and a
       // dynamic offset has a 256-byte alignment requirement the row boundaries do
       // not respect. So each shard's logit slice is its OWN buffer, which is also
       // what a real distributed shard has: it never holds the other shards' logits.
-      H.logitsSlice.push(rw(rg.count));
+      const slice = rw(rg.count);
+      H.logitsSlice.push(slice);
+      const bg = (pipe: GPUComputePipeline, bufs: GPUBuffer[]) => dev.createBindGroup({
+        layout: pipe.getBindGroupLayout(0),
+        entries: bufs.map((buffer, binding) => ({ binding, resource: { buffer } })),
+      });
+      H.perShard.push({
+        range: rg, groups, pVal, pIdx, oVal, oIdx, d1, d2, dummy,
+        // Built once here rather than per encode(). `dummy` is the buffer
+        // argmax.wgsl's pass1 binds for `xidx`, which it declares (so both passes
+        // share one auto layout) but reads nothing live from -- it cannot be the
+        // buffer pass1 also writes, because read + read_write on one buffer is a
+        // validation error.
+        bg1: bg(H.am1, [slice, dummy, pVal, pIdx, d1]),
+        bg2: bg(H.am2, [pVal, pIdx, oVal, oIdx, d2]),
+        logitsOffset: rg.start,
+      });
     }
     return H;
   }
@@ -505,24 +519,19 @@ export class ShardedHead {
       enc.copyBufferToBuffer(
         logits, s.logitsOffset * 4, this.logitsSlice[i], 0, s.range.count * 4);
     }
+    // Bind groups are built once (see `bgs` below), not per encode. Rebuilding
+    // them per step cost ~4 ms of a 5.4 ms layer in the layer benchmark, and a
+    // sharded head builds 2N of them.
     for (let i = 0; i < this.perShard.length; i++) {
       const s = this.perShard[i];
       const p = enc.beginComputePass();
       p.setPipeline(this.am1);
-      p.setBindGroup(0, this.dev.createBindGroup({
-        layout: this.am1.getBindGroupLayout(0),
-        entries: [this.logitsSlice[i], s.dummy, s.pVal, s.pIdx, s.d1].map(
-          (buffer, binding) => ({ binding, resource: { buffer } })),
-      }));
+      p.setBindGroup(0, s.bg1);
       p.dispatchWorkgroups(s.groups);
       p.end();
       const p2 = enc.beginComputePass();
       p2.setPipeline(this.am2);
-      p2.setBindGroup(0, this.dev.createBindGroup({
-        layout: this.am2.getBindGroupLayout(0),
-        entries: [s.pVal, s.pIdx, s.oVal, s.oIdx, s.d2].map(
-          (buffer, binding) => ({ binding, resource: { buffer } })),
-      }));
+      p2.setBindGroup(0, s.bg2);
       p2.dispatchWorkgroups(1);
       p2.end();
     }

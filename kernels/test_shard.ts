@@ -268,10 +268,15 @@ for (const [rows, cols] of SHAPES) {
   for (const r of colResiduals) {
     if (r.n === 4) console.log(`     ${r.shape.padEnd(10)} N=4  residual/scale ${r.rel.toExponential(1)}`);
   }
-  ok("column-wise reassociation stays 3 orders below Q8_0's own quantization error",
+  // The THRESHOLD is 1e-5, three orders below quantization; the MEASURED values
+  // come in around 1e-7, five orders below. Both figures are stated because they
+  // mean different things: 1e-5 is the bar the assertion holds to (deliberately
+  // loose, so it does not become a bit-exactness test by accident on one machine's
+  // rounding), and ~1e-7 is what this hardware actually does.
+  ok("column-wise reassociation stays far below Q8_0's own quantization error",
      worst < 1e-5,
      `worst ${worst.toExponential(1)} at ${worstAt.shape} N=${worstAt.n}, ` +
-     `vs quantization 1.34e-2`);
+     `vs quantization 1.34e-2 (threshold 1e-5, i.e. 3 orders; measured is ~5)`);
   ok("column-wise is NOT bit-identical, as predicted (the residual is real)",
      worst > 0, `worst residual/scale ${worst.toExponential(1)}`);
 }
