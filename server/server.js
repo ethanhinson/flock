@@ -24,14 +24,17 @@ import express from 'express';
 import {WebSocketServer} from 'ws';
 import {createServer} from 'node:http';
 import {createServer as createHttpsServer} from 'node:https';
-import {existsSync, readFileSync} from 'node:fs';
+import {existsSync, readFileSync, mkdirSync} from 'node:fs';
 import {randomBytes} from 'node:crypto';
 import {networkInterfaces} from 'node:os';
 import path from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 
 import {Coordinator} from './coordinator.js';
-import {Flock} from './mesh.js';
+import {Flock, normCaps} from './mesh.js';
+import {Journal} from './journal.js';
+import {Sessions, DEFAULT_TTL_MS} from './session.js';
+import {f32to16} from '../web/js/wire.mjs';
 import {readModel} from './gguf.mjs';
 import {layerPlan, Infeasible} from './allocate.js';
 import {QWEN3_06B} from '../kernels/layer.ts';
@@ -107,6 +110,124 @@ console.log(`coordinator holds layers 0-${CUT - 1}; birds cover ` +
               .toFixed(1)}MB), split across however many devices join`);
 console.log('kv cache: ON  |  wire: f16 binary  |  links: webrtc  |  engine: wgsl');
 
+// ---------------------------------------------------------------------------
+// DURABLE STATE: the conversation journal and the sessions, on disk.
+//
+// A bird's K/V cache lives in GPU buffers inside a browser tab, and a refresh, a
+// reassignment, a backgrounded phone or a coordinator restart destroys it. It
+// cannot be preserved; it is REBUILT, by replaying the journal of exactly what
+// was fed (see ./journal.js). The sessions (./session.js) are what let a device
+// come back as itself so that a refresh is not a new member. Both live under
+// FLOCK_STATE_DIR so a restart picks the conversation up where it was.
+// ---------------------------------------------------------------------------
+const STATE_DIR = process.env.FLOCK_STATE_DIR || path.join(ROOT, '.state');
+mkdirSync(STATE_DIR, {recursive: true});
+const journal = new Journal({hidden: META.hidden, file: path.join(STATE_DIR, 'journal.bin')});
+const SESSION_TTL_MS = +(process.env.FLOCK_SESSION_TTL_MS || DEFAULT_TTL_MS);
+const sessions = new Sessions({file: path.join(STATE_DIR, 'sessions.json'), ttlMs: SESSION_TTL_MS});
+flock.pauseMaxMs = SESSION_TTL_MS;
+if (process.env.FLOCK_PAUSE_GRACE_MS) flock.pauseGraceMs = +process.env.FLOCK_PAUSE_GRACE_MS;
+
+// Conversation state. `fed` is how many tokens the conversation holds, which is
+// also the next position id -- the journal's length. The coordinator's cache and
+// every bird's cache are meant to hold exactly these positions; when one of them
+// does not (a device moved, re-attached, or the coordinator restarted) the flags
+// below say so, and the next turn rebuilds it before generating.
+//
+// `busy` refuses a second /chat; `generating` is the narrower state in which a
+// token is actually being computed and membership changes must wait for the
+// boundary. The readiness wait is busy but not generating, so a device that
+// joins or pauses while a turn is waiting is placed at once.
+const convo = {
+  fed: 0, busy: false, generating: false,
+  // The next lap tells every bird to clear its shard first. Set when a
+  // conversation starts over, consumed by the lap that starts the new one.
+  resetPending: true,
+  get turns() { return journal.turns; },
+};
+// The birds' caches do not match the journal: replay it before the next turn.
+let needReplay = false;
+// The coordinator's own cache does not match the journal (a restart, or a turn
+// that was rewound): prefill its layers from the journal before the next turn.
+let coordDirty = false;
+let lastReplay = null;
+
+/** Drop every cache in the flock and start the conversation over. */
+function resetConvo() {
+  coord.reset();
+  journal.clear();
+  convo.fed = 0;
+  convo.resetPending = true;
+  needReplay = false;
+  coordDirty = false;
+}
+
+/** The layers moved, or a device came back with empty buffers: whatever the
+ *  birds hold no longer matches the journal. With nothing journaled there is
+ *  nothing to replay, but a stale shard must still be cleared by the next lap. */
+function markCachesStale() {
+  if (journal.length > 0) needReplay = true;
+  else convo.resetPending = true;
+}
+
+/** A turn failed or was aborted part-way: the caches hold a partial prompt or a
+ *  torn reply that nothing can be appended to. Rewind to where the turn began --
+ *  the conversation before it is intact -- and rebuild every cache to there. */
+function rewindTurn(why) {
+  const to = journal.rewindTurn();
+  convo.fed = to;
+  coordDirty = true;
+  markCachesStale();
+  console.log(`[journal] ${why}: rewound to ${to} tokens, ${journal.turns} turn(s) kept`);
+}
+
+/** Save every member's placement, so a restart puts each device back where it is. */
+function recordPlacements() {
+  sessions.setPlacements(flock.birds.map(b => ({peer_id: b.peerId, start: b.start, end: b.end,
+                                                paused: b.paused, paused_at: b.pausedAt || null})));
+}
+
+/**
+ * ON START, PICK THE CONVERSATION UP. The journal gives the token ids and the
+ * turn count; the coordinator's own K/V is recomputed from the ids (prefilling
+ * its layers, which is bit-identical to having decoded them) before the first
+ * turn; the sessions give every device its peer id, its limits and its
+ * placement back, so a device that still holds its layers reconnects and
+ * confirms them rather than being reallocated. The birds are replayed regardless:
+ * a device might have seen positions this journal never got, and a replay from
+ * zero is the one thing that is right in every case.
+ */
+function restoreState() {
+  const j = journal.load();
+  const recs = sessions.load();
+  for (const r of recs) {
+    const b = flock.claim(r.peer_id, r.label, null, {onCoordinator: r.on_coordinator});
+    b.caps = normCaps(r.caps || {});
+    if (r.start != null && r.end != null) { b.start = r.start; b.end = r.end; }
+    if (r.paused) { b.paused = true; b.pausedAt = r.paused_at || Date.now(); }
+  }
+  if (j.ok && j.tokens > 0) {
+    convo.fed = j.tokens;
+    coordDirty = true;
+    needReplay = true;
+    convo.resetPending = false;
+  }
+  if (recs.length) {
+    const d = flock.plan({force: true});
+    console.log(`[state] restored ${recs.length} session(s): ` +
+                flock.birds.map(b => `${b.label} ${b.placed() ? `${b.start}-${b.end}` : 'unplaced'}` +
+                                     (b.paused ? ' (paused)' : '')).join(', ') +
+                (d.moved?.length ? ` -- ${d.reason}` : ''));
+    recordPlacements();
+  }
+  if (j.ok && (j.tokens > 0 || j.turns > 0)) {
+    console.log(`[state] restored a conversation of ${j.tokens} tokens, ${j.turns} turn(s)` +
+                (j.torn ? ` (cut ${j.torn} torn bytes off the journal)` : '') +
+                `; the coordinator re-prefills and the birds are replayed before the next turn`);
+  }
+}
+restoreState();
+
 // Drop devices we have not heard from. A fixed slot could sit red and wait for its
 // phone to come back; a MEMBER cannot, because it is holding layers nobody runs, so
 // the flock stays uncovered until the device is actually removed and its layers are
@@ -116,9 +237,10 @@ setInterval(() => {
   const gone = flock.sweep();
   if (!gone.length) return;
   console.log(`dropped ${gone.length} unresponsive device(s): ${gone.join(', ')}`);
+  for (const pid of gone) sessions.revoke(pid);
   // Mid-token this has to wait: reassigning now would move layers whose K/V cache
   // the current token is still writing into.
-  if (convo.busy) { flock.defer(); return; }
+  if (convo.generating) { flock.defer(); return; }
   rebalance({force: true, why: 'a device stopped answering'});
 }, SWEEP_MS);
 
@@ -128,34 +250,95 @@ setInterval(() => {
  * is not covering some layers at all. (The speed rebalancer is rebalanceForSpeed,
  * below, and has its own rules about when it may run.)
  *
- * ANY reassignment drops the conversation. The K/V cache is sharded BY LAYER across
- * the devices, so a layer that moves leaves its keys on the device that no longer
- * holds it -- and the device that now does starts from an empty cache at a position
- * offset the rest of the flock believes is already filled. Continuing would mix
- * keys for the same positions computed on two different devices, which is text that
- * is wrong without looking wrong. Re-prefilling the history instead is not
- * available: Coordinator.turnTokens documents why re-encoding a conversation
- * DIVERGES from what was actually fed. So the honest cost of adding or losing a
- * device is the conversation's context, said out loud, rather than silent garbage.
+ * ANY reassignment invalidates the birds' caches. The K/V cache is sharded BY
+ * LAYER across the devices, so a layer that moves leaves its keys on the device
+ * that no longer holds it, and the device that now does starts from an empty
+ * cache at a position the rest of the flock believes is already filled.
+ * Continuing would mix keys for the same positions computed on two different
+ * devices -- text that is wrong without looking wrong. This USED to drop the
+ * conversation, because re-encoding the history diverges from what was fed
+ * (Coordinator.turnTokens). Now the journal holds exactly what was fed, so a
+ * move marks the caches stale and the next turn REPLAYS the journal through the
+ * new topology before it generates: the same bits, in the same order, to the
+ * same positions. The conversation survives; what the move costs is the replay.
  */
 function rebalance({force = false, why = ''} = {}) {
   const d = flock.plan({force});
   if (d.move) {
     if (why) console.log(`rebalancing: ${why}`);
     console.log(`  ${d.reason}`);
-    if (d.moved.length) {
-      resetConvo();
-      lastRebalance = {at: Date.now(), reason: d.reason, moved: d.moved,
-                       dropped_context: true};
-    }
-    flock.announce();
+    afterPlan(d);
   }
   if (flock.infeasible) console.error(`cannot place layers: ${flock.infeasible.message}`);
   return d;
 }
-// The last reallocation that cost the conversation its context, so the chat page
-// can say WHY the context went to zero rather than appearing to forget.
+/** What every successful plan owes: stale caches marked, the change announced,
+ *  the placements saved for a restart, and the decision recorded for /status. */
+function afterPlan(d) {
+  if (d.moved.length) {
+    markCachesStale();
+    lastRebalance = {at: Date.now(), reason: d.reason, moved: d.moved,
+                     dropped_context: false, replay_tokens: journal.length};
+  }
+  flock.announce();
+  recordPlacements();
+}
+// The last reallocation, so the chat page can say the flock changed shape and
+// that the context was rebuilt rather than dropped.
 let lastRebalance = null;
+
+/** Apply a membership change that arrived while a token was in flight. */
+function settle() {
+  if (!flock.deferred) return;
+  const d = flock.applyPending();
+  if (d?.move) {
+    console.log(`applied a deferred membership change: ${d.reason}`);
+    afterPlan(d);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PAUSE / RESUME. A phone going to the background cannot compute: iOS suspends
+// the tab's JS, its sockets and its WebGPU work together. Before this, such a
+// device looked alive-but-silent for the 40s liveness grace and was then swept
+// as dead, and every turn in between waited on it. Now the page says so
+// ({t:'pause'} on visibilitychange, a beacon to /pause on pagehide), the
+// coordinator hands its layers to its neighbours after a short grace, and when
+// the page is visible again it re-attaches with its session and is placed again.
+// The grace exists because a REFRESH fires the same events, and the same device
+// is back within a second or two: moving layers for it would be pure waste.
+// ---------------------------------------------------------------------------
+const pauseTimers = new Map();
+function pauseBird(bird, why) {
+  if (bird.paused) return;
+  flock.pause(bird.peerId);
+  recordPlacements();
+  const held = bird.placed() ? `${bird.start}-${bird.end}` : 'nothing';
+  console.log(`[pause] ${bird.label} (${bird.peerId}) ${why}; holds ${held}; its layers ` +
+              `move in ${(flock.pauseGraceMs / 1000).toFixed(1)}s unless it is back`);
+  const t = setTimeout(() => {
+    pauseTimers.delete(bird.peerId);
+    if (!bird.paused || flock.byPeer(bird.peerId) !== bird) return;   // back, or gone
+    if (convo.generating) { flock.defer(); return; }
+    rebalance({force: true, why: `${bird.label} paused (held ${held})`});
+  }, flock.pauseGraceMs + 20);
+  pauseTimers.set(bird.peerId, t);
+}
+function resumeBird(bird, why) {
+  clearTimeout(pauseTimers.get(bird.peerId));
+  pauseTimers.delete(bird.peerId);
+  const was = flock.resume(bird.peerId);
+  if (was) {
+    console.log(`[resume] ${bird.label} (${bird.peerId}) ${why}; ` +
+                (bird.placed() ? `still holds ${bird.start}-${bird.end}` : 'is placed again next'));
+  }
+  if (!bird.placed()) {
+    if (convo.generating) flock.defer();
+    else rebalance({force: true, why: `${bird.label} resumed`});
+  }
+  recordPlacements();
+  return was;
+}
 
 /**
  * Why this specific device cannot be in the flock, named precisely.
@@ -276,12 +459,18 @@ app.post('/join', (req, res) => {
   // both report navigator.platform "MacIntel" (a Mac and an iPad do) were
   // indistinguishable in the logs while knocking each other out of the flock.
   //
-  // Every /join is a NEW member, with ONE exception. A reload is a new device as
-  // far as the flock is concerned, and the old registration is reaped by the
-  // liveness sweeper -- the correct reading: the page that held those layers is
-  // gone, along with the K/V cache for them.
+  // Every /join is a NEW member, with TWO exceptions.
   //
-  // The exception is a RETRY. A device that joins while a turn is running is
+  // The first is a SESSION. /join answers with a random token bound to the peer
+  // id, the device's limits and its address (see ./session.js); a page that
+  // refreshes, or a phone back from the background, presents it and RE-ATTACHES:
+  // same peer id, same layers, membership unchanged, nobody else moves. Its GPU
+  // buffers are gone, so it streams its layers again and the next turn replays
+  // the journal into them. A token that fails any check is a fresh join, and the
+  // log says which -- never the client, which has nothing to do with it either
+  // way.
+  //
+  // The second is a RETRY. A device that joins while a turn is running is
   // answered `wait` and told to ask again with the id it was given; that id was
   // minted here a moment ago and the device has not connected yet, so it is the
   // same device asking the same question. Minting a fresh id for every retry
@@ -290,8 +479,21 @@ app.post('/join', (req, res) => {
   // layers"), and the sweeper spent the next minute dropping phantoms, which read
   // in the log as joined -> dropped -> joined. A stale id from some other source
   // is still refused: only an id of a member that has never connected is reused.
-  const retry = req.body.peer_id ? flock.byPeer(String(req.body.peer_id)) : null;
-  const pid = retry && !retry.everLinked ? retry.peerId : randomBytes(8).toString('hex');
+  const from = (req.socket?.remoteAddress || '').replace('::ffff:', '');
+  const caps = req.body.caps || null;
+  let reattach = null;
+  if (req.body.session) {
+    const v = sessions.validate(String(req.body.session), {from, caps: normCaps(caps || {})});
+    const member = v.ok ? flock.byPeer(v.peerId) : null;
+    if (v.ok && member) reattach = member;
+    else console.log(`[join] ${req.body.label || 'phone'} from=${from || '?'} presented a ` +
+                     `session that is ${v.ok ? 'for a device no longer in the flock' : v.reason}` +
+                     ` -> fresh join`);
+  }
+  const retry = !reattach && req.body.peer_id ? flock.byPeer(String(req.body.peer_id)) : null;
+  const pid = reattach ? reattach.peerId
+            : retry && !retry.everLinked ? retry.peerId
+            : randomBytes(8).toString('hex');
   // A join can still break the flock: a device reporting a binding limit too small
   // for any layer makes every assignment infeasible. Keep enough to roll back.
   const was = flock.byPeer(pid);
@@ -300,24 +502,41 @@ app.post('/join', (req, res) => {
   // is the same one doing the embedding and the LM head. It still gets layers --
   // wasting the fastest hardware on the network would be foolish -- but the
   // allocator has to know, or it double-counts that GPU. See Flock.reallocate().
-  const from = (req.socket?.remoteAddress || '').replace('::ffff:', '');
   const onCoordinator = from === '127.0.0.1' || from === '::1' || from === 'localhost';
-  const bird = flock.claim(pid, req.body.label || 'phone', req.body.caps || null,
-                           {onCoordinator});
+  const bird = flock.claim(pid, req.body.label || 'phone', caps, {onCoordinator});
+  if (reattach) {
+    // The same device, in a new tab (or back from the background): its socket
+    // and channel, if the old ones are somehow still open, are replaced by the
+    // ones it opens next -- never duplicated -- and it holds nothing until it
+    // streams its range again and confirms it. Whatever it had cached is gone
+    // with the old tab, so the journal is replayed before the next turn.
+    bird.teardown();
+    bird.confirmed = null;
+    bird.everLinked = false;             // a fresh connect window, as for a new join
+    if (bird.paused) resumeBird(bird, 're-attached with its session');
+    markCachesStale();
+    sessions.touch(pid);
+  }
   // Who is actually joining, and is this a new device or a returning one? Two
   // devices reporting the same navigator.platform ("MacIntel" for both a Mac and
   // an iPad) are indistinguishable in a log line without this.
   console.log(`[join] ${bird.label} peer=${pid} from=${from || '?'} ` +
               `cores=${bird.caps.cores ?? '?'} ` +
               `bind=${Math.round((bird.caps.bind || 0) / 1e6)}MB ` +
-              `${was ? 'REJOIN' : 'new'} -> now ${flock.members().length} member(s)`);
+              `${reattach ? 'REATTACH' : was ? 'REJOIN' : 'new'} -> now ${flock.members().length} member(s)` +
+              (reattach && bird.placed() ? `, keeps ${bird.start}-${bird.end}` : ''));
 
   // A join mid-token cannot take effect mid-token: the running token is filling
   // K/V caches on the devices that hold those layers now. Stage it and let the
   // token finish. The device waits one token, which is milliseconds.
-  const deferred = convo.busy;
-  if (deferred) flock.defer();
-  else rebalance({force: true, why: `${bird.label} joined`});
+  //
+  // A re-attaching device is already placed (unless it was paused, which
+  // resumeBird handled), so nothing has to move for it: that is the whole point.
+  const deferred = convo.generating;
+  if (!reattach || !bird.placed()) {
+    if (deferred) flock.defer();
+    else rebalance({force: true, why: `${bird.label} joined`});
+  }
 
   if (flock.infeasible) {
     // THIS JOIN IS WHAT BROKE IT -- so undo it, rather than letting one bad device
@@ -340,6 +559,7 @@ app.post('/join', (req, res) => {
     };
     if (!prevCaps) {
       flock.release(pid);
+      sessions.revoke(pid);
       const after = flock.plan({force: true});
       if (!flock.infeasible) return refuse(after.reason);
     } else {
@@ -366,6 +586,11 @@ app.post('/join', (req, res) => {
       error: flock.infeasible.message, detail: flock.infeasible.detail,
       peer_id: pid, wait: false});
   }
+  // The token the device presents to come back as itself. Issued once per
+  // membership: a retry or a re-attach gets the token it already has.
+  const session = sessions.get(pid)?.token ||
+    sessions.issue({peerId: pid, from, caps: bird.caps, label: bird.label, onCoordinator,
+                    start: bird.start, end: bird.end});
   if (!bird.placed()) {
     // Admitted but not yet holding layers -- only happens when a token is in
     // flight. Tell the device to ask again rather than guessing a range for it.
@@ -376,12 +601,15 @@ app.post('/join', (req, res) => {
     // members with the same label, the allocator gave each a slice, and the flock had
     // two phantom devices it would wait forever on. So the id is returned on the
     // `wait` answer too, and callers must send it back.
-    return res.json({peer_id: pid, wait: true, retry_ms: 1200,
+    return res.json({peer_id: pid, session, wait: true, retry_ms: 1200,
+                     reattached: !!reattach,
                      reason: deferred ? 'a token is in flight; layers are assigned '
                        + 'at the next token boundary' : 'no layers assigned yet',
                      gguf: GGUF_URL, model: META.model, n_total: META.n_total});
   }
-  res.json({peer_id: pid, slot: bird.slot, start: bird.start, end: bird.end,
+  recordPlacements();
+  res.json({peer_id: pid, session, reattached: !!reattach,
+            slot: bird.slot, start: bird.start, end: bird.end,
             n_layers: bird.end - bird.start + 1, hidden: META.hidden,
             kv_heads: META.kv_heads, head_dim: META.head_dim,
             kv_cache: META.kv_cache, n_total: META.n_total, model: META.model,
@@ -403,7 +631,8 @@ app.post('/leave', (req, res) => {
   // the page's own reconnect logic the thing that decides what happens next.
   try { bird.ws?.close(); } catch {}
   flock.release(pid);
-  if (convo.busy) flock.defer();
+  sessions.revoke(pid);
+  if (convo.generating) flock.defer();
   else rebalance({force: true, why: `${label} left (held ${range})`});
   res.json({ok: true, left: pid, held: range,
             devices: flock.members().length,
@@ -420,10 +649,25 @@ app.post('/evict', (req, res) => {
   if (!bird) return res.status(404).json({error: 'not a member of this flock'});
   try { bird.ws?.close(); } catch {}
   flock.release(pid);
-  if (convo.busy) flock.defer();
+  sessions.revoke(pid);
+  if (convo.generating) flock.defer();
   else rebalance({force: true, why: `${bird.label} evicted`});
   res.json({ok: true, evicted: pid, devices: flock.members().length,
             ready: flock.ready(), missing: flock.missing()});
+});
+
+/** The device is going to the background and says so (a beacon from pagehide,
+ *  which survives the tab being suspended where a websocket message may not).
+ *  Needs the session: a peer id alone is public in /status, and a pause moves
+ *  layers. */
+app.post('/pause', (req, res) => {
+  const pid = req.body?.peer_id;
+  const bird = pid ? flock.byPeer(String(pid)) : null;
+  if (!bird) return res.status(404).json({error: 'not a member of this flock'});
+  const v = sessions.validate(String(req.body?.session || ''), {});
+  if (!v.ok || v.peerId !== bird.peerId) return res.status(403).json({error: 'not your session'});
+  pauseBird(bird, req.body?.why || 'went to the background');
+  res.json({ok: true, paused: pid, grace_ms: flock.pauseGraceMs});
 });
 
 // Birds have no readable console, so they POST failures here. Kept in a ring
@@ -475,12 +719,16 @@ app.get('/status', (_, res) => res.json({
   // speed-weighted allocator whose reasoning is invisible cannot be told apart
   // from a broken one.
   allocation: flock.allocation(),
-  // Set when a reallocation dropped the conversation, so the chat page can explain
-  // a context that went to zero instead of appearing to have forgotten.
+  // The last reallocation, so the chat page can say the flock changed shape --
+  // and that the context was rebuilt from the journal rather than dropped.
   last_rebalance: lastRebalance,
   // Conversation state, so the chat UI can show how much context is cached and
-  // whether a turn is already in flight.
+  // whether a turn is already in flight. `replay_pending` means the devices'
+  // caches do not match the journal yet and the next turn rebuilds them first.
   cached_tokens: convo.fed, turns: convo.turns, busy: convo.busy,
+  replay_pending: needReplay || coordDirty, last_replay: lastReplay,
+  journal: {tokens: journal.length, turns: journal.turns, turn_start: journal.turnStart},
+  sessions: sessions.live().length,
   diag: DIAG.slice(-12),
 }));
 
@@ -502,19 +750,6 @@ app.get('/health', (_, res) => {
     rss_mb: +(process.memoryUsage().rss / 1e6).toFixed(0),
   });
 });
-
-// Conversation state. `fed` is how many tokens the caches have seen, which is
-// also the next position id — the coordinator's cache and every bird's cache all
-// advance together, so one counter describes the whole flock.
-const convo = {fed: 0, turns: 0, busy: false};
-
-/** Drop every cache in the flock and start the conversation over. */
-function resetConvo() {
-  coord.reset();
-  flock.reset();     // each bird clears its own shard of the cache on next frame
-  convo.fed = 0;
-  convo.turns = 0;
-}
 
 app.post('/reset', (_, res) => {
   if (convo.busy) return res.status(409).json({error: 'a turn is in flight'});
@@ -540,9 +775,7 @@ function rebalanceForSpeed(why) {
   const d = flock.plan();
   if (d.move && d.moved.length) {
     console.log(`rebalancing for speed (${why}): ${d.reason}`);
-    lastRebalance = {at: Date.now(), reason: d.reason, moved: d.moved,
-                     dropped_context: false};
-    flock.announce();
+    afterPlan(d);
   }
   return d;
 }
@@ -602,20 +835,45 @@ app.post('/chat', async (req, res) => {
       rebalanceForSpeed('a new conversation started');
       convo.busy = true;
     }
-    // THE READINESS GATE. Devices that were just (re)assigned are streaming their
-    // weights and hold nothing yet; a frame sent now would arrive at a device
-    // with no layers. Wait for every placed device to confirm, saying who is
-    // still loading so the chat page can show it rather than appear hung.
-    const readiness = await flock.awaitReady({
-      timeoutMs: READY_WAIT_MS,
-      onWait: (pend, waited) => sse({type: 'waiting', waited_ms: waited,
-        pending: pend.map(b => ({label: b.label, range: `${b.start}-${b.end}`,
-                                 peer_id: b.peerId}))}),
-    });
-    if (!readiness.ok) {
-      sse({type: 'error', text: readiness.reason});
-      return res.end();
+    // THE READINESS GATE, AND BEHIND IT THE REBUILD. Devices that were just
+    // (re)assigned are streaming their weights and hold nothing yet; a frame sent
+    // now would arrive at a device with no layers. Wait for every placed device
+    // to confirm, saying who is still loading so the chat page can show it rather
+    // than appear hung. Then, if the caches do not match the journal (a device
+    // moved, re-attached, paused, or the coordinator restarted), replay the
+    // journal through the chain before generating a single token. A replay is
+    // itself laps through the birds, so a device dying under it is just another
+    // reassignment: the flock settles and the loop goes round again.
+    const waitFrom = Date.now();
+    const onWait = (pend, waited) => sse({type: 'waiting', waited_ms: waited,
+      pending: pend.map(b => ({label: b.label, range: `${b.start}-${b.end}`,
+                               peer_id: b.peerId}))});
+    for (;;) {
+      const readiness = await flock.awaitReady({
+        timeoutMs: Math.max(1000, READY_WAIT_MS - (Date.now() - waitFrom)), onWait});
+      if (!readiness.ok) {
+        sse({type: 'error', text: readiness.reason});
+        return res.end();
+      }
+      if (!needReplay && !coordDirty) break;
+      convo.generating = true;
+      try {
+        await rebuild(sse);
+      } catch (e) {
+        console.log(`[replay] ${e.message} -- the flock changed under the replay; ` +
+                    `it runs again once the devices settle`);
+        if (e.nack && e.bird) dropIfFailing(e.bird);
+        if (Date.now() - waitFrom > READY_WAIT_MS) {
+          sse({type: 'error', text: `could not rebuild the conversation on the devices: ${e.message}`});
+          return res.end();
+        }
+        await new Promise(r => setTimeout(r, 300));
+      } finally {
+        convo.generating = false;
+        settle();
+      }
     }
+    convo.generating = true;
     // Append this turn to the warm cache rather than re-prefilling the history.
     // See Coordinator.turnTokens for why re-encoding would be wrong here.
     let stepIds = coord.turnTokens(prompt, convo.turns === 0);
@@ -636,33 +894,35 @@ app.post('/chat', async (req, res) => {
       // Remember what the coordinator's own share costs per token, so a bird
       // sharing this GPU can be charged for it in the next allocation.
       flock.noteCoordMs(coordMs);
+      // What left the coordinator's layers is what the journal keeps: it is the
+      // birds' input, and a replay hands it to them again verbatim.
+      const fedActs = flat;
 
       const t1 = performance.now();
       try {
         // One lap: into the first bird, out of the last. Birds forward to each
         // other directly, so the coordinator sees a single round trip no matter
         // how many devices are in the chain.
-        const {data} = await flock.lap(flat, stepIds.length, META.hidden, offset);
+        const {data} = await flock.lap(flat, stepIds.length, META.hidden, offset,
+                                       {reset: convo.resetPending});
+        convo.resetPending = false;
         flat = data;
       } catch (e) {
         // A bird dropping mid-turn, or refusing a frame, leaves the caches at an
-        // offset no device agrees on any more, so the conversation cannot be
-        // continued. What it does NOT do is remove the device: a device that is
-        // between assignments, or that failed one frame, is still a member. Only a
-        // device that fails to compute repeatedly has shown it cannot serve.
-        resetConvo();
-        if (e.nack && e.bird) {
-          const b = e.bird;
-          if (e.nack.reason === 'failed' && b.failures >= 3) {
-            console.log(`[flock] ${b.label} failed ${b.failures} frames in a row; ` +
-                        `removing it (held ${b.start}-${b.end})`);
-            flock.release(b.peerId);
-            flock.defer();
-          }
-        }
+        // offset no device agrees on any more. The turn cannot continue -- but the
+        // conversation before it can: rewind to where the turn began and rebuild
+        // every cache to there before the next one. What this does NOT do is
+        // remove the device: a device that is between assignments, or that failed
+        // one frame, is still a member. Only a device that fails to compute
+        // repeatedly has shown it cannot serve.
+        rewindTurn(e.message);
+        if (e.nack && e.bird) dropIfFailing(e.bird);
         sse({type: 'error', text: e.message});
         return res.end();
       }
+      // Every device has appended these positions: they are part of the
+      // conversation now. Journal them before anything else can fail.
+      journal.append(stepIds, offset, fedActs);
       const stats = flock.chain().map(b => ({
         slot: b.slot, range: `${b.start}-${b.end}`, ms: b.lastMs,
         label: b.label, transport: b.transport}));
@@ -700,49 +960,121 @@ app.post('/chat', async (req, res) => {
 
     // An aborted turn stops mid-answer: the caches hold a partial assistant
     // reply with no closing token, so the next turn cannot append cleanly.
-    // Start over rather than continue from a torn conversation.
+    // Rewind to the turn's start rather than continue from a torn reply -- the
+    // turns before it are kept.
     if (stop === 'aborted') {
-      resetConvo();
+      rewindTurn('the turn was aborted by the client');
       return res.end();
     }
 
     // The generated tokens are in the cache now, so the next turn continues from
     // here. Count the turn only if it produced something to continue from.
-    if (out.length) convo.turns++;
+    if (out.length) journal.endTurn();
     sse({type: 'done', text: coord.decode(out), stop,
          tokens: out.length, prompt_tokens: promptTokens, cached: convo.fed,
          turn: convo.turns});
     res.end();
   } catch (e) {
     console.error(`[chat] ${e.stack || e.message}`);
-    resetConvo();
+    rewindTurn(`the coordinator failed: ${e.message}`);
     try { sse({type: 'error', text: `coordinator failed: ${e.message}`}); } catch {}
     try { res.end(); } catch {}
   } finally {
+    convo.generating = false;
     convo.busy = false;
     // THE END OF A TURN IS WHERE MEMBERSHIP CHANGES LAND. A device that joined or
     // left while the answer was being generated was deferred; it is applied now,
     // as a sticky edit, so the devices that need not move do not. The next turn
-    // then waits for the ones that did move to confirm their new layers.
+    // then waits for the ones that did move to confirm their new layers, and
+    // replays the journal into them.
     //
     // Doing it here rather than at a token boundary is what lets an answer
     // complete: the K/V cache is sharded by layer, so a move mid-answer had to end
-    // the answer. The context is still dropped -- that is the documented cost of a
-    // reassignment -- but the user gets their whole reply first.
-    if (flock.deferred) {
-      const d = flock.applyPending();
-      if (d?.move) {
-        console.log(`applied a deferred membership change: ${d.reason}`);
-        if (d.moved.length) {
-          resetConvo();
-          lastRebalance = {at: Date.now(), reason: d.reason, moved: d.moved,
-                           dropped_context: true};
-        }
-        flock.announce();
-      }
-    }
+    // the answer.
+    settle();
   }
 });
+
+/** A device that has failed to compute several frames in a row cannot serve;
+ *  remove it. A transient refusal (between assignments) does not count. */
+function dropIfFailing(b) {
+  if (b.failures >= 3) {
+    console.log(`[flock] ${b.label} failed ${b.failures} frames in a row; ` +
+                `removing it (held ${b.start}-${b.end})`);
+    flock.release(b.peerId);
+    sessions.revoke(b.peerId);
+    flock.defer();
+  }
+}
+
+/** Tokens per replay frame. 64 tokens of f16 at hidden=1024 is 131 KB, under the
+ *  256 KiB a WebRTC data channel carries per message by default; a bigger
+ *  frame would be silently dropped by the channel, which looks like a hang. */
+const REPLAY_CHUNK = Math.max(1, +(process.env.FLOCK_REPLAY_CHUNK || 64));
+const MAX_PREFILL = QWEN3_06B.maxPrefill;
+
+/**
+ * Rebuild every cache that does not match the journal.
+ *
+ * The coordinator's own, if it is stale (a restart, a rewound turn): reset it and
+ * prefill its layers from the journaled ids, in chunks of maxPrefill. Prefill is
+ * bit-identical to having decoded the same ids one at a time
+ * (kernels/test_prefill.ts), and the activations it produces are checked against
+ * the journaled ones so a divergence is logged the first time it could happen
+ * rather than discovered as wrong text.
+ *
+ * The birds', if they are stale (anything moved, or a device came back empty):
+ * one lap of the journaled activations per REPLAY_CHUNK positions, the first
+ * carrying `reset` so every shard starts from zero, all carrying `replay` so no
+ * bird counts them as conversation output or reports timings for them. Every
+ * bird is replayed, not only the ones that moved: the chain is a pipeline, and
+ * the unmoved birds have to recompute their part for the moved ones to get
+ * their input. Their caches end up exactly as they were.
+ */
+async function rebuild(sse) {
+  const ids = journal.ids();
+  const n = ids.length;
+  const t0 = performance.now();
+  const what = [];
+  if (coordDirty) {
+    coord.reset();
+    let diverged = 0;
+    for (let off = 0; off < n; off += MAX_PREFILL) {
+      const chunk = ids.slice(off, off + MAX_PREFILL);
+      const acts = await coord.forward(chunk, off);
+      for (let i = 0; i < chunk.length; i++) {
+        const want = journal.activationBits(off + i);
+        for (let k = 0; k < META.hidden; k++) {
+          if (f32to16(acts[i * META.hidden + k]) !== want[k]) { diverged++; break; }
+        }
+      }
+    }
+    coordDirty = false;
+    what.push(`the coordinator re-prefilled ${n} tokens` +
+              (diverged ? ` (${diverged} position(s) differ from the journal; the journal wins)` : ''));
+  }
+  if (needReplay) {
+    if (n === 0) {
+      convo.resetPending = true;
+    } else {
+      let reset = true;
+      for (let off = 0; off < n; off += REPLAY_CHUNK) {
+        const len = Math.min(REPLAY_CHUNK, n - off);
+        await flock.lap(journal.activations(off, len), len, META.hidden, off,
+                        {reset, replay: true});
+        reset = false;
+      }
+      convo.resetPending = false;
+    }
+    needReplay = false;
+    what.push(`replayed ${n} tokens through ${flock.chain().map(b => b.label).join(' -> ') || 'nobody'}`);
+  }
+  convo.fed = n;
+  const ms = +(performance.now() - t0).toFixed(0);
+  lastReplay = {at: Date.now(), tokens: n, ms, what: what.join('; ')};
+  console.log(`[replay] ${what.join('; ')} in ${ms}ms`);
+  sse?.({type: 'replay', tokens: n, ms, what: what.join('; ')});
+}
 
 // Chrome and Edge expose WebGPU only in a SECURE CONTEXT, so a bird reached over
 // plain http:// on a LAN sees no navigator.gpu at all -- which looks exactly like
@@ -767,9 +1099,21 @@ wss.on('connection', ws => {
     if (!isBinary) {
       const m = JSON.parse(data.toString());
       if (m.peer_id && !bird) {                 // hello
-        bird = flock.byPeer(m.peer_id);
-        if (!bird) return ws.send(JSON.stringify({error: 'unknown peer — rejoin'}));
+        const b = flock.byPeer(m.peer_id);
+        if (!b) return ws.send(JSON.stringify({error: 'unknown peer — rejoin'}));
+        // The socket has to prove it is the device the peer id was issued to.
+        // Peer ids are public (/status lists them); the session is not.
+        const rec = sessions.get(b.peerId);
+        if (rec && rec.token !== m.session) {
+          console.log(`[hello] ${b.label} peer=${b.peerId}: no valid session on the socket; refused`);
+          return ws.send(JSON.stringify({error: 'unknown peer — rejoin'}));
+        }
+        bird = b;
+        // A second socket for the same membership REPLACES the first: a page that
+        // reconnects, or a refreshed tab whose old socket has not closed yet.
+        if (bird.ws && bird.ws !== ws) { try { bird.ws.close(); } catch {} }
         bird.ws = ws; bird.label = m.label || bird.label;
+        sessions.touch(bird.peerId);
         // Do NOT clobber an open data channel. `transport` is what actually
         // carries frames, and a hello can arrive after the channel is up (a
         // reconnect, or a reassignment that re-runs the handshake) -- writing 'ws'
@@ -780,7 +1124,7 @@ wss.on('connection', ws => {
         bird.lastSeen = Date.now();
         // A device that was admitted but not placed (it joined mid-token) becomes
         // placeable the moment it is answering. Between turns that is now.
-        if (!bird.placed() && !convo.busy) {
+        if (!bird.placed() && !bird.paused && !convo.generating) {
           rebalance({force: true, why: `${bird.label} connected`});
         }
         // ALWAYS tell this bird its current range, even if it has not changed.
@@ -814,6 +1158,9 @@ wss.on('connection', ws => {
       // arrive twice for one token (websocket and data channel both deliver) and
       // double-counting would bias the EWMA toward whichever bird is chattiest.
       else if (m.t === 'stats') { bird.lastMs = m.ms; bird.lastSeen = Date.now(); }
+      // The device is going to the background (see pauseBird) or is back from it.
+      else if (m.t === 'pause') pauseBird(bird, m.why || 'said it is going to the background');
+      else if (m.t === 'resume') { resumeBird(bird, 'said it is back'); bird.lastSeen = Date.now(); }
       // THE READINESS HANDSHAKE. The device has streamed and built the layers for
       // [start, end] and can take frames for them. Until this arrives for the
       // range it is assigned, no lap starts -- see Flock.awaitReady.
@@ -842,7 +1189,7 @@ wss.on('connection', ws => {
       // probe finishing, or the real device's limits differing from the adapter's.
       else if (m.t === 'caps' && m.caps) {
         flock.setCaps(bird, m.caps);
-        if (!convo.busy) rebalance({force: true, why: `${bird.label} reported limits`});
+        if (!convo.generating) rebalance({force: true, why: `${bird.label} reported limits`});
       }
       // Whether this bird can hand off peer-to-peer decides how far the
       // coordinator's chained wait should reach.
@@ -851,7 +1198,7 @@ wss.on('connection', ws => {
       // what actually carried the frame is the only honest answer.
       // Liveness heartbeat. Without it an idle bird ages past alive()'s grace
       // period and the flock reports itself uncovered until a turn starts.
-      else if (m.t === 'ping') bird.lastSeen = Date.now();
+      else if (m.t === 'ping') { bird.lastSeen = Date.now(); sessions.touch(bird.peerId); }
     } else if (bird) {
       bird.deliver(data);
     }

@@ -27,6 +27,28 @@ import {Rate, shouldRebalance, currentMakespan, MIN_SAMPLES} from './speed.js';
 
 const ICE = ['stun:stun.l.google.com:19302'];
 
+/** What a device reported about itself, normalised: missing means unlimited.
+ *  Exported because the session token is bound to these numbers, so the server
+ *  has to normalise a re-attaching device's report the same way. */
+export function normCaps(caps) {
+  const num = v => (typeof v === 'number' && v > 0 && Number.isFinite(v)) ? v : null;
+  const bind = num(caps?.maxStorageBufferBindingSize ?? caps?.bind);
+  const budget = num(caps?.budget ?? caps?.maxBufferSize);
+  return {
+    bind: bind ?? Infinity,
+    // A device's whole-weights budget is not a limit WebGPU reports, so it comes
+    // from maxBufferSize when nothing better is offered. That is generous (it is
+    // one buffer's ceiling, not the device's memory) but it is the only number a
+    // browser will tell us, and the alternative -- guessing from the user agent --
+    // was what produced the iPad OOM this design is trying to stop repeating.
+    budget: budget ?? Infinity,
+    cores: num(caps?.cores) ?? null,
+    gpu: caps?.vendor || caps?.gpu || null,
+    secure: caps?.secureContext ?? null,
+    compute_ok: caps?.computeOk ?? null,
+  };
+}
+
 export class Bird {
   constructor(peerId, label = '?') {
     this.peerId = peerId; this.label = label;
@@ -37,8 +59,13 @@ export class Bird {
     this.lastSeen = 0; this.lastMs = null; this.claimedAt = 0;
     this.frames = 0;
     this.transport = 'none';
-    this.resetPending = false;
     this.forwardsDirectly = false;   // set when the bird reports a live peer link
+    // PAUSED: the device said it is going away (a phone going to the background,
+    // where iOS suspends JS, sockets and WebGPU alike) and will be back. It stays
+    // a member but holds no layers, so the others take its share at once rather
+    // than after the liveness grace; when it comes back it re-attaches with its
+    // session and is placed again. See Flock.pause().
+    this.paused = false; this.pausedAt = 0;
     this.ws = null; this.pc = null; this.chan = null;
     this._waiter = null;
     // THE READINESS HANDSHAKE. Being assigned a range and HOLDING it are different
@@ -135,6 +162,7 @@ export class Bird {
     return {slot: this.slot, start: this.start, end: this.end,
             n_layers: this.placed() ? this.end - this.start + 1 : 0,
             alive: this.alive(), last_ms: this.lastMs,
+            paused: this.paused,
             // Assigned is not holding: a bird re-streams for seconds after a
             // reassignment, and this is where /status says which ones still are.
             ready: this.isReady(),
@@ -164,10 +192,15 @@ export class Bird {
 
   /** Push into this bird but wait for `awaitOn` to answer (the chain's tail).
    *  When this bird IS the tail, `awaitOn` is itself — so this one method covers
-   *  both the chained and the single-bird case. */
-  sendChained(floats, seq, hidden, offset, awaitOn, timeout = 120000) {
-    const frame = pack(floats, {seq, hidden, offset, reset: this.resetPending});
-    this.resetPending = false;
+   *  both the chained and the single-bird case.
+   *
+   *  `flags` (reset, replay) are the lap's, not this bird's: every head of a
+   *  direct run gets them, and a bird that forwards directly passes them on. A
+   *  per-bird "reset pending" flag used to live here, and it only ever reached
+   *  the birds the coordinator sent to itself -- a bird fed by its predecessor's
+   *  data channel never saw the reset, and its cache kept growing. */
+  sendChained(floats, seq, hidden, offset, awaitOn, flags = {}, timeout = 120000) {
+    const frame = pack(floats, {seq, hidden, offset, reset: !!flags.reset, replay: !!flags.replay});
     const viaRTC = this.chanOpen();
     const link = viaRTC ? this.chan : this.ws;
     if (!link) return Promise.reject(new Error(
@@ -193,8 +226,6 @@ export class Bird {
       buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
     if (this._waiter) this._waiter({data, meta});
   }
-
-  reset() { this.resetPending = true; }
 
   /** Drop every link to this bird. Called when its websocket goes away, so a
    *  refresh starts from a clean slate instead of leaking a PeerConnection. */
@@ -256,11 +287,22 @@ export class Flock {
    * @param {object} opts   `now` for tests, `onPlan` called after every successful
    *                        reallocation with the new assignment
    */
-  constructor(layers, {now = () => Date.now(), onPlan = null} = {}) {
+  constructor(layers, {now = () => Date.now(), onPlan = null,
+                       pauseGraceMs = 2500, pauseMaxMs = 10 * 60 * 1000} = {}) {
     this.layers = layers;
     this.birds = [];            // chain order; index === slot
     this.now = now;
     this.onPlan = onPlan;
+    // A pause takes effect after `pauseGraceMs`: a page REFRESH also fires the
+    // events that send a pause, and the same device is back with its session
+    // within a second or two. Reallocating in that window would move layers for
+    // a device that is about to hold exactly what it held. A device that is
+    // really gone to the background stays paused past the grace, and its share
+    // is handed on then -- seconds, not the 40s liveness grace.
+    // A paused device is kept as a member for `pauseMaxMs` (the session's
+    // lifetime); one that never comes back is dropped after that.
+    this.pauseGraceMs = pauseGraceMs;
+    this.pauseMaxMs = pauseMaxMs;
     // The last reason a reallocation was made or refused, verbatim in /status. A
     // speed-weighted split whose decisions are invisible is indistinguishable from
     // a broken one, so this is part of the feature and not debug output.
@@ -293,7 +335,43 @@ export class Flock {
    * the whole flock on every phone that locks its screen for a second.
    */
   members(grace = 40000) {
-    return this.birds.filter(b => b.claimed() || (Date.now() - b.lastSeen) < grace);
+    return this.birds.filter(b => !this.pauseInEffect(b) &&
+                                  (b.claimed() || (Date.now() - b.lastSeen) < grace));
+  }
+
+  /** Has this device's pause outlasted the refresh window, so its layers should
+   *  go to the others? Before that a paused device is still allocated to. */
+  pauseInEffect(b) {
+    return b.paused && (Date.now() - b.pausedAt) >= this.pauseGraceMs;
+  }
+
+  /** A paused device that has been away longer than a session lasts is not
+   *  coming back on this membership. */
+  pauseLapsed(b) {
+    return b.paused && (Date.now() - b.pausedAt) >= this.pauseMaxMs;
+  }
+
+  /**
+   * The device is going away and says so. It keeps its membership and, for the
+   * refresh window, its layers; after that the allocator treats it as absent and
+   * hands its share to its neighbours. Returns false if it was not a member.
+   */
+  pause(peerId) {
+    const b = this.byPeer(peerId);
+    if (!b) return false;
+    if (!b.paused) { b.paused = true; b.pausedAt = Date.now(); }
+    return true;
+  }
+
+  /** The device is back. It is a member holding whatever it was left with (nothing,
+   *  once the pause took effect); the caller re-plans to place it again. */
+  resume(peerId) {
+    const b = this.byPeer(peerId);
+    if (!b) return false;
+    const was = b.paused;
+    b.paused = false; b.pausedAt = 0;
+    b.lastSeen = Date.now();
+    return was;
   }
 
   /**
@@ -340,22 +418,7 @@ export class Flock {
   }
 
   setCaps(b, caps) {
-    const num = v => (typeof v === 'number' && v > 0 && Number.isFinite(v)) ? v : null;
-    const bind = num(caps.maxStorageBufferBindingSize ?? caps.bind);
-    const budget = num(caps.budget ?? caps.maxBufferSize);
-    b.caps = {
-      bind: bind ?? Infinity,
-      // A device's whole-weights budget is not a limit WebGPU reports, so it comes
-      // from maxBufferSize when nothing better is offered. That is generous (it is
-      // one buffer's ceiling, not the device's memory) but it is the only number a
-      // browser will tell us, and the alternative -- guessing from the user agent --
-      // was what produced the iPad OOM this design is trying to stop repeating.
-      budget: budget ?? Infinity,
-      cores: num(caps.cores) ?? null,
-      gpu: caps.vendor || caps.gpu || null,
-      secure: caps.secureContext ?? null,
-      compute_ok: caps.computeOk ?? null,
-    };
+    b.caps = normCaps(caps);
     return b;
   }
 
@@ -382,8 +445,11 @@ export class Flock {
   sweep(grace = 40000) {
     // The exact complement of members(), so the two cannot disagree about who is in
     // the flock -- a device the sweeper keeps but the allocator ignores would hold
-    // layers nobody ever gives away.
+    // layers nobody ever gives away. The one addition is a PAUSED device: the
+    // allocator ignores it (it holds nothing) and the sweeper keeps it, until its
+    // session would have lapsed, because it said it was coming back.
     const keep = new Set(this.members(grace));
+    for (const b of this.birds) if (b.paused && !this.pauseLapsed(b)) keep.add(b);
     const gone = this.birds.filter(b => !keep.has(b));
     if (!gone.length) return [];
     for (const b of gone) this.release(b.peerId);
@@ -493,8 +559,12 @@ export class Flock {
         // its K/V cache is stale for the ones it lost, so its old timings describe
         // work it is no longer doing. It is also no longer READY: whatever it
         // confirmed was the old range, and nothing may be sent to it until it
-        // confirms the new one.
+        // confirms the new one. Cleared explicitly, not left to the range
+        // comparison: a device moved BACK to a range it confirmed earlier would
+        // otherwise look ready while it is still streaming -- seen once, as a
+        // replay frame arriving at a device holding nothing.
         b.rate.reset();
+        b.confirmed = null;
       }
       b.start = a.start; b.end = a.end;
       b.bytes = a.bytes;
@@ -606,7 +676,7 @@ export class Flock {
    *  A bird forwards peer-to-peer when it has an open channel to the next one,
    *  so we can only await the tail for the longest chained run from the head.
    */
-  async lap(floats, seq, hidden, offset) {
+  async lap(floats, seq, hidden, offset, flags = {}) {
     const chain = this.chain();
     if (!chain.length) throw new Error('no device holds any layer');
     let flat = floats, i = 0;
@@ -614,7 +684,7 @@ export class Flock {
       // How far does the direct chain reach from bird i?
       let j = i;
       while (j + 1 < chain.length && chain[j].forwardsDirectly) j++;
-      const got = await chain[i].sendChained(flat, seq, hidden, offset, chain[j]);
+      const got = await chain[i].sendChained(flat, seq, hidden, offset, chain[j], flags);
       // teardown() resolves a pending waiter with null so the lap does not hang for
       // the full timeout when a device's socket dies mid-frame. Say what happened:
       // destructuring the null instead reported "Cannot destructure property 'data'",
@@ -744,8 +814,6 @@ export class Flock {
     if (run) out.push(run);
     return out.map(r => r.start === r.end ? `${r.start}` : `${r.start}-${r.end}`);
   }
-
-  reset() { this.birds.forEach(b => b.reset()); }
 
   /** Everything a human needs to see why the split is what it is. */
   allocation() {

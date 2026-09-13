@@ -75,6 +75,14 @@ globalThis.localStorage = {
   getItem(k) { return this._m.has(k) ? this._m.get(k) : null; },
   setItem(k, v) { this._m.set(k, String(v)); },
 };
+// The page keeps its session in sessionStorage (per tab, dies with the tab).
+// A fresh harness is a fresh tab: empty.
+globalThis.sessionStorage = {
+  _m: new Map(),
+  getItem(k) { return this._m.has(k) ? this._m.get(k) : null; },
+  setItem(k, v) { this._m.set(k, String(v)); },
+  removeItem(k) { this._m.delete(k); },
+};
 // navigator.gpu is the REAL one -- Deno's. The page requires WebGPU now (the
 // layers are compute shaders, so there is no fallback to degrade to), and giving
 // it a real device is what lets this test cover the inference rather than a stub.
@@ -226,7 +234,7 @@ if (!health.ok) {
   })).json();
   const ws = new WebSocket(`${BASE.replace('https', 'wss')}/ws`);
   await new Promise(r => { ws.onopen = r; ws.onerror = r; });
-  ws.send(JSON.stringify({peer_id: j.peer_id, label: 'second'}));
+  ws.send(JSON.stringify({peer_id: j.peer_id, session: j.session, label: 'second'}));
 
   // Give the page time to receive its chain message and re-stream.
   for (let i = 0; i < 150 && nodes.get('layers').textContent === before; i++)

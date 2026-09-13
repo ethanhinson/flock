@@ -62,12 +62,14 @@ async function fakeBird(label, {caps = null, slowPerLayer = 0} = {}) {
     await sleep(j.retry_ms || 300);
   }
   if (j.error) return {error: j.error, label};
-  const b = {label, peerId: j.peer_id, start: j.start, end: j.end, hidden: j.hidden,
-             frames: 0, reassigns: [], why: j.why, closed: false};
+  const b = {label, peerId: j.peer_id, session: j.session, start: j.start, end: j.end,
+             hidden: j.hidden, frames: 0, reassigns: [], why: j.why, closed: false};
   const ws = new WebSocket(BASE.replace(/^http/, 'ws') + '/ws');
   b.ws = ws;
   await new Promise((res, rej) => { ws.on('open', res); ws.on('error', rej); });
-  ws.send(JSON.stringify({peer_id: b.peerId, label}));
+  // The session from /join has to come back on the socket: a peer id alone is
+  // public in /status, so the coordinator refuses a hello without it.
+  ws.send(JSON.stringify({peer_id: b.peerId, session: b.session, label}));
   ws.send(JSON.stringify({t: 'ping'}));
   // The readiness handshake: a fake bird "builds" instantly, so it confirms the
   // range it was given at once, and again whenever it is reassigned. Without this
@@ -291,19 +293,29 @@ if (LAYERS >= 2) {
      !r.error && (r.stop === 'eos' || r.stop === 'length'), r.error || r.stop);
   await sleep(600);
   const s2 = await status();
-  ok('after the turn the context was dropped, and /status says why',
-     s2.cached_tokens === 0 && !!s2.last_rebalance?.dropped_context,
-     `cached ${s2.cached_tokens}; ${JSON.stringify(s2.last_rebalance)}`);
+  // This used to assert that the context was DROPPED. It is not any more: the
+  // coordinator journals what it fed and replays it into the new topology before
+  // the next turn, so the join costs a replay, not the conversation.
+  ok('after the turn the context is KEPT, and /status says the move did not drop it',
+     s2.cached_tokens === r.events.find(e => e.type === 'done')?.cached &&
+     s2.last_rebalance?.dropped_context === false && s2.replay_pending === true,
+     `cached ${s2.cached_tokens}; replay_pending ${s2.replay_pending}; ` +
+     `${JSON.stringify(s2.last_rebalance)}`);
   ok('both devices now hold layers and the flock is covered',
      s2.ready && s2.birds.length === 2 && s2.missing.length === 0,
      s2.birds.map(b => `${b.label}:${b.start}-${b.end}`).join(' '));
   ok('the incumbent was TOLD its new range, not left guessing',
      (a.reassigns || []).length > 0, (a.reassigns || []).join('; ') || 'never told');
 
-  // And the flock works again straight afterwards.
-  const next = await turn('hello', 4, true);
-  ok('a turn after the rebalance completes normally', !next.error,
-     next.error || next.stop);
+  // And the flock works again straight afterwards -- CONTINUING the conversation,
+  // which means the journal was replayed into both devices first.
+  const next = await turn('hello', 4, false);
+  const rep = next.events.find(e => e.type === 'replay');
+  ok('a turn after the rebalance completes normally, continuing the conversation',
+     !next.error && next.events.find(e => e.type === 'done')?.turn === 2,
+     next.error || `${next.stop}, turn ${next.events.find(e => e.type === 'done')?.turn}`);
+  ok('  and it replayed the journal into the devices before generating',
+     !!rep && rep.tokens === s2.cached_tokens, JSON.stringify(rep));
   await bye(a); await bye(joiner);
   await clear();
 }
