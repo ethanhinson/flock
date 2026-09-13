@@ -212,7 +212,11 @@ function progressDone(msg) {
 
 // Claim a slot FIRST — the coordinator decides which layers we own, so two
 // phones joining the same flock get different slices automatically.
-let peerId = localStorage.getItem('flock_peer') || null;
+// No stored identity. The coordinator assigns a peer id on every /join, because
+// identity is a property of a live membership, not of a browser profile: a stale
+// id let one device take over another's slot, and localStorage cannot tell two
+// devices apart when both report navigator.platform as "MacIntel".
+let peerId = null;
 (async () => {
   // WHAT CAN THIS DEVICE ACTUALLY DO -- measured, and measured BEFORE joining.
   //
@@ -267,7 +271,7 @@ let peerId = localStorage.getItem('flock_peer') || null;
   }
   meta = j; peerId = j.peer_id;
   if (j.why) log(`share: ${j.why}`);
-  localStorage.setItem('flock_peer', peerId);
+  // (Deliberately not persisted -- see the note where peerId is declared.)
   $('layers').textContent = `${meta.start}–${meta.end}`;
   $('of').textContent = `of ${meta.n_total} · ${meta.n_layers} layer` +
                         (meta.n_layers === 1 ? '' : 's');
@@ -389,7 +393,11 @@ let peerId = localStorage.getItem('flock_peer') || null;
   });
   $('join').disabled = false;
   // A refresh shouldn't drop us out of the flock: if we were a member, rejoin.
-  if (localStorage.getItem('flock_joined') === '1') {
+  // A reload means a new membership, so there is nothing to restore. Auto-joining
+  // from a stored flag would claim layers the moment a page is opened -- including
+  // a tab someone left behind -- which is how slots ended up held by devices that
+  // were not really participating.
+  if (new URLSearchParams(location.search).get('join') === '1') {
     running = true;
     $('join').textContent = 'leave the flock';
     $('join').classList.add('leave');
@@ -772,7 +780,7 @@ $('join').onclick = async () => {
   running = !running;
   $('join').textContent = running ? 'leave the flock' : 'join the flock';
   $('join').classList.toggle('leave', running);
-  localStorage.setItem('flock_joined', running ? '1' : '0');
+
   await keepAwake(running);
   if (running) { clearProblem(); connect(); }
   else {

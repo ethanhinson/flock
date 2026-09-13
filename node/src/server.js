@@ -272,14 +272,21 @@ app.use('/kernels', express.static('kernels'));
 // refusing it outright would be worse than the OOM it might hit, and an OOM comes
 // back through /diag either way.
 app.post('/join', (req, res) => {
-  const pid = req.body.peer_id || randomBytes(4).toString('hex');
-  // Remember the CAPS this device was a member under, so a rejoin whose new caps break
-  // the flock can be put back the way it was. A reload is the commonest path through
-  // here -- bird.html keeps its peer id in localStorage and re-probes on every load --
-  // so "this device was already a member" is not a reason to skip the rollback below.
-  // Measured: a rejoin reporting a smaller limit made every assignment infeasible, and
-  // because the id was known the rollback was skipped, every device was unplaced, and
-  // nothing recovered until 40s of silence let the sweeper run.
+  // IDENTITY IS THE COORDINATOR'S TO ASSIGN. It used to be whatever the client
+  // sent, kept in localStorage across reloads, which is wrong twice over: a stale
+  // id let one device silently take over another's slot, and two devices that
+  // both report navigator.platform "MacIntel" (a Mac and an iPad do) were
+  // indistinguishable in the logs while knocking each other out of the flock.
+  //
+  // Every /join is now a NEW member. A reload is therefore a new device as far as
+  // the flock is concerned, and the old registration is reaped by the liveness
+  // sweeper -- which is the correct reading: the page that held those layers is
+  // gone, along with the K/V cache for them.
+  const pid = randomBytes(8).toString('hex');
+  // A join can still break the flock: a device reporting a binding limit too small
+  // for any layer makes every assignment infeasible. Keep enough to roll back.
+  // (Ids are fresh now, so `was` is always null -- kept so the rollback below reads
+  // the same whether or not an id is ever reused again.)
   const was = flock.byPeer(pid);
   const prevCaps = was ? {...was.caps} : null;
   // A bird reaching us over loopback is running on this very machine, so its GPU
@@ -290,6 +297,13 @@ app.post('/join', (req, res) => {
   const onCoordinator = from === '127.0.0.1' || from === '::1' || from === 'localhost';
   const bird = flock.claim(pid, req.body.label || 'phone', req.body.caps || null,
                            {onCoordinator});
+  // Who is actually joining, and is this a new device or a returning one? Two
+  // devices reporting the same navigator.platform ("MacIntel" for both a Mac and
+  // an iPad) are indistinguishable in a log line without this.
+  console.log(`[join] ${bird.label} peer=${pid} from=${from || '?'} ` +
+              `cores=${bird.caps.cores ?? '?'} ` +
+              `bind=${Math.round((bird.caps.bind || 0) / 1e6)}MB ` +
+              `${was ? 'REJOIN' : 'new'} -> now ${flock.members().length} member(s)`);
 
   // A join mid-token cannot take effect mid-token: the running token is filling
   // K/V caches on the devices that hold those layers now. Stage it and let the
