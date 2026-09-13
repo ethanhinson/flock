@@ -29,7 +29,7 @@
 
 import { getDevice, ok, randVec, readBack, summary } from "./lib.ts";
 import { absErrScaled, amax } from "./ops_ref.ts";
-import { Layer, QWEN3_06B, type LayerConfig } from "./layer.ts";
+import { Layer, type LayerConfig, QWEN3_06B } from "./layer.ts";
 import { layerForwardRef, layerPrefillRef, newRefCache } from "./layer_ref.ts";
 import { realLayer } from "./real_weights.ts";
 
@@ -50,8 +50,11 @@ for (const n of [1, 2, 7, 13, 64, 65]) {
   const got = await L.readOutput(n);
   const want = layerPrefillRef(hidden, n, w, cfg, newRefCache());
   const err = absErrScaled(got, want, amax(want));
-  ok(`prefill N=${n} vs CPU reference`, err < 2e-6,
-    `abs/scale ${err.toExponential(1)}  |max| ${amax(want).toFixed(2)}`);
+  ok(
+    `prefill N=${n} vs CPU reference`,
+    err < 2e-6,
+    `abs/scale ${err.toExponential(1)}  |max| ${amax(want).toFixed(2)}`,
+  );
 }
 
 // N=1 prefill must equal N=1 decode against the DECODE reference too -- the two
@@ -64,8 +67,11 @@ for (const n of [1, 2, 7, 13, 64, 65]) {
   const got = await L.readOutput(1);
   const want = layerForwardRef(hidden, w, cfg, newRefCache());
   const err = absErrScaled(got, want, amax(want));
-  ok("prefill N=1 matches the DECODE CPU reference", err < 2e-6,
-    `abs/scale ${err.toExponential(1)} (streaming vs one-pass softmax, real weights)`);
+  ok(
+    "prefill N=1 matches the DECODE CPU reference",
+    err < 2e-6,
+    `abs/scale ${err.toExponential(1)} (streaming vs one-pass softmax, real weights)`,
+  );
 }
 
 // ================================= prefill vs N sequential decode steps (GPU)
@@ -104,8 +110,11 @@ for (const n of [2, 7, 13, 33]) {
   const cacheB = await readCache(B, n);
 
   const err = absErrScaled(outA, outB, amax(outB));
-  ok(`prefill N=${n} == ${n} decode steps (hidden states)`, err < 2e-6,
-    `abs/scale ${err.toExponential(1)}`);
+  ok(
+    `prefill N=${n} == ${n} decode steps (hidden states)`,
+    err < 2e-6,
+    `abs/scale ${err.toExponential(1)}`,
+  );
 
   // The cache is written by the SAME kernels on both paths (rmsnorm then rope then
   // a buffer copy), differing only in batching, so bit-identity is the right bar
@@ -116,11 +125,16 @@ for (const n of [2, 7, 13, 33]) {
     if (cacheA.k[i] === cacheB.k[i]) kSame++;
     if (cacheA.v[i] === cacheB.v[i]) vSame++;
   }
-  ok(`prefill N=${n} leaves a BIT-IDENTICAL KV cache`,
+  ok(
+    `prefill N=${n} leaves a BIT-IDENTICAL KV cache`,
     kSame === cacheA.k.length && vSame === cacheA.v.length,
-    `k ${kSame}/${cacheA.k.length}, v ${vSame}/${cacheA.v.length}`);
-  ok(`prefill N=${n} advanced nKeys correctly`, A.nKeys === n && B.nKeys === n,
-    `prefill ${A.nKeys}, decode ${B.nKeys}`);
+    `k ${kSame}/${cacheA.k.length}, v ${vSame}/${cacheA.v.length}`,
+  );
+  ok(
+    `prefill N=${n} advanced nKeys correctly`,
+    A.nKeys === n && B.nKeys === n,
+    `prefill ${A.nKeys}, decode ${B.nKeys}`,
+  );
 }
 
 // ============================================ prefill then decode on top of it
@@ -154,13 +168,21 @@ console.log("\nprefill then decode (the path generate() takes)\n");
   for (let i = 0; i < nDec; i++) {
     worst = Math.max(worst, absErrScaled(decA[i], decB[i], amax(decB[i])));
   }
-  ok(`${nDec} decode steps on top of a ${nPre}-token prefill match all-decode`,
-    worst < 2e-6, `abs/scale ${worst.toExponential(1)}`);
-  ok("nKeys is consistent across the prefill/decode boundary",
-    A.nKeys === nPre + nDec && B.nKeys === nPre + nDec, `${A.nKeys} vs ${B.nKeys}`);
-  ok("the prefill's own output is finite and non-trivial",
+  ok(
+    `${nDec} decode steps on top of a ${nPre}-token prefill match all-decode`,
+    worst < 2e-6,
+    `abs/scale ${worst.toExponential(1)}`,
+  );
+  ok(
+    "nKeys is consistent across the prefill/decode boundary",
+    A.nKeys === nPre + nDec && B.nKeys === nPre + nDec,
+    `${A.nKeys} vs ${B.nKeys}`,
+  );
+  ok(
+    "the prefill's own output is finite and non-trivial",
     preOut.every(Number.isFinite) && amax(preOut) > 1,
-    `|max| ${amax(preOut).toFixed(2)}`);
+    `|max| ${amax(preOut).toFixed(2)}`,
+  );
 }
 
 // RoPE position is the silent one: a prefill that rotated every token by the same
@@ -208,8 +230,11 @@ console.log("\nprefill then decode (the path generate() takes)\n");
   for (let i = 0; i < n * cfg.hidden; i++) {
     worstDelta = Math.max(worstDelta, Math.abs(at0[i] - at900[i]));
   }
-  ok("position changes the output by O(1) at pos0=900 (RoPE angles are live)",
-    worstDelta > 1, `max |diff| ${worstDelta.toFixed(2)} vs |out| ${amax(at0).toFixed(2)}`);
+  ok(
+    "position changes the output by O(1) at pos0=900 (RoPE angles are live)",
+    worstDelta > 1,
+    `max |diff| ${worstDelta.toFixed(2)} vs |out| ${amax(at0).toFixed(2)}`,
+  );
 
   // And within a prefill, token i must be rotated by pos0 + i rather than all by
   // pos0. At pos0=900 the between-token angles are large enough to see, so this
@@ -218,15 +243,21 @@ console.log("\nprefill then decode (the path generate() takes)\n");
   for (let i = 0; i < cfg.hidden; i++) {
     tokDelta = Math.max(tokDelta, Math.abs(at900[i] - at900[(n - 1) * cfg.hidden + i]));
   }
-  ok("identical tokens WITHIN a prefill differ (RoPE uses the token index)",
-    tokDelta > 1e-3, `max |diff| between token 0 and ${n - 1} at pos0=900: ${tokDelta.toExponential(2)}`);
+  ok(
+    "identical tokens WITHIN a prefill differ (RoPE uses the token index)",
+    tokDelta > 1e-3,
+    `max |diff| between token 0 and ${n - 1} at pos0=900: ${tokDelta.toExponential(2)}`,
+  );
 
   // The GPU still has to agree with the reference at pos0=0, which is where the
   // arithmetic is checked; the positional assertions above are structural.
   const ref = layerPrefillRef(rep, n, w, cfg, newRefCache());
   const err = absErrScaled(at0, ref, amax(ref));
-  ok("repeated-token prefill matches the CPU reference", err < 2e-6,
-    `abs/scale ${err.toExponential(1)}`);
+  ok(
+    "repeated-token prefill matches the CPU reference",
+    err < 2e-6,
+    `abs/scale ${err.toExponential(1)}`,
+  );
 }
 
 // Chunking: two prefills of 5 must equal one prefill of 10. This is what lets a
@@ -249,8 +280,11 @@ console.log("\nprefill then decode (the path generate() takes)\n");
   outB.set(secondHalf, 5 * cfg.hidden);
 
   const err = absErrScaled(outA, outB, amax(outA));
-  ok("one prefill of 10 == two chunked prefills of 5", err < 2e-6,
-    `abs/scale ${err.toExponential(1)} (this is what chunks a prompt > maxPrefill)`);
+  ok(
+    "one prefill of 10 == two chunked prefills of 5",
+    err < 2e-6,
+    `abs/scale ${err.toExponential(1)} (this is what chunks a prompt > maxPrefill)`,
+  );
 }
 
 // Guard rails, because silently computing on a too-large batch would corrupt
@@ -258,11 +292,18 @@ console.log("\nprefill then decode (the path generate() takes)\n");
 {
   const L = await fresh();
   let threw = false;
-  try { L.encodePrefill(cfg.maxPrefill + 1, randVec((cfg.maxPrefill + 1) * cfg.hidden)); }
-  catch { threw = true; }
+  try {
+    L.encodePrefill(cfg.maxPrefill + 1, randVec((cfg.maxPrefill + 1) * cfg.hidden));
+  } catch {
+    threw = true;
+  }
   ok("prefill beyond maxPrefill throws rather than overrunning the buffers", threw);
   let threw2 = false;
-  try { L.encodePrefill(2, randVec(cfg.hidden)); } catch { threw2 = true; }
+  try {
+    L.encodePrefill(2, randVec(cfg.hidden));
+  } catch {
+    threw2 = true;
+  }
   ok("a hidden state of the wrong length throws", threw2);
 }
 

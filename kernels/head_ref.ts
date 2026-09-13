@@ -32,7 +32,9 @@ const fr = Math.fround;
  * token_embd is a plausible embedding, so a wrong row does not look wrong.
  */
 export function embedRef(
-  packed: Uint8Array, ids: number[], cols: number,
+  packed: Uint8Array,
+  ids: number[],
+  cols: number,
 ): Float32Array {
   const nb = cols / 32;
   const dv = new DataView(packed.buffer, packed.byteOffset, packed.byteLength);
@@ -63,7 +65,10 @@ export function embedRef(
 export function argmaxRef(x: Float32Array): number {
   let bi = 0, bv = x[0];
   for (let i = 1; i < x.length; i++) {
-    if (x[i] > bv) { bv = x[i]; bi = i; }
+    if (x[i] > bv) {
+      bv = x[i];
+      bi = i;
+    }
   }
   return bi;
 }
@@ -92,9 +97,16 @@ export function argmaxRef(x: Float32Array): number {
  * nKeys >= pos0 + nQueries. Query i attends to keys 0..pos0+i.
  */
 export function attnPrefillRef(
-  q: Float32Array, k: Float32Array, v: Float32Array,
-  nHeads: number, nKvHeads: number, headDim: number,
-  nQueries: number, pos0: number, tile = 64, wg = 128,
+  q: Float32Array,
+  k: Float32Array,
+  v: Float32Array,
+  nHeads: number,
+  nKvHeads: number,
+  headDim: number,
+  nQueries: number,
+  pos0: number,
+  tile = 64,
+  wg = 128,
 ): Float32Array {
   const out = new Float32Array(nQueries * nHeads * headDim);
   const groupSize = nHeads / nKvHeads;

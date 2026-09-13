@@ -47,7 +47,10 @@ const dev = await getDevice();
 
 /** The only honest fence: map a buffer the pass wrote. */
 async function fencedPass(build: (p: GPUComputePassEncoder) => void, out: GPUBuffer) {
-  const rd = dev.createBuffer({ size: 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  const rd = dev.createBuffer({
+    size: 4,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
   const enc = dev.createCommandEncoder();
   const p = enc.beginComputePass();
   build(p);
@@ -55,7 +58,8 @@ async function fencedPass(build: (p: GPUComputePassEncoder) => void, out: GPUBuf
   enc.copyBufferToBuffer(out, 0, rd, 0, 4);
   dev.queue.submit([enc.finish()]);
   await rd.mapAsync(GPUMapMode.READ);
-  rd.unmap(); rd.destroy();
+  rd.unmap();
+  rd.destroy();
 }
 
 async function measureFenceOverhead(): Promise<number> {
@@ -73,10 +77,15 @@ async function measureFenceOverhead(): Promise<number> {
 
 /** Median ms for ONE call, from `reps` in one pass behind one fence, fence removed. */
 async function timeBatched(
-  one: (p: GPUComputePassEncoder) => void, out: GPUBuffer, reps: number, fenceMs: number,
+  one: (p: GPUComputePassEncoder) => void,
+  out: GPUBuffer,
+  reps: number,
+  fenceMs: number,
 ): Promise<number> {
-  const build = (p: GPUComputePassEncoder) => { for (let i = 0; i < reps; i++) one(p); };
-  await fencedPass(build, out);                          // warmup
+  const build = (p: GPUComputePassEncoder) => {
+    for (let i = 0; i < reps; i++) one(p);
+  };
+  await fencedPass(build, out); // warmup
   const ms: number[] = [];
   for (let t = 0; t < TRIALS; t++) {
     const t0 = performance.now();
@@ -104,22 +113,35 @@ let floorUs = 0;
 @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g: vec3<u32>) {
   if (g.x == 0xFFFFFFFFu) { o[0] = 1.0; }
 }`,
-      }), entryPoint: "main",
+      }),
+      entryPoint: "main",
     },
   });
   const bg = dev.createBindGroup({
-    layout: pipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: o } }],
+    layout: pipe.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: o } }],
   });
-  floorUs = (await timeBatched((p) => {
-    p.setPipeline(pipe); p.setBindGroup(0, bg); p.dispatchWorkgroups(1);
-  }, o, 2000, fenceMs)) * 1000;
+  floorUs = (await timeBatched(
+    (p) => {
+      p.setPipeline(pipe);
+      p.setBindGroup(0, bg);
+      p.dispatchWorkgroups(1);
+    },
+    o,
+    2000,
+    fenceMs,
+  )) * 1000;
   console.log(`empty 1-workgroup dispatch: ${floorUs.toFixed(2)} us  <- the per-dispatch floor\n`);
   o.destroy();
 }
 
 interface Row {
-  shape: string; direction: string; n: number;
-  shardsUs: number; reduceUs: number; totalUs: number;
+  shape: string;
+  direction: string;
+  n: number;
+  shardsUs: number;
+  reduceUs: number;
+  totalUs: number;
 }
 const all: Row[] = [];
 
@@ -133,27 +155,45 @@ const all: Row[] = [];
  * pass would be timing something that is not the operation.
  */
 async function timeShape(
-  packed: Uint8Array, rows: number, cols: number, x: Float32Array,
-  n: number, direction: "row" | "col", reps: number,
+  packed: Uint8Array,
+  rows: number,
+  cols: number,
+  x: Float32Array,
+  n: number,
+  direction: "row" | "col",
+  reps: number,
 ): Promise<Row> {
   const split = splitQ8(packed, rows, cols);
   const mv = await ShardedMatvec.create(dev, split, rows, cols, n, direction);
   mv.setInput(x);
   const shardsUs = (await timeBatched(
     (p) => mv.dispatchShards(p),
-    direction === "col" ? mv.partials() : mv.output(), reps, fenceMs)) * 1000;
+    direction === "col" ? mv.partials() : mv.output(),
+    reps,
+    fenceMs,
+  )) * 1000;
   const reduceUs = direction === "col"
     ? (await timeBatched((p) => mv.dispatchReduce(p), mv.output(), reps, fenceMs)) * 1000
     : 0;
   mv.destroy();
-  return { shape: `${rows}x${cols}`, direction, n, shardsUs, reduceUs, totalUs: shardsUs + reduceUs };
+  return {
+    shape: `${rows}x${cols}`,
+    direction,
+    n,
+    shardsUs,
+    reduceUs,
+    totalUs: shardsUs + reduceUs,
+  };
 }
 
 function line(r: Row, baseUs: number) {
   console.log(
     `  ${r.shape.padEnd(12)} ${r.direction.padEnd(4)} ${String(r.n).padStart(2)} ` +
-    `${r.shardsUs.toFixed(1).padStart(8)} ${(r.direction === "col" ? r.reduceUs.toFixed(1) : "-").padStart(8)} ` +
-    `${r.totalUs.toFixed(1).padStart(8)} ${(r.totalUs / baseUs).toFixed(2).padStart(7)}x`);
+      `${r.shardsUs.toFixed(1).padStart(8)} ${
+        (r.direction === "col" ? r.reduceUs.toFixed(1) : "-").padStart(8)
+      } ` +
+      `${r.totalUs.toFixed(1).padStart(8)} ${(r.totalUs / baseUs).toFixed(2).padStart(7)}x`,
+  );
 }
 
 // ------------------------------------------------------- layer-sized shapes
@@ -162,8 +202,12 @@ function line(r: Row, baseUs: number) {
 // dispatch floor. That is the regime where sharding should look worst, and including
 // it is the point: a matvec that IS the dispatch floor cannot absorb N-1 more of them.
 console.log("-- layer-sized matvecs, us per call (unsharded is 1-2x the dispatch floor)\n");
-console.log(`  ${"shape".padEnd(12)} ${"dir".padEnd(4)} ${"N".padStart(2)} ` +
-            `${"shards".padStart(8)} ${"reduce".padStart(8)} ${"total".padStart(8)} ${"vs N=1".padStart(8)}`);
+console.log(
+  `  ${"shape".padEnd(12)} ${"dir".padEnd(4)} ${"N".padStart(2)} ` +
+    `${"shards".padStart(8)} ${"reduce".padStart(8)} ${"total".padStart(8)} ${
+      "vs N=1".padStart(8)
+    }`,
+);
 for (const [r, c] of [[1024, 1024], [3072, 1024], [1024, 3072]] as [number, number][]) {
   const packed = quantMatrixQ8(randVec(r * c, 0.05), r, c);
   const x = randVec(c, 0.1);
@@ -187,15 +231,17 @@ for (const [r, c] of [[1024, 1024], [3072, 1024], [1024, 3072]] as [number, numb
 // here for the extra dispatches to hide behind, and the overhead should be a small
 // percentage rather than a multiple.
 console.log("-- the real tied LM head, 151936 x 1024, us per call\n");
-console.log(`  ${"dir".padEnd(4)} ${"N".padStart(2)} ${"shards".padStart(9)} ` +
-            `${"reduce".padStart(9)} ${"total".padStart(9)} ${"vs N=1".padStart(8)} ` +
-            `${"GB/s".padStart(6)} ${"largest binding".padStart(16)}`);
+console.log(
+  `  ${"dir".padEnd(4)} ${"N".padStart(2)} ${"shards".padStart(9)} ` +
+    `${"reduce".padStart(9)} ${"total".padStart(9)} ${"vs N=1".padStart(8)} ` +
+    `${"GB/s".padStart(6)} ${"largest binding".padStart(16)}`,
+);
 {
   const m = await realModel();
   const split = splitQ8(m.embd.packed, m.embd.rows, m.embd.cols);
   const bytes = split.qs.byteLength + split.scales.byteLength;
   const x = randVec(m.embd.cols, 0.1);
-  const REPS = 100;        // ~785 us x 100 = ~80 ms per batch, well over the fence
+  const REPS = 100; // ~785 us x 100 = ~80 ms per batch, well over the fence
   for (const direction of ["row", "col"] as const) {
     let baseUs = 0;
     for (const n of [1, 2, 4, 8]) {
@@ -203,20 +249,31 @@ console.log(`  ${"dir".padEnd(4)} ${"N".padStart(2)} ${"shards".padStart(9)} ` +
       mv.setInput(x);
       const shardsUs = (await timeBatched(
         (p) => mv.dispatchShards(p),
-        direction === "col" ? mv.partials() : mv.output(), REPS, fenceMs)) * 1000;
+        direction === "col" ? mv.partials() : mv.output(),
+        REPS,
+        fenceMs,
+      )) * 1000;
       const reduceUs = direction === "col"
         ? (await timeBatched((p) => mv.dispatchReduce(p), mv.output(), REPS, fenceMs)) * 1000
         : 0;
       const totalUs = shardsUs + reduceUs;
       if (n === 1) baseUs = totalUs;
       const plan = memShardPlan(
-        { name: "h", rows: m.embd.rows, cols: m.embd.cols }, n, direction);
+        { name: "h", rows: m.embd.rows, cols: m.embd.cols },
+        n,
+        direction,
+      );
       all.push({ shape: "151936x1024", direction, n, shardsUs, reduceUs, totalUs });
       console.log(
         `  ${direction.padEnd(4)} ${String(n).padStart(2)} ${shardsUs.toFixed(1).padStart(9)} ` +
-        `${(direction === "col" ? reduceUs.toFixed(1) : "-").padStart(9)} ${totalUs.toFixed(1).padStart(9)} ` +
-        `${(totalUs / baseUs).toFixed(2).padStart(7)}x ${(bytes / (totalUs * 1e3)).toFixed(0).padStart(6)} ` +
-        `${((plan.maxBindingBytes / 1e6).toFixed(1) + " MB").padStart(16)}`);
+          `${(direction === "col" ? reduceUs.toFixed(1) : "-").padStart(9)} ${
+            totalUs.toFixed(1).padStart(9)
+          } ` +
+          `${(totalUs / baseUs).toFixed(2).padStart(7)}x ${
+            (bytes / (totalUs * 1e3)).toFixed(0).padStart(6)
+          } ` +
+          `${((plan.maxBindingBytes / 1e6).toFixed(1) + " MB").padStart(16)}`,
+      );
       mv.destroy();
     }
     console.log("");
@@ -234,10 +291,13 @@ console.log("-- what the overhead is, and where it comes from\n");
       const dispatchCost = (n - 1) * floorUs;
       console.log(
         `  ${direction}-wise head N=${n}: ${(at.totalUs - base.totalUs >= 0 ? "+" : "")}` +
-        `${(at.totalUs - base.totalUs).toFixed(1)} us vs N=1 ` +
-        `(${((at.totalUs / base.totalUs - 1) * 100).toFixed(1)}%); ` +
-        `${n - 1} extra dispatches at the ${floorUs.toFixed(1)} us floor = ${dispatchCost.toFixed(1)} us` +
-        (direction === "col" ? `; reduction ${at.reduceUs.toFixed(1)} us` : ""));
+          `${(at.totalUs - base.totalUs).toFixed(1)} us vs N=1 ` +
+          `(${((at.totalUs / base.totalUs - 1) * 100).toFixed(1)}%); ` +
+          `${n - 1} extra dispatches at the ${floorUs.toFixed(1)} us floor = ${
+            dispatchCost.toFixed(1)
+          } us` +
+          (direction === "col" ? `; reduction ${at.reduceUs.toFixed(1)} us` : ""),
+      );
     }
   }
   // The column-wise result is not dispatch overhead and the arithmetic above
@@ -266,9 +326,13 @@ console.log("-- what the overhead is, and where it comes from\n");
     const c1 = head.find((r) => r.direction === "col" && r.n === 1)!;
     const unexplained = (c8.totalUs - c1.totalUs) - 7 * floorUs - c8.reduceUs;
     console.log("");
-    console.log(`  col-wise N=8's ${(c8.totalUs - c1.totalUs).toFixed(0)} us of overhead is NOT dispatches:`);
-    console.log(`    dispatches ${(7 * floorUs).toFixed(0)} us + reduction ${c8.reduceUs.toFixed(0)} us ` +
-                `leaves ${unexplained.toFixed(0)} us unexplained.`);
+    console.log(
+      `  col-wise N=8's ${(c8.totalUs - c1.totalUs).toFixed(0)} us of overhead is NOT dispatches:`,
+    );
+    console.log(
+      `    dispatches ${(7 * floorUs).toFixed(0)} us + reduction ${c8.reduceUs.toFixed(0)} us ` +
+        `leaves ${unexplained.toFixed(0)} us unexplained.`,
+    );
     console.log(`    That is lane starvation. Each row still gets 64 lanes but a shard`);
     console.log(`    has only 1024/32/8 = 4 blocks, so 60 of 64 lanes idle. Row-wise`);
     console.log(`    keeps every row's full column count and does not degrade.`);

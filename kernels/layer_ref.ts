@@ -13,21 +13,29 @@ import { addRef, attnRef, rmsnormRef, ropeInvFreq, ropeRef, swigluRef } from "./
 import { attnPrefillRef } from "./head_ref.ts";
 import type { LayerConfig, LayerWeights } from "./layer.ts";
 
-const COOP_LANES = 64;   // must match q8_coop.wgsl
+const COOP_LANES = 64; // must match q8_coop.wgsl
 
 /** Mutable KV cache for the reference, mirroring the GPU layout. */
-export interface RefCache { k: Float32Array[]; v: Float32Array[] }
+export interface RefCache {
+  k: Float32Array[];
+  v: Float32Array[];
+}
 
-export function newRefCache(): RefCache { return { k: [], v: [] }; }
+export function newRefCache(): RefCache {
+  return { k: [], v: [] };
+}
 
 /**
  * One decode step. `cache` is appended to, matching the GPU's behaviour, so a
  * multi-token test exercises the same cache-growth path on both sides.
  */
 export function layerForwardRef(
-  hidden: Float32Array, w: LayerWeights, cfg: LayerConfig, cache: RefCache,
+  hidden: Float32Array,
+  w: LayerWeights,
+  cfg: LayerConfig,
+  cache: RefCache,
 ): Float32Array {
-  const { nHeads, nKvHeads, headDim, ffn, eps } = cfg;
+  const { nHeads, nKvHeads, headDim, eps } = cfg;
   const invFreq = ropeInvFreq(headDim, cfg.ropeBase);
   const pos = cache.k.length;
   const mv = (name: string, x: Float32Array) => {
@@ -93,7 +101,10 @@ export function layerForwardRef(
  * followed by decode steps exercises the same cache on both sides.
  */
 export function layerPrefillRef(
-  hidden: Float32Array, nTokens: number, w: LayerWeights, cfg: LayerConfig,
+  hidden: Float32Array,
+  nTokens: number,
+  w: LayerWeights,
+  cfg: LayerConfig,
   cache: RefCache,
 ): Float32Array {
   const { nHeads, nKvHeads, headDim, ffn, eps, hidden: H } = cfg;
@@ -110,8 +121,13 @@ export function layerPrefillRef(
     const out = new Float32Array(nTokens * t.rows);
     for (let i = 0; i < nTokens; i++) {
       out.set(
-        cpuMatmulQ8F32(t.packed, x.subarray(i * cols, (i + 1) * cols), t.rows, t.cols,
-          coop(COOP_LANES)),
+        cpuMatmulQ8F32(
+          t.packed,
+          x.subarray(i * cols, (i + 1) * cols),
+          t.rows,
+          t.cols,
+          coop(COOP_LANES),
+        ),
         i * t.rows,
       );
     }

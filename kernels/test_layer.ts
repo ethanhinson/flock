@@ -32,7 +32,7 @@ import { realLayer } from "./real_weights.ts";
 const dev = await getDevice();
 const cfg = QWEN3_06B;
 
-const LAYER = 24;   // the layer shard0.onnx runs first
+const LAYER = 24; // the layer shard0.onnx runs first
 console.log(`loading blk.${LAYER}.* from Qwen3-0.6B-Q8_0.gguf ...`);
 const w = await realLayer(LAYER);
 console.log(`  q8 tensors: ${Object.keys(w.q8).join(", ")}`);
@@ -56,18 +56,31 @@ console.log(`  f32 gains:  ${Object.keys(w.f32).join(", ")}\n`);
   // "Varied" has to be generous: these came from a model trained in bf16, so the
   // f32 values carry only 8 mantissa bits and 1024 of them collapse to ~200
   // distinct. A zeroed or constant misread would give 1.
-  ok("attn_norm gain is finite, right-sized, and not constant",
+  ok(
+    "attn_norm gain is finite, right-sized, and not constant",
     g.length === cfg.hidden && g.every(Number.isFinite) && distinct > 32,
-    `len ${g.length}, ${distinct} distinct values, mean ${(g.reduce((a, b) => a + b, 0) / g.length).toFixed(3)}`);
-  const shapes = Object.entries(w.q8).map(([k, t]) => `${k.replace(".weight", "")} ${t.rows}x${t.cols}`);
+    `len ${g.length}, ${distinct} distinct values, mean ${
+      (g.reduce((a, b) => a + b, 0) / g.length).toFixed(3)
+    }`,
+  );
+  const shapes = Object.entries(w.q8).map(([k, t]) =>
+    `${k.replace(".weight", "")} ${t.rows}x${t.cols}`
+  );
   const want = [
-    "attn_q 2048x1024", "attn_k 1024x1024", "attn_v 1024x1024",
-    "attn_output 1024x2048", "ffn_gate 3072x1024", "ffn_up 3072x1024",
+    "attn_q 2048x1024",
+    "attn_k 1024x1024",
+    "attn_v 1024x1024",
+    "attn_output 1024x2048",
+    "ffn_gate 3072x1024",
+    "ffn_up 3072x1024",
     "ffn_down 1024x3072",
   ];
   const missing = want.filter((s) => !shapes.includes(s));
-  ok("all seven projections present with the expected shapes", missing.length === 0,
-    missing.length ? `missing ${missing.join(", ")}` : shapes.length + " tensors");
+  ok(
+    "all seven projections present with the expected shapes",
+    missing.length === 0,
+    missing.length ? `missing ${missing.join(", ")}` : shapes.length + " tensors",
+  );
 }
 
 const layer = await Layer.create(dev, w, cfg);
@@ -104,8 +117,11 @@ for (let step = 0; step < 4; step++) {
   //
   // Relative error is still reported, because a sudden jump in it would be worth
   // looking at even while the absolute number stays fine.
-  ok(`layer ${LAYER} step ${step} (nKeys=${step + 1})`, eAbs < 1e-6,
-    `abs/scale ${eAbs.toExponential(1)}  (per-element rel ${eRel.toExponential(1)})`);
+  ok(
+    `layer ${LAYER} step ${step} (nKeys=${step + 1})`,
+    eAbs < 1e-6,
+    `abs/scale ${eAbs.toExponential(1)}  (per-element rel ${eRel.toExponential(1)})`,
+  );
 
   gpuH = gpu;
   refH = ref;
@@ -120,11 +136,17 @@ for (let step = 0; step < 4; step++) {
   const x = randVec(cfg.hidden, 0.05);
   const y = await layer.forward(x);
   let dot = 0, nx = 0, ny = 0;
-  for (let i = 0; i < x.length; i++) { dot += x[i] * y[i]; nx += x[i] * x[i]; ny += y[i] * y[i]; }
+  for (let i = 0; i < x.length; i++) {
+    dot += x[i] * y[i];
+    nx += x[i] * x[i];
+    ny += y[i] * y[i];
+  }
   const cos = dot / Math.sqrt(nx * ny);
-  ok("layer transforms the hidden state (not a pass-through)",
+  ok(
+    "layer transforms the hidden state (not a pass-through)",
     y.every(Number.isFinite) && amax(y) > 0 && cos < 0.999,
-    `cos(in, out) = ${cos.toFixed(4)}, |out|max = ${amax(y).toExponential(2)}`);
+    `cos(in, out) = ${cos.toFixed(4)}, |out|max = ${amax(y).toExponential(2)}`,
+  );
 }
 
 // Position dependence: the same token at a different cache position must produce
@@ -141,11 +163,14 @@ for (let step = 0; step < 4; step++) {
   layer.reset();
   const x = randVec(cfg.hidden, 0.05);
   const at0 = await layer.forward(x);
-  const at1 = await layer.forward(x);     // same input, now at position 1
+  const at1 = await layer.forward(x); // same input, now at position 1
   let changed = 0;
   for (let i = 0; i < x.length; i++) if (at0[i] !== at1[i]) changed++;
-  ok("output depends on position (RoPE is live)", changed > cfg.hidden / 2,
-    `${changed}/${cfg.hidden} entries differ between position 0 and position 1`);
+  ok(
+    "output depends on position (RoPE is live)",
+    changed > cfg.hidden / 2,
+    `${changed}/${cfg.hidden} entries differ between position 0 and position 1`,
+  );
 }
 
 Deno.exit(summary() ? 1 : 0);

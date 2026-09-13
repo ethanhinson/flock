@@ -24,9 +24,7 @@
 //   4. A whole greedy generation over the real model agrees token for token, and
 //      the sharded head runs under a binding limit the unsharded one cannot.
 
-import {
-  getDevice, ok, quantMatrixQ8, randVec, readBack, splitQ8, summary,
-} from "./lib.ts";
+import { getDevice, ok, quantMatrixQ8, randVec, readBack, splitQ8, summary } from "./lib.ts";
 import { argmaxRef } from "./head_ref.ts";
 import { QWEN3_06B } from "./layer.ts";
 import { Model } from "./model.ts";
@@ -38,7 +36,8 @@ const dev = await getDevice();
 
 /** Run a sharded head over one hidden state and return (logits, token id). */
 async function runHead(
-  head: ShardedHead, h: Float32Array,
+  head: ShardedHead,
+  h: Float32Array,
 ): Promise<{ logits: Float32Array; token: number }> {
   head.setInput(h);
   const enc = dev.createCommandEncoder();
@@ -78,18 +77,29 @@ console.log("-- synthetic head, vocab 4096 x hidden 256\n");
   const base = await ShardedHead.create(dev, split, vocab, hidden, { shards: 1 });
   const ref = await runHead(base, h);
   const refToken = argmaxRef(ref.logits);
-  ok("the 1-shard head's own argmax agrees with argmaxRef", ref.token === refToken,
-     `sharded ${ref.token}, argmaxRef ${refToken}`);
+  ok(
+    "the 1-shard head's own argmax agrees with argmaxRef",
+    ref.token === refToken,
+    `sharded ${ref.token}, argmaxRef ${refToken}`,
+  );
 
   for (const n of [2, 3, 4, 5, 7, 8]) {
     const head = await ShardedHead.create(dev, split, vocab, hidden, { shards: n });
     const got = await runHead(head, h);
     let diff = 0;
     for (let i = 0; i < vocab; i++) diff = Math.max(diff, Math.abs(got.logits[i] - ref.logits[i]));
-    ok(`N=${n}: all ${vocab} logits bit-identical to unsharded`, diff === 0,
-       `max |diff| ${diff.toExponential(1)}  (rows ${shardRanges(vocab, n, 1).map((r) => r.count).join("/")})`);
-    ok(`N=${n}: picks the same token as argmaxRef`, got.token === refToken,
-       `sharded ${got.token}, ref ${refToken}`);
+    ok(
+      `N=${n}: all ${vocab} logits bit-identical to unsharded`,
+      diff === 0,
+      `max |diff| ${diff.toExponential(1)}  (rows ${
+        shardRanges(vocab, n, 1).map((r) => r.count).join("/")
+      })`,
+    );
+    ok(
+      `N=${n}: picks the same token as argmaxRef`,
+      got.token === refToken,
+      `sharded ${got.token}, ref ${refToken}`,
+    );
     head.destroy();
   }
   base.destroy();
@@ -119,20 +129,32 @@ console.log("\n-- tie-breaking across a shard boundary\n");
   const cases: { name: string; rows: number[]; want: number }[] = [
     // A tie between shard 1 and shard 3: the lower global index must win, which
     // is in the EARLIER shard.
-    { name: "tie across shards 1 and 3", rows: [ranges[1].start + 5, ranges[3].start + 9],
-      want: ranges[1].start + 5 },
+    {
+      name: "tie across shards 1 and 3",
+      rows: [ranges[1].start + 5, ranges[3].start + 9],
+      want: ranges[1].start + 5,
+    },
     // A tie in the LAST shard against the FIRST: shard 0 must win even though the
     // reduction walks shards in increasing order and would otherwise be free to
     // keep the later one.
-    { name: "tie across shards 0 and 3", rows: [ranges[0].start + 1, ranges[3].end - 1],
-      want: ranges[0].start + 1 },
+    {
+      name: "tie across shards 0 and 3",
+      rows: [ranges[0].start + 1, ranges[3].end - 1],
+      want: ranges[0].start + 1,
+    },
     // A tie WITHIN one shard, which exercises argmax.wgsl's own rule under the
     // shard's shifted indexing rather than the host reduction.
-    { name: "tie inside shard 2", rows: [ranges[2].start + 3, ranges[2].start + 400],
-      want: ranges[2].start + 3 },
+    {
+      name: "tie inside shard 2",
+      rows: [ranges[2].start + 3, ranges[2].start + 400],
+      want: ranges[2].start + 3,
+    },
     // Exactly at a boundary: the last row of shard 1 against the first of shard 2.
-    { name: "tie at the shard 1/2 boundary", rows: [ranges[1].end - 1, ranges[2].start],
-      want: ranges[1].end - 1 },
+    {
+      name: "tie at the shard 1/2 boundary",
+      rows: [ranges[1].end - 1, ranges[2].start],
+      want: ranges[1].end - 1,
+    },
   ];
   const x = new Float32Array(hidden);
   x[0] = 7.0;
@@ -151,10 +173,16 @@ console.log("\n-- tie-breaking across a shard boundary\n");
     // equal proves nothing, and quantization could have separated them.
     const tied = got.logits[c.rows[0]] === got.logits[c.rows[1]];
     const refToken = argmaxRef(got.logits);
-    ok(`${c.name}: the planted logits really are equal in f32`, tied,
-       `${got.logits[c.rows[0]]} vs ${got.logits[c.rows[1]]}`);
-    ok(`${c.name}: lowest index wins`, got.token === c.want && refToken === c.want,
-       `sharded ${got.token}, argmaxRef ${refToken}, want ${c.want}`);
+    ok(
+      `${c.name}: the planted logits really are equal in f32`,
+      tied,
+      `${got.logits[c.rows[0]]} vs ${got.logits[c.rows[1]]}`,
+    );
+    ok(
+      `${c.name}: lowest index wins`,
+      got.token === c.want && refToken === c.want,
+      `sharded ${got.token}, argmaxRef ${refToken}, want ${c.want}`,
+    );
     head.destroy();
   }
 }
@@ -169,16 +197,34 @@ const embdSplit = splitQ8(m.embd.packed, m.embd.rows, m.embd.cols);
 // is the configuration test_model.ts validates token for token against ONNX, so
 // the reference here is the one with the ONNX proof behind it.
 const whole = await Model.create(dev, m, cfg);
-const PROMPT = [151644, 872, 198, 63593, 315, 9625, 30, 151645, 198,
-                151644, 77091, 198, 151667, 271, 151668, 271];
+const PROMPT = [
+  151644,
+  872,
+  198,
+  63593,
+  315,
+  9625,
+  30,
+  151645,
+  198,
+  151644,
+  77091,
+  198,
+  151667,
+  271,
+  151668,
+  271,
+];
 
 const refLogits = await whole.logits(PROMPT);
 const refToken = argmaxRef(refLogits);
 const wholeToken = await whole.currentToken();
-ok("the unsharded engine's GPU argmax agrees with argmaxRef on the real logits",
-   wholeToken === refToken, `GPU ${wholeToken}, argmaxRef ${refToken}`);
-ok("and that token is the one the ONNX comparison pins (785)", refToken === 785,
-   `got ${refToken}`);
+ok(
+  "the unsharded engine's GPU argmax agrees with argmaxRef on the real logits",
+  wholeToken === refToken,
+  `GPU ${wholeToken}, argmaxRef ${refToken}`,
+);
+ok("and that token is the one the ONNX comparison pins (785)", refToken === 785, `got ${refToken}`);
 
 // The hidden state AFTER output_norm: the sharded head's job starts there, since
 // output_norm is one 1024-element op that does not need splitting.
@@ -199,13 +245,23 @@ for (const n of [2, 4, 8]) {
   const got = await runHead(head, normed);
   let diff = 0;
   for (let i = 0; i < m.vocab; i++) diff = Math.max(diff, Math.abs(got.logits[i] - refLogits[i]));
-  ok(`real head N=${n}: all 151936 logits bit-identical to the unsharded engine`,
-     diff === 0, `max |diff| ${diff.toExponential(1)}`);
-  ok(`real head N=${n}: picks token ${refToken}, the same as argmaxRef`,
-     got.token === refToken, `sharded ${got.token}, ref ${refToken}`);
+  ok(
+    `real head N=${n}: all 151936 logits bit-identical to the unsharded engine`,
+    diff === 0,
+    `max |diff| ${diff.toExponential(1)}`,
+  );
+  ok(
+    `real head N=${n}: picks token ${refToken}, the same as argmaxRef`,
+    got.token === refToken,
+    `sharded ${got.token}, ref ${refToken}`,
+  );
   const bytes = head.shardBytes();
-  console.log(`     shard bytes: ${bytes.map((b) => (b / 1e6).toFixed(1)).join(" / ")} MB` +
-              `  (unsharded ${((m.vocab * m.embd.cols + m.vocab * (m.embd.cols / 32) * 2) / 1e6).toFixed(1)} MB)`);
+  console.log(
+    `     shard bytes: ${bytes.map((b) => (b / 1e6).toFixed(1)).join(" / ")} MB` +
+      `  (unsharded ${
+        ((m.vocab * m.embd.cols + m.vocab * (m.embd.cols / 32) * 2) / 1e6).toFixed(1)
+      } MB)`,
+  );
   head.destroy();
 }
 
@@ -219,7 +275,12 @@ console.log("\n-- greedy generation, unsharded head vs a 4-way sharded head\n");
 {
   const N = 12;
   const shardHead = await ShardedHead.create(
-    dev, embdSplit, m.vocab, m.embd.cols, { shards: 4 });
+    dev,
+    embdSplit,
+    m.vocab,
+    m.embd.cols,
+    { shards: 4 },
+  );
 
   // Two independent engines so the KV caches cannot alias. Each runs the SAME
   // layer stack; only the head differs -- unsharded on `a`, 4-way sharded on `b`.
@@ -236,7 +297,8 @@ console.log("\n-- greedy generation, unsharded head vs a 4-way sharded head\n");
   let tb = (await runHead(shardHead, await b.normedState(PROMPT))).token;
 
   for (let i = 0; i < N; i++) {
-    idsA.push(ta); idsB.push(tb);
+    idsA.push(ta);
+    idsB.push(tb);
     if (ta === m.eos || tb === m.eos) break;
     ta = await a.step([ta]);
     const nb = await b.normedState([tb]);
@@ -245,9 +307,13 @@ console.log("\n-- greedy generation, unsharded head vs a 4-way sharded head\n");
   console.log(`  unsharded head: ${JSON.stringify(idsA)}`);
   console.log(`  4-way sharded:  ${JSON.stringify(idsB)}\n`);
   const same = idsA.length === idsB.length && idsA.every((x, i) => x === idsB[i]);
-  ok(`greedy decode is identical with a 4-way sharded head for ${idsA.length} tokens`,
-     same, same ? `${idsA.length} tokens identical`
-                : `first difference at ${idsA.findIndex((x, i) => x !== idsB[i])}`);
+  ok(
+    `greedy decode is identical with a 4-way sharded head for ${idsA.length} tokens`,
+    same,
+    same
+      ? `${idsA.length} tokens identical`
+      : `first difference at ${idsA.findIndex((x, i) => x !== idsB[i])}`,
+  );
   shardHead.destroy();
 }
 
@@ -258,31 +324,54 @@ console.log("\n-- greedy generation, unsharded head vs a 4-way sharded head\n");
 {
   const LIMIT = 128 * 1024 * 1024;
   const unshardedPlan = memShardPlan(
-    { name: "token_embd.weight", rows: m.vocab, cols: m.embd.cols }, 1, "row", LIMIT);
-  ok("the unsharded tied head does NOT fit the 128 MiB default binding limit",
-     !unshardedPlan.fits,
-     `${(unshardedPlan.maxBindingBytes / 1e6).toFixed(1)} MB > ${(LIMIT / 1e6).toFixed(1)} MB`);
-  ok(`memShardPlan says ${unshardedPlan.minShardsForLimit} shards are enough`,
-     unshardedPlan.minShardsForLimit === 2, `${unshardedPlan.minShardsForLimit}`);
+    { name: "token_embd.weight", rows: m.vocab, cols: m.embd.cols },
+    1,
+    "row",
+    LIMIT,
+  );
+  ok(
+    "the unsharded tied head does NOT fit the 128 MiB default binding limit",
+    !unshardedPlan.fits,
+    `${(unshardedPlan.maxBindingBytes / 1e6).toFixed(1)} MB > ${(LIMIT / 1e6).toFixed(1)} MB`,
+  );
+  ok(
+    `memShardPlan says ${unshardedPlan.minShardsForLimit} shards are enough`,
+    unshardedPlan.minShardsForLimit === 2,
+    `${unshardedPlan.minShardsForLimit}`,
+  );
 
   // And it actually runs under that limit, producing the right token. This is the
   // whole deliverable in one assertion: a head that a default-limits device cannot
   // bind at all, running correctly split.
   const head = await ShardedHead.create(
-    dev, embdSplit, m.vocab, m.embd.cols,
-    { shards: unshardedPlan.minShardsForLimit!, bindingLimit: LIMIT });
+    dev,
+    embdSplit,
+    m.vocab,
+    m.embd.cols,
+    { shards: unshardedPlan.minShardsForLimit!, bindingLimit: LIMIT },
+  );
   const got = await runHead(head, normed);
-  ok(`a ${unshardedPlan.minShardsForLimit}-way head runs under a 128 MiB limit and picks ${refToken}`,
-     got.token === refToken, `got ${got.token}`);
+  ok(
+    `a ${unshardedPlan.minShardsForLimit}-way head runs under a 128 MiB limit and picks ${refToken}`,
+    got.token === refToken,
+    `got ${got.token}`,
+  );
   head.destroy();
 
   let threw = "";
   try {
-    await ShardedHead.create(dev, embdSplit, m.vocab, m.embd.cols,
-      { shards: 1, bindingLimit: LIMIT });
-  } catch (e) { threw = String((e as Error).message); }
-  ok("a 1-shard head under a 128 MiB limit is refused before upload",
-     threw.includes("over the"), threw || "(did not throw)");
+    await ShardedHead.create(dev, embdSplit, m.vocab, m.embd.cols, {
+      shards: 1,
+      bindingLimit: LIMIT,
+    });
+  } catch (e) {
+    threw = String((e as Error).message);
+  }
+  ok(
+    "a 1-shard head under a 128 MiB limit is refused before upload",
+    threw.includes("over the"),
+    threw || "(did not throw)",
+  );
 }
 
 Deno.exit(summary() ? 1 : 0);

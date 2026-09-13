@@ -39,7 +39,7 @@
 
 import { getDevice, ok, randVec, summary } from "./lib.ts";
 import { amax, relErr } from "./ops_ref.ts";
-import { Layer, QWEN3_06B, type LayerWeights } from "./layer.ts";
+import { Layer, type LayerWeights, QWEN3_06B } from "./layer.ts";
 import { layerForwardRef, newRefCache } from "./layer_ref.ts";
 import { realLayer } from "./real_weights.ts";
 import { requantWithNoise } from "./dequant.ts";
@@ -77,14 +77,24 @@ const hidden = randVec(cfg.hidden, 0.05);
 // --- ONNX ------------------------------------------------------------------
 const tmp = await Deno.makeTempDir();
 const inPath = `${tmp}/in.json`, outPath = `${tmp}/out.json`;
-await Deno.writeTextFile(inPath, JSON.stringify({
-  ort: paths.ort, shard: paths.shard, nTokens: 1, positions: [0], pastLen: 0,
-  nLayers: 2, kvHeads: cfg.nKvHeads, headDim: cfg.headDim,
-  hidden: Array.from(hidden),
-}));
+await Deno.writeTextFile(
+  inPath,
+  JSON.stringify({
+    ort: paths.ort,
+    shard: paths.shard,
+    nTokens: 1,
+    positions: [0],
+    pastLen: 0,
+    nLayers: 2,
+    kvHeads: cfg.nKvHeads,
+    headDim: cfg.headDim,
+    hidden: Array.from(hidden),
+  }),
+);
 const proc = new Deno.Command("node", {
   args: [new URL("./onnx_truth.mjs", import.meta.url).pathname, inPath, outPath],
-  stdout: "piped", stderr: "piped",
+  stdout: "piped",
+  stderr: "piped",
 });
 const { code, stderr } = await proc.output();
 if (code !== 0) {
@@ -128,7 +138,11 @@ function maxAbs(a: Float32Array, b: Float32Array): number {
 }
 function cosine(a: Float32Array, b: Float32Array): number {
   let dot = 0, na = 0, nb = 0;
-  for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
   return dot / Math.sqrt(na * nb);
 }
 
@@ -140,23 +154,33 @@ console.log(`ONNX  output |max| ${amax(onnxOut).toFixed(3)}, first: ${onnxOut[0]
 console.log(`WGSL  output |max| ${amax(gpuOut).toFixed(3)}, first: ${gpuOut[0].toFixed(4)}\n`);
 
 console.log(`quantization term (same arithmetic, one extra round of Q8_0 noise):`);
-console.log(`  abs/scale ${quantAbs.toExponential(2)}   per-element rel ${quantTerm.toExponential(2)}\n`);
+console.log(
+  `  abs/scale ${quantAbs.toExponential(2)}   per-element rel ${quantTerm.toExponential(2)}\n`,
+);
 
 // The GPU must match its own Q8_0 CPU reference tightly -- that is the ULP-level
 // check test_layer.ts makes, repeated here over two chained layers.
-ok("WGSL matches its Q8_0 CPU reference over 2 chained layers",
-  gpuVsRefAbs < 1e-6, `abs/scale ${gpuVsRefAbs.toExponential(1)}`);
+ok(
+  "WGSL matches its Q8_0 CPU reference over 2 chained layers",
+  gpuVsRefAbs < 1e-6,
+  `abs/scale ${gpuVsRefAbs.toExponential(1)}`,
+);
 
 // Against ONNX the bar is "no worse than quantization explains". 3x margin
 // covers ORT using different kernels and summation orders than either of ours.
-ok("WGSL vs ONNX is within what Q8_0 quantization accounts for",
+ok(
+  "WGSL vs ONNX is within what Q8_0 quantization accounts for",
   gpuVsOnnxAbs < Math.max(3 * quantAbs, 1e-3),
-  `abs/scale ${gpuVsOnnxAbs.toExponential(2)} vs quantization ${quantAbs.toExponential(2)}`);
+  `abs/scale ${gpuVsOnnxAbs.toExponential(2)} vs quantization ${quantAbs.toExponential(2)}`,
+);
 
 // Direction is the structural check: quantization perturbs magnitudes, a wiring
 // bug changes what is being computed.
-ok("WGSL and ONNX agree in direction (cosine ~ 1)", gpuVsOnnxCos > 0.999,
-  `cosine ${gpuVsOnnxCos.toFixed(6)}`);
+ok(
+  "WGSL and ONNX agree in direction (cosine ~ 1)",
+  gpuVsOnnxCos > 0.999,
+  `cosine ${gpuVsOnnxCos.toFixed(6)}`,
+);
 
 await Deno.remove(tmp, { recursive: true });
 Deno.exit(summary() ? 1 : 0);

@@ -35,19 +35,21 @@ console.log("loading Qwen3-0.6B-Q8_0.gguf ...");
 const m = await realModel();
 console.log(`  ${m.nLayers} layers, vocab ${m.vocab}, hidden ${m.hidden}\n`);
 
-const CUT = 24;   // flock's default split: coordinator 0-23, birds 24-27
+const CUT = 24; // flock's default split: coordinator 0-23, birds 24-27
 
 // The reference: one Model holding everything, the configuration test_model.ts
 // validated against ONNX.
 const whole = await Model.create(dev, m, cfg);
-ok("the whole model holds every layer", whole.held === m.nLayers,
-   `${whole.held} layers`);
+ok("the whole model holds every layer", whole.held === m.nLayers, `${whole.held} layers`);
 
 // The coordinator: the same class, cut. It holds the embedding, layers 0..CUT-1,
 // output_norm and the tied head.
 const coord = await Model.create(dev, m, cfg, { cut: CUT });
-ok(`a cut-${CUT} coordinator holds only layers 0-${CUT - 1}`, coord.held === CUT,
-   `${coord.held} layers`);
+ok(
+  `a cut-${CUT} coordinator holds only layers 0-${CUT - 1}`,
+  coord.held === CUT,
+  `${coord.held} layers`,
+);
 
 // The birds: layers CUT..27, each its own Layer with its own KV cache, exactly as
 // a phone holds them. Built through fromBuffers' sibling create() here because the
@@ -80,15 +82,33 @@ async function lap(ids: number[]): Promise<number> {
 }
 
 // --- prompt: the 16 ids test_model.ts uses, so this ties back to the ONNX proof --
-const PROMPT = [151644, 872, 198, 63593, 315, 9625, 30, 151645, 198,
-                151644, 77091, 198, 151667, 271, 151668, 271];
+const PROMPT = [
+  151644,
+  872,
+  198,
+  63593,
+  315,
+  9625,
+  30,
+  151645,
+  198,
+  151644,
+  77091,
+  198,
+  151667,
+  271,
+  151668,
+  271,
+];
 
 const wholeFirst = await whole.step(PROMPT);
 const splitFirst = await lap(PROMPT);
-ok("split and whole agree on the first token after the prompt",
-   wholeFirst === splitFirst, `whole ${wholeFirst}, split ${splitFirst}`);
-ok("that token is the one the ONNX comparison pins (785)", splitFirst === 785,
-   `got ${splitFirst}`);
+ok(
+  "split and whole agree on the first token after the prompt",
+  wholeFirst === splitFirst,
+  `whole ${wholeFirst}, split ${splitFirst}`,
+);
+ok("that token is the one the ONNX comparison pins (785)", splitFirst === 785, `got ${splitFirst}`);
 
 // --- and then a real generation, because step 0 is the easy case --------------
 //
@@ -110,11 +130,14 @@ console.log(`whole: ${JSON.stringify(wholeIds)}`);
 console.log(`split: ${JSON.stringify(splitIds)}\n`);
 
 const same = wholeIds.length === splitIds.length &&
-             wholeIds.every((x, i) => x === splitIds[i]);
-ok(`greedy decode is identical across the split for ${wholeIds.length} tokens`,
-   same,
-   same ? `${wholeIds.length} tokens identical`
-        : `first difference at ${wholeIds.findIndex((x, i) => x !== splitIds[i])}`);
+  wholeIds.every((x, i) => x === splitIds[i]);
+ok(
+  `greedy decode is identical across the split for ${wholeIds.length} tokens`,
+  same,
+  same
+    ? `${wholeIds.length} tokens identical`
+    : `first difference at ${wholeIds.findIndex((x, i) => x !== splitIds[i])}`,
+);
 
 // --- the hidden state itself, not just the token it produces ------------------
 //
@@ -127,9 +150,11 @@ for (const l of birds) l.reset();
 
 const probe = PROMPT.slice(0, 8);
 const coordOut = await coord.encodePartial(probe);
-ok("the coordinator hands over every position, not only the last",
-   coordOut.length === probe.length * cfg.hidden,
-   `${coordOut.length} floats for ${probe.length} tokens`);
+ok(
+  "the coordinator hands over every position, not only the last",
+  coordOut.length === probe.length * cfg.hidden,
+  `${coordOut.length} floats for ${probe.length} tokens`,
+);
 
 // The same prefix through the unsplit model, read at the cut. hiddenState() reads
 // after ALL layers, so the comparison has to be made by running the unsplit
@@ -142,22 +167,35 @@ let hdiff = 0;
 for (let i = 0; i < coordOut.length; i++) {
   hdiff = Math.max(hdiff, Math.abs(coordOut[i] - coord2Out[i]));
 }
-ok("two independently built coordinators produce the identical hidden state",
-   hdiff === 0, `max |diff| ${hdiff.toExponential(1)} over ${coordOut.length} floats`);
+ok(
+  "two independently built coordinators produce the identical hidden state",
+  hdiff === 0,
+  `max |diff| ${hdiff.toExponential(1)} over ${coordOut.length} floats`,
+);
 
 // --- the guards, because a cache that silently desynchronizes is the real risk --
 let threw = "";
 try {
   await coord.encodePartial([1, 2, 3], 999);
-} catch (e) { threw = String((e as Error).message); }
-ok("an offset that disagrees with the cache position throws rather than computing",
-   threw.includes("999") && threw.includes("position"), threw || "(did not throw)");
+} catch (e) {
+  threw = String((e as Error).message);
+}
+ok(
+  "an offset that disagrees with the cache position throws rather than computing",
+  threw.includes("999") && threw.includes("position"),
+  threw || "(did not throw)",
+);
 
 threw = "";
 try {
   await coord.projectHidden(new Float32Array(cfg.hidden - 1), 1);
-} catch (e) { threw = String((e as Error).message); }
-ok("a short hidden state throws rather than projecting garbage",
-   threw.includes("floats"), threw || "(did not throw)");
+} catch (e) {
+  threw = String((e as Error).message);
+}
+ok(
+  "a short hidden state throws rather than projecting garbage",
+  threw.includes("floats"),
+  threw || "(did not throw)",
+);
 
 Deno.exit(summary());

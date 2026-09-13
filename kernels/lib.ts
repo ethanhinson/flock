@@ -23,14 +23,14 @@
 import { f32to16 } from "../web/js/wire.mjs";
 
 export const Q8_BLOCK = 32;
-export const Q8_BYTES = 34;   // f16 scale + 32 int8
+export const Q8_BYTES = 34; // f16 scale + 32 int8
 export const Q4_BLOCK = 32;
-export const Q4_BYTES = 18;   // f16 scale + 16 packed nibble pairs
+export const Q4_BYTES = 18; // f16 scale + 16 packed nibble pairs
 
 export function halfToF32(h: number): number {
   const s = (h & 0x8000) ? -1 : 1, e = (h >>> 10) & 0x1f, m = h & 0x3ff;
   if (e === 0) return s * m * Math.pow(2, -24);
-  if (e === 31) return s * 3.4028235e38;   // kernels clamp inf to max finite
+  if (e === 31) return s * 3.4028235e38; // kernels clamp inf to max finite
   return s * (1 + m / 1024) * Math.pow(2, e - 15);
 }
 
@@ -71,7 +71,10 @@ export function quantRowQ4(vals: Float32Array): Uint8Array {
     let amax = 0, max = 0;
     for (let i = 0; i < Q4_BLOCK; i++) {
       const v = vals[b * 32 + i];
-      if (Math.abs(v) > amax) { amax = Math.abs(v); max = v; }
+      if (Math.abs(v) > amax) {
+        amax = Math.abs(v);
+        max = v;
+      }
     }
     const d = max / -8;
     const id = d === 0 ? 0 : 1 / d;
@@ -115,7 +118,10 @@ export function quantMatrixQ4(w: Float32Array, rows: number, cols: number): Uint
 // is f16 packed two-per-word (unpack2x16float). Repacking is a one-time upload
 // cost and it is what buys the kernel its speed.
 
-export interface SplitQ8 { qs: Uint8Array; scales: Uint8Array }
+export interface SplitQ8 {
+  qs: Uint8Array;
+  scales: Uint8Array;
+}
 
 export function splitQ8(packed: Uint8Array, rows: number, cols: number): SplitQ8 {
   const nb = cols / Q8_BLOCK, rowBytes = nb * Q8_BYTES;
@@ -205,7 +211,10 @@ function dot4(a: number[], b: number[]): number {
  * byte so one word spans cols g*4..g*4+3 and g*4+16..g*4+19.
  */
 function matmulF32(
-  rows: number, cols: number, blockBytes: number, red: Reduction,
+  rows: number,
+  cols: number,
+  blockBytes: number,
+  red: Reduction,
   decode: (base: number) => { scale: number; q: number[] },
   x: Float32Array,
   rowBase: (r: number) => number,
@@ -240,38 +249,63 @@ function matmulF32(
 }
 
 export function cpuMatmulQ8F32(
-  packed: Uint8Array, x: Float32Array, rows: number, cols: number, red: Reduction = SERIAL,
+  packed: Uint8Array,
+  x: Float32Array,
+  rows: number,
+  cols: number,
+  red: Reduction = SERIAL,
 ): Float32Array {
   const nb = cols / Q8_BLOCK;
   const dv = new DataView(packed.buffer, packed.byteOffset, packed.byteLength);
-  return matmulF32(rows, cols, Q8_BYTES, red, (base) => {
-    const q = new Array(32);
-    for (let i = 0; i < 32; i++) {
-      let v = packed[base + 2 + i]; if (v > 127) v -= 256;
-      q[i] = v;
-    }
-    return { scale: fr(halfToF32(dv.getUint16(base, true))), q };
-  }, x, (r) => r * nb * Q8_BYTES,
-    (g) => [[0, 1, 2, 3].map((k) => g * 8 + k), [0, 1, 2, 3].map((k) => g * 8 + 4 + k)]);
+  return matmulF32(
+    rows,
+    cols,
+    Q8_BYTES,
+    red,
+    (base) => {
+      const q = new Array(32);
+      for (let i = 0; i < 32; i++) {
+        let v = packed[base + 2 + i];
+        if (v > 127) v -= 256;
+        q[i] = v;
+      }
+      return { scale: fr(halfToF32(dv.getUint16(base, true))), q };
+    },
+    x,
+    (r) => r * nb * Q8_BYTES,
+    (g) => [[0, 1, 2, 3].map((k) => g * 8 + k), [0, 1, 2, 3].map((k) => g * 8 + 4 + k)],
+  );
 }
 
 export function cpuMatmulQ4F32(
-  packed: Uint8Array, x: Float32Array, rows: number, cols: number, red: Reduction = SERIAL,
+  packed: Uint8Array,
+  x: Float32Array,
+  rows: number,
+  cols: number,
+  red: Reduction = SERIAL,
 ): Float32Array {
   const nb = cols / Q4_BLOCK;
   const dv = new DataView(packed.buffer, packed.byteOffset, packed.byteLength);
-  return matmulF32(rows, cols, Q4_BYTES, red, (base) => {
-    // Byte i holds weight i in its low nibble and weight i+16 in its high one,
-    // so the 16 bytes cover the block's two halves in parallel, not in order.
-    const q = new Array(32);
-    for (let i = 0; i < 16; i++) {
-      const byte = packed[base + 2 + i];
-      q[i] = (byte & 0xf) - 8;
-      q[i + 16] = (byte >> 4) - 8;
-    }
-    return { scale: fr(halfToF32(dv.getUint16(base, true))), q };
-  }, x, (r) => r * nb * Q4_BYTES,
-    (g) => [[0, 1, 2, 3].map((k) => g * 4 + k), [0, 1, 2, 3].map((k) => g * 4 + 16 + k)]);
+  return matmulF32(
+    rows,
+    cols,
+    Q4_BYTES,
+    red,
+    (base) => {
+      // Byte i holds weight i in its low nibble and weight i+16 in its high one,
+      // so the 16 bytes cover the block's two halves in parallel, not in order.
+      const q = new Array(32);
+      for (let i = 0; i < 16; i++) {
+        const byte = packed[base + 2 + i];
+        q[i] = (byte & 0xf) - 8;
+        q[i + 16] = (byte >> 4) - 8;
+      }
+      return { scale: fr(halfToF32(dv.getUint16(base, true))), q };
+    },
+    x,
+    (r) => r * nb * Q4_BYTES,
+    (g) => [[0, 1, 2, 3].map((k) => g * 4 + k), [0, 1, 2, 3].map((k) => g * 4 + 16 + k)],
+  );
 }
 
 /** Pairwise f32 tree sum, the same order a workgroup reduction produces. */
@@ -319,6 +353,35 @@ export function maxRelErr(a: Float32Array, b: Float32Array): number {
  * INVALIDATES the adapter ("The adapter cannot be reused, as it has been
  * invalidated by a device creation"), so the fallback has to request a fresh one.
  */
+/**
+ * The WebGPU spec defaults for the two limits the kernels depend on. Deno's
+ * WebGPU types declare every entry of GPUSupportedLimits optional, because the
+ * spec lets an adapter leave out a limit it does not know, so a read has to say
+ * what "not reported" means. It means the default: that is the value the device
+ * would be created with anyway, so requesting it explicitly is the same request
+ * as not asking. On Deno's wgpu the adapter reports both, and this is never hit.
+ */
+export const SPEC_LIMITS = {
+  maxStorageBufferBindingSize: 128 * 1024 * 1024,
+  maxBufferSize: 256 * 1024 * 1024,
+} as const;
+export type SizeLimit = keyof typeof SPEC_LIMITS;
+
+/** One of the two size limits, or its spec default when the adapter omits it. */
+export function limitOf(limits: GPUSupportedLimits, name: SizeLimit): number {
+  return limits[name] ?? SPEC_LIMITS[name];
+}
+
+/**
+ * GPUShaderModule as a browser ships it. Deno's lib leaves out getCompilationInfo
+ * because its wgpu backend has none, and that absence is real (see probeWGSL); a
+ * browser has the method, and the probe uses it when present. Declared here so
+ * the optional method has a type the callback below is checked against.
+ */
+interface ShaderModuleWithInfo extends GPUShaderModule {
+  getCompilationInfo?(): Promise<GPUCompilationInfo>;
+}
+
 export async function getDevice(): Promise<GPUDevice> {
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) throw new Error("no WebGPU adapter");
@@ -326,8 +389,8 @@ export async function getDevice(): Promise<GPUDevice> {
   try {
     dev = await adapter.requestDevice({
       requiredLimits: {
-        maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
-        maxBufferSize: adapter.limits.maxBufferSize,
+        maxStorageBufferBindingSize: limitOf(adapter.limits, "maxStorageBufferBindingSize"),
+        maxBufferSize: limitOf(adapter.limits, "maxBufferSize"),
       },
     });
   } catch {
@@ -352,7 +415,7 @@ export async function getDevice(): Promise<GPUDevice> {
  */
 export async function probeWGSL(dev: GPUDevice, body: string): Promise<boolean> {
   dev.pushErrorScope("validation");
-  const m = dev.createShaderModule({
+  const m: ShaderModuleWithInfo = dev.createShaderModule({
     code: `@compute @workgroup_size(1) fn p() { ${body} }`,
   });
   let msgs = false;
@@ -377,9 +440,12 @@ export async function probeWGSL(dev: GPUDevice, body: string): Promise<boolean> 
  * about what the builtins buy has to come from a browser, not from here.
  */
 export function probeUnpack(dev: GPUDevice): Promise<boolean> {
-  return probeWGSL(dev, `let v = vec4<f32>(unpack4xU8(0x0F0F0F0Fu))
+  return probeWGSL(
+    dev,
+    `let v = vec4<f32>(unpack4xU8(0x0F0F0F0Fu))
       + vec4<f32>(unpack4xI8(1u))
-      + vec4<f32>(unpack2x16float(0u), 0.0, 0.0);`);
+      + vec4<f32>(unpack2x16float(0u), 0.0, 0.0);`,
+  );
 }
 
 /** unpack2x16float alone -- available more widely than the 8-bit unpacks. */
@@ -411,9 +477,7 @@ export function coopSource(src: string, opts: { unpack8: boolean; unpackF16: boo
     f32(bitcast<i32>(w) >> 24u))`;
   // Q4_0 stores two weights per byte, biased by 8. `v` is the word already
   // masked down to one nibble per byte, so both spellings see the same input.
-  const nib = opts.unpack8
-    ? "vec4<f32>(unpack4xU8(v)) - vec4<f32>(8.0)"
-    : `vec4<f32>(
+  const nib = opts.unpack8 ? "vec4<f32>(unpack4xU8(v)) - vec4<f32>(8.0)" : `vec4<f32>(
     f32(v & 0xFFu),
     f32((v >> 8u) & 0xFFu),
     f32((v >> 16u) & 0xFFu),
@@ -462,9 +526,7 @@ export function attnSource(src: string, maxKeys: number): string {
 export type RopePairing = "norm" | "neox";
 
 export function ropeSource(src: string, pairing: RopePairing): string {
-  const [ia, ib] = pairing === "norm"
-    ? ["j * 2u", "j * 2u + 1u"]
-    : ["j", "j + half_dim"];
+  const [ia, ib] = pairing === "norm" ? ["j * 2u", "j * 2u + 1u"] : ["j", "j + half_dim"];
   return src.replaceAll("$ROPE_IA", ia).replaceAll("$ROPE_IB", ib);
 }
 
@@ -496,7 +558,9 @@ export function storageBuffer(dev: GPUDevice, data: Uint8Array | Float32Array): 
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
   });
   const padded = size === bytes.byteLength ? bytes : (() => {
-    const p = new Uint8Array(size); p.set(bytes); return p;
+    const p = new Uint8Array(size);
+    p.set(bytes);
+    return p;
   })();
   dev.queue.writeBuffer(buf, 0, padded);
   return buf;
@@ -509,14 +573,22 @@ export function uniformBuffer(dev: GPUDevice, vals: number[]): GPUBuffer {
   return buf;
 }
 
-export async function readBack(dev: GPUDevice, src: GPUBuffer, bytes: number): Promise<Float32Array> {
-  const rd = dev.createBuffer({ size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+export async function readBack(
+  dev: GPUDevice,
+  src: GPUBuffer,
+  bytes: number,
+): Promise<Float32Array> {
+  const rd = dev.createBuffer({
+    size: bytes,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
   const enc = dev.createCommandEncoder();
   enc.copyBufferToBuffer(src, 0, rd, 0, bytes);
   dev.queue.submit([enc.finish()]);
   await rd.mapAsync(GPUMapMode.READ);
   const out = new Float32Array(rd.getMappedRange().slice(0));
-  rd.unmap(); rd.destroy();
+  rd.unmap();
+  rd.destroy();
   return out;
 }
 
@@ -530,8 +602,13 @@ export function randVec(n: number, scale = 1): Float32Array {
 
 let pass = 0, fail = 0;
 export function ok(name: string, cond: boolean, extra = "") {
-  if (cond) { pass++; console.log(`  ok   ${name}${extra ? "  " + extra : ""}`); }
-  else { fail++; console.log(`  FAIL ${name}${extra ? "  " + extra : ""}`); }
+  if (cond) {
+    pass++;
+    console.log(`  ok   ${name}${extra ? "  " + extra : ""}`);
+  } else {
+    fail++;
+    console.log(`  FAIL ${name}${extra ? "  " + extra : ""}`);
+  }
 }
 export function summary(): number {
   console.log(`\n${pass} passed, ${fail} failed`);

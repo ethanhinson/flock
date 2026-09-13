@@ -40,24 +40,27 @@
 // length, and `lastRow` is what selects it.
 
 import {
-  attnSource, coopSource, probeUnpack, probeUnpackF16, splitQ8, storageBuffer,
+  coopSource,
+  probeUnpack,
+  probeUnpackF16,
+  splitQ8,
+  storageBuffer,
   uniformBuffer,
 } from "./lib.ts";
-import {
-  Layer, QWEN3_06B, wgslSource, type GpuTensor, type LayerBuffers,
-  type LayerConfig, type LayerWeights,
-} from "./layer.ts";
+import { Layer, type LayerConfig, QWEN3_06B, wgslSource } from "./layer.ts";
 import type { RealModel } from "./real_weights.ts";
 
-const ROWS_PER_WG = 4;      // must match q8_coop.wgsl
-const ARGMAX_WG = 256;      // must match argmax.wgsl
+const ROWS_PER_WG = 4; // must match q8_coop.wgsl
+const ARGMAX_WG = 256; // must match argmax.wgsl
 /**
- * Stage-1 workgroups for the argmax. 594 is ceil(151936 / 256), i.e. one element
+ * Stage-1 workgroups for the argmax: ceil(151936 / 256) = 594, i.e. one element
  * per thread with no strided loop -- the point where stage 1 stops being a
  * reduction and becomes a single comparison per thread, and where stage 2 still
  * fits in one workgroup (594 partials, 256 threads, a 3-iteration strided load).
+ * Derived from the workgroup size rather than written as 594 so that a change to
+ * argmax.wgsl's workgroup has one number to update, not two.
  */
-const ARGMAX_GROUPS = 594;
+const ARGMAX_GROUPS = Math.ceil(151936 / ARGMAX_WG);
 
 export interface ModelConfig extends LayerConfig {
   vocab: number;
@@ -104,7 +107,9 @@ export class Model {
    * either way for the embedding and the head.
    */
   static async create(
-    dev: GPUDevice, m: RealModel, base: LayerConfig = QWEN3_06B,
+    dev: GPUDevice,
+    m: RealModel,
+    base: LayerConfig = QWEN3_06B,
     opts: { cut?: number } = {},
   ): Promise<Model> {
     const cut = opts.cut ?? m.nLayers;
@@ -122,9 +127,11 @@ export class Model {
     const unpack8 = await probeUnpack(dev);
     const unpackF16 = await probeUnpackF16(dev);
     const src = wgslSource;
-    const mk = (code: string, entryPoint = "main") => dev.createComputePipeline({
-      layout: "auto", compute: { module: dev.createShaderModule({ code }), entryPoint },
-    });
+    const mk = (code: string, entryPoint = "main") =>
+      dev.createComputePipeline({
+        layout: "auto",
+        compute: { module: dev.createShaderModule({ code }), entryPoint },
+      });
     const argmaxSrc = await src("argmax.wgsl");
     M.pipes = {
       embed: mk(coopSource(await src("embed.wgsl"), { unpack8, unpackF16 })),
@@ -144,15 +151,16 @@ export class Model {
     M.buf.embdSc = storageBuffer(dev, scales);
     M.buf.outputNorm = storageBuffer(dev, m.outputNorm);
 
-    const rw = (n: number) => dev.createBuffer({
-      size: Math.max(16, n * 4),
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
+    const rw = (n: number) =>
+      dev.createBuffer({
+        size: Math.max(16, n * 4),
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      });
     const P = cfg.maxPrefill;
-    M.buf.ids = rw(P);                    // u32 token ids for the embedding gather
-    M.buf.embOut = rw(P * cfg.hidden);    // the embedding's output / layer 0's input
-    M.buf.normed = rw(cfg.hidden);        // one hidden state after output_norm
-    M.buf.lastRow = rw(cfg.hidden);       // the position the head projects
+    M.buf.ids = rw(P); // u32 token ids for the embedding gather
+    M.buf.embOut = rw(P * cfg.hidden); // the embedding's output / layer 0's input
+    M.buf.normed = rw(cfg.hidden); // one hidden state after output_norm
+    M.buf.lastRow = rw(cfg.hidden); // the position the head projects
     M.buf.logits = rw(cfg.vocab);
     M.buf.amVal = rw(ARGMAX_GROUPS);
     M.buf.amIdx = rw(ARGMAX_GROUPS);
@@ -165,12 +173,14 @@ export class Model {
 
     M.buf.dEmbed = uniformBuffer(dev, [1, cfg.hidden, 0, 0]);
     M.buf.dEmbedPre = dev.createBuffer({
-      size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     M.buf.dHead = uniformBuffer(dev, [cfg.vocab, cfg.hidden, 1, 0]);
     M.buf.dNorm = (() => {
       const b = dev.createBuffer({
-        size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
       dev.queue.writeBuffer(b, 0, new Uint32Array([cfg.hidden, 1, 0, 0]));
       dev.queue.writeBuffer(b, 8, new Float32Array([cfg.eps]));
@@ -196,7 +206,10 @@ export class Model {
     let key = this.pipeKey.get(pipe) ?? "?";
     for (const b of bufs) {
       let id = this.bufId.get(b);
-      if (id === undefined) { id = this.bufId.size; this.bufId.set(b, id); }
+      if (id === undefined) {
+        id = this.bufId.size;
+        this.bufId.set(b, id);
+      }
       key += "/" + id;
     }
     let bg = this.bgCache.get(key);
@@ -233,10 +246,16 @@ export class Model {
       const enc = dev.createCommandEncoder();
       const p = enc.beginComputePass();
       p.setPipeline(this.pipes.embed);
-      p.setBindGroup(0, this.bind(this.pipes.embed, [
-        buf.embdQs, buf.embdSc, buf.ids, buf.embOut,
-        n === 1 ? buf.dEmbed : buf.dEmbedPre,
-      ]));
+      p.setBindGroup(
+        0,
+        this.bind(this.pipes.embed, [
+          buf.embdQs,
+          buf.embdSc,
+          buf.ids,
+          buf.embOut,
+          n === 1 ? buf.dEmbed : buf.dEmbedPre,
+        ]),
+      );
       p.dispatchWorkgroups(n);
       p.end();
 
@@ -253,7 +272,12 @@ export class Model {
         // the chain is one copy per boundary.
         if (i > 0) {
           enc.copyBufferToBuffer(
-            this.layers[i - 1].outputBuffer(), 0, L.inputBuffer(), 0, n * cfg.hidden * 4);
+            this.layers[i - 1].outputBuffer(),
+            0,
+            L.inputBuffer(),
+            0,
+            n * cfg.hidden * 4,
+          );
         }
         if (n === 1) L.encode(undefined, enc);
         else L.encodePrefill(n, undefined, enc);
@@ -262,7 +286,12 @@ export class Model {
       // to fill the KV cache. So the head's input is one row, taken from the end.
       const lastOut = this.layers[this.layers.length - 1].outputBuffer();
       enc.copyBufferToBuffer(
-        lastOut, (n - 1) * cfg.hidden * 4, buf.lastRow, 0, cfg.hidden * 4);
+        lastOut,
+        (n - 1) * cfg.hidden * 4,
+        buf.lastRow,
+        0,
+        cfg.hidden * 4,
+      );
       dev.queue.submit([enc.finish()]);
       this.pos += n;
     }
@@ -281,19 +310,25 @@ export class Model {
     // The final RMSNorm. Applied HERE, once -- see the note at the top about the
     // ONNX export putting it in the last shard rather than in head.onnx.
     p.setPipeline(this.pipes.rmsnorm);
-    p.setBindGroup(0, this.bind(this.pipes.rmsnorm,
-      [buf.lastRow, buf.outputNorm, buf.normed, buf.dNorm]));
+    p.setBindGroup(
+      0,
+      this.bind(this.pipes.rmsnorm, [buf.lastRow, buf.outputNorm, buf.normed, buf.dNorm]),
+    );
     p.dispatchWorkgroups(1);
 
     // The tied projection: token_embd read as 151936 x 1024. 37984 workgroups.
     p.setPipeline(this.pipes.matvec);
-    p.setBindGroup(0, this.bind(this.pipes.matvec,
-      [buf.embdQs, buf.embdSc, buf.normed, buf.logits, buf.dHead]));
+    p.setBindGroup(
+      0,
+      this.bind(this.pipes.matvec, [buf.embdQs, buf.embdSc, buf.normed, buf.logits, buf.dHead]),
+    );
     p.dispatchWorkgroups(Math.ceil(cfg.vocab / ROWS_PER_WG), 1);
 
     p.setPipeline(this.pipes.argmax1);
-    p.setBindGroup(0, this.bind(this.pipes.argmax1,
-      [buf.logits, buf.amDummy, buf.amVal, buf.amIdx, buf.dAm1]));
+    p.setBindGroup(
+      0,
+      this.bind(this.pipes.argmax1, [buf.logits, buf.amDummy, buf.amVal, buf.amIdx, buf.dAm1]),
+    );
     p.dispatchWorkgroups(ARGMAX_GROUPS);
     p.end();
 
@@ -302,8 +337,10 @@ export class Model {
     // without relying on in-pass ordering across bind groups.
     const p2 = enc.beginComputePass();
     p2.setPipeline(this.pipes.argmax2);
-    p2.setBindGroup(0, this.bind(this.pipes.argmax2,
-      [buf.amVal, buf.amIdx, buf.tokVal, buf.tokIdx, buf.dAm2]));
+    p2.setBindGroup(
+      0,
+      this.bind(this.pipes.argmax2, [buf.amVal, buf.amIdx, buf.tokVal, buf.tokIdx, buf.dAm2]),
+    );
     p2.dispatchWorkgroups(1);
     p2.end();
   }
@@ -312,28 +349,32 @@ export class Model {
   private async readU32(src: GPUBuffer, n: number): Promise<Uint32Array> {
     const bytes = n * 4;
     const rd = this.dev.createBuffer({
-      size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      size: bytes,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
     const enc = this.dev.createCommandEncoder();
     enc.copyBufferToBuffer(src, 0, rd, 0, bytes);
     this.dev.queue.submit([enc.finish()]);
     await rd.mapAsync(GPUMapMode.READ);
     const out = new Uint32Array(rd.getMappedRange().slice(0));
-    rd.unmap(); rd.destroy();
+    rd.unmap();
+    rd.destroy();
     return out;
   }
 
   private async readF32(src: GPUBuffer, n: number): Promise<Float32Array> {
     const bytes = n * 4;
     const rd = this.dev.createBuffer({
-      size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      size: bytes,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
     const enc = this.dev.createCommandEncoder();
     enc.copyBufferToBuffer(src, 0, rd, 0, bytes);
     this.dev.queue.submit([enc.finish()]);
     await rd.mapAsync(GPUMapMode.READ);
     const out = new Float32Array(rd.getMappedRange().slice(0));
-    rd.unmap(); rd.destroy();
+    rd.unmap();
+    rd.destroy();
     return out;
   }
 
@@ -399,12 +440,14 @@ export class Model {
       // diverged -- continuing would compute against keys for other positions,
       // which is silently wrong text rather than an error.
       throw new Error(
-        `offset ${offset} does not match this cache's position ${this.pos}`);
+        `offset ${offset} does not match this cache's position ${this.pos}`,
+      );
     }
     const n = ids.length;
     if (n > this.cfg.maxPrefill) {
       throw new Error(
-        `a lap of ${n} tokens exceeds maxPrefill ${this.cfg.maxPrefill}`);
+        `a lap of ${n} tokens exceeds maxPrefill ${this.cfg.maxPrefill}`,
+      );
     }
     this.encodeTokens(ids);
     // The layers' output, all n rows. encodeTokens chunks at maxPrefill and leaves
@@ -508,8 +551,10 @@ export class Model {
     const enc = dev.createCommandEncoder();
     const p = enc.beginComputePass();
     p.setPipeline(this.pipes.embed);
-    p.setBindGroup(0, this.bind(this.pipes.embed,
-      [buf.embdQs, buf.embdSc, buf.ids, buf.embOut, buf.dEmbedPre]));
+    p.setBindGroup(
+      0,
+      this.bind(this.pipes.embed, [buf.embdQs, buf.embdSc, buf.ids, buf.embOut, buf.dEmbedPre]),
+    );
     p.dispatchWorkgroups(n);
     p.end();
     dev.queue.submit([enc.finish()]);
@@ -525,7 +570,8 @@ export class Model {
    * caller stream without changing this loop.
    */
   async generate(
-    prompt: number[], maxTokens: number,
+    prompt: number[],
+    maxTokens: number,
     opts: { eos?: number[]; onToken?: (id: number, i: number) => void } = {},
   ): Promise<number[]> {
     const eos = new Set(opts.eos ?? []);

@@ -18,7 +18,12 @@ const fr = Math.fround;
  * bits, which then gets amplified by the reciprocal square root.
  */
 export function rmsnormRef(
-  x: Float32Array, g: Float32Array, n: number, nVecs: number, eps: number, wg = 128,
+  x: Float32Array,
+  g: Float32Array,
+  n: number,
+  nVecs: number,
+  eps: number,
+  wg = 128,
 ): Float32Array {
   const out = new Float32Array(n * nVecs);
   const part = new Float32Array(wg);
@@ -58,8 +63,13 @@ export function rmsnormRef(
  * ULP, which is what test_ops.ts asserts.
  */
 export function ropeRef(
-  x: Float32Array, nTokens: number, nHeads: number, headDim: number,
-  pos0: number, invFreq: Float32Array, pairing: RopePairing = "neox",
+  x: Float32Array,
+  nTokens: number,
+  nHeads: number,
+  headDim: number,
+  pos0: number,
+  invFreq: Float32Array,
+  pairing: RopePairing = "neox",
 ): Float32Array {
   const out = Float32Array.from(x);
   const half = headDim / 2;
@@ -123,8 +133,13 @@ export function addRef(a: Float32Array, b: Float32Array): Float32Array {
  * implementations, so this reference carries a tolerance.
  */
 export function attnRef(
-  q: Float32Array, k: Float32Array, v: Float32Array,
-  nHeads: number, nKvHeads: number, headDim: number, nKeys: number,
+  q: Float32Array,
+  k: Float32Array,
+  v: Float32Array,
+  nHeads: number,
+  nKvHeads: number,
+  headDim: number,
+  nKeys: number,
 ): Float32Array {
   const out = new Float32Array(nHeads * headDim);
   const groupSize = nHeads / nKvHeads;

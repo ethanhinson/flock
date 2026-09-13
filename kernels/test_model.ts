@@ -45,11 +45,16 @@ const MAX_TOKENS = 16;
 function findPaths() {
   const ref = (Deno.env.get("FLOCK_ONNX_REF") || `${REPO}kernels/.ref`).replace(/\/$/, "");
   const ort = `${REPO}node_modules/onnxruntime-node/dist/index.js`;
-  const transformers =
-    `${REPO}node_modules/@huggingface/transformers/dist/transformers.node.mjs`;
+  const transformers = `${REPO}node_modules/@huggingface/transformers/dist/transformers.node.mjs`;
   const need = [
-    `${ref}/embed.onnx`, `${ref}/layers.onnx`, `${ref}/head.onnx`, `${ref}/coord.json`,
-    `${ref}/shard0.onnx`, `${ref}/shard1.onnx`, ort, transformers,
+    `${ref}/embed.onnx`,
+    `${ref}/layers.onnx`,
+    `${ref}/head.onnx`,
+    `${ref}/coord.json`,
+    `${ref}/shard0.onnx`,
+    `${ref}/shard1.onnx`,
+    ort,
+    transformers,
   ];
   try {
     for (const f of need) Deno.statSync(f);
@@ -62,7 +67,8 @@ function findPaths() {
       { path: `${ref}/shard0.onnx`, n_layers: 2 },
       { path: `${ref}/shard1.onnx`, n_layers: 2 },
     ],
-    ort, transformers,
+    ort,
+    transformers,
   };
 }
 
@@ -79,17 +85,26 @@ console.log(`onnx:   ${paths.coordDir} + 2 shards\n`);
 
 const tmp = await Deno.makeTempDir();
 const inPath = `${tmp}/in.json`, outPath = `${tmp}/out.json`;
-await Deno.writeTextFile(inPath, JSON.stringify({
-  ...paths, prompt: PROMPT, maxTokens: MAX_TOKENS, wantHidden: true,
-}));
+await Deno.writeTextFile(
+  inPath,
+  JSON.stringify({
+    ...paths,
+    prompt: PROMPT,
+    maxTokens: MAX_TOKENS,
+    wantHidden: true,
+  }),
+);
 const proc = new Deno.Command("node", {
   args: [new URL("./onnx_full.mjs", import.meta.url).pathname, inPath, outPath],
-  stdout: "piped", stderr: "piped",
+  stdout: "piped",
+  stderr: "piped",
 });
 const { code, stderr } = await proc.output();
 if (code !== 0) {
   console.log("  skip  onnx_full.mjs failed:");
-  console.log("        " + new TextDecoder().decode(stderr).trim().split("\n").slice(-3).join("\n        "));
+  console.log(
+    "        " + new TextDecoder().decode(stderr).trim().split("\n").slice(-3).join("\n        "),
+  );
   Deno.exit(0);
 }
 const onnx = JSON.parse(await Deno.readTextFile(outPath));
@@ -104,17 +119,25 @@ const dev = await getDevice();
 const t0 = performance.now();
 const weights = await realModel();
 const M = await Model.create(dev, weights, { ...QWEN3_06B, maxPrefill: 64 });
-console.log(`WGSL model loaded in ${((performance.now() - t0) / 1000).toFixed(1)}s: ` +
-  `${weights.nLayers} layers, vocab ${weights.vocab}\n`);
+console.log(
+  `WGSL model loaded in ${((performance.now() - t0) / 1000).toFixed(1)}s: ` +
+    `${weights.nLayers} layers, vocab ${weights.vocab}\n`,
+);
 
-ok("GGUF metadata matches the ONNX export",
+ok(
+  "GGUF metadata matches the ONNX export",
   weights.nLayers === 28 && weights.vocab === 151936 && weights.hidden === 1024 &&
-  weights.eos === onnx.eos,
-  `${weights.nLayers} layers, vocab ${weights.vocab}, eos ${weights.eos}`);
+    weights.eos === onnx.eos,
+  `${weights.nLayers} layers, vocab ${weights.vocab}, eos ${weights.eos}`,
+);
 
 const cos = (a: Float32Array, b: Float32Array) => {
   let d = 0, na = 0, nb = 0;
-  for (let i = 0; i < a.length; i++) { d += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+  for (let i = 0; i < a.length; i++) {
+    d += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
   return d / Math.sqrt(na * nb);
 };
 
@@ -127,15 +150,26 @@ const cos = (a: Float32Array, b: Float32Array) => {
   const got = await M.embed(promptIds);
   const ref = Float32Array.from(onnx.embedding);
   const c = cos(got, ref);
-  ok("WGSL embedding matches embed.onnx on the real prompt ids",
-    c > 0.9999, `cosine ${c.toFixed(6)}  abs/scale ${absErrScaled(got, ref, amax(ref)).toExponential(2)} (Q8_0 vs f32)`);
+  ok(
+    "WGSL embedding matches embed.onnx on the real prompt ids",
+    c > 0.9999,
+    `cosine ${c.toFixed(6)}  abs/scale ${
+      absErrScaled(got, ref, amax(ref)).toExponential(2)
+    } (Q8_0 vs f32)`,
+  );
   let worstTok = 1, worstAt = -1;
   for (let t = 0; t < promptIds.length; t++) {
     const ct = cos(got.subarray(t * 1024, (t + 1) * 1024), ref.subarray(t * 1024, (t + 1) * 1024));
-    if (ct < worstTok) { worstTok = ct; worstAt = t; }
+    if (ct < worstTok) {
+      worstTok = ct;
+      worstAt = t;
+    }
   }
-  ok("every prompt token's embedding row is right (not just the average)",
-    worstTok > 0.9999, `worst token ${worstAt} (id ${promptIds[worstAt]}) cosine ${worstTok.toFixed(6)}`);
+  ok(
+    "every prompt token's embedding row is right (not just the average)",
+    worstTok > 0.9999,
+    `worst token ${worstAt} (id ${promptIds[worstAt]}) cosine ${worstTok.toFixed(6)}`,
+  );
 }
 
 // --- the hidden state after all 28 layers + output_norm ---------------------
@@ -154,40 +188,57 @@ const cos = (a: Float32Array, b: Float32Array) => {
   // The bar is quantization-sized, not ULP-sized: 28 layers of Q8_0 weights against
   // 28 layers of f32 weights. What a wiring bug would do is destroy the DIRECTION,
   // which is why cosine carries the assertion and the magnitude only corroborates.
-  ok("WGSL and ONNX agree on the hidden state after 28 layers (cosine ~ 1)",
-    c > 0.999, `cosine ${c.toFixed(6)}  abs/scale ${e.toExponential(2)}`);
-  ok("the magnitudes agree to within quantization",
+  ok(
+    "WGSL and ONNX agree on the hidden state after 28 layers (cosine ~ 1)",
+    c > 0.999,
+    `cosine ${c.toFixed(6)}  abs/scale ${e.toExponential(2)}`,
+  );
+  ok(
+    "the magnitudes agree to within quantization",
     Math.abs(amax(got) - amax(ref)) / amax(ref) < 0.05,
-    `|max| ${amax(got).toFixed(2)} vs ${amax(ref).toFixed(2)}`);
+    `|max| ${amax(got).toFixed(2)} vs ${amax(ref).toFixed(2)}`,
+  );
 }
 
 // --- the logits and the argmax ---------------------------------------------
 {
   M.reset();
   const logits = await M.logits(promptIds);
-  ok("logits are the full vocabulary and all finite",
+  ok(
+    "logits are the full vocabulary and all finite",
     logits.length === weights.vocab && logits.every(Number.isFinite),
-    `${logits.length} logits, |max| ${amax(logits).toFixed(2)}`);
+    `${logits.length} logits, |max| ${amax(logits).toFixed(2)}`,
+  );
 
   // Rank order is what greedy decode consumes, so compare THAT rather than values:
   // a uniform scale error would leave every id right and every value wrong.
   const order = Array.from(logits.keys()).sort((a, b) => logits[b] - logits[a]);
   const want = onnx.generated[0];
-  ok("WGSL argmax over the logits picks the token ONNX picked",
-    order[0] === want, `WGSL ${order[0]}, ONNX ${want}`);
+  ok(
+    "WGSL argmax over the logits picks the token ONNX picked",
+    order[0] === want,
+    `WGSL ${order[0]}, ONNX ${want}`,
+  );
 
   // The margin is the evidence about how reproducible this is at all. A greedy
   // decode is only deterministic across two different weight quantizations when the
   // top two logits are further apart than the quantization noise.
   const margin = logits[order[0]] - logits[order[1]];
-  console.log(`\ntop-5 WGSL logits: ${order.slice(0, 5).map((i) => `${i}:${logits[i].toFixed(3)}`).join("  ")}`);
+  console.log(
+    `\ntop-5 WGSL logits: ${
+      order.slice(0, 5).map((i) => `${i}:${logits[i].toFixed(3)}`).join("  ")
+    }`,
+  );
   console.log(`margin between top two: ${margin.toFixed(4)}\n`);
   // M.logits() ran the head, so the GPU's argmax output is sitting there for the
   // SAME logits the host just scanned. Comparing those isolates the reduction --
   // including its tie rule -- from everything upstream of it.
   const reduced = await M.currentToken();
-  ok("the GPU argmax reduction agrees with a host scan of the same logits",
-    reduced === order[0], `reduction ${reduced}, host scan ${order[0]}`);
+  ok(
+    "the GPU argmax reduction agrees with a host scan of the same logits",
+    reduced === order[0],
+    `reduction ${reduced}, host scan ${order[0]}`,
+  );
 }
 
 // --- greedy decode, the whole thing ----------------------------------------
@@ -205,21 +256,30 @@ const cos = (a: Float32Array, b: Float32Array) => {
 
   console.log(`WGSL generated: ${JSON.stringify(gen)}`);
   console.log(`ONNX generated: ${JSON.stringify(onnx.generated)}`);
-  console.log(`  ${gen.length} tokens in ${ms.toFixed(0)} ms ` +
-    `(${(gen.length / (ms / 1000)).toFixed(1)} tok/s including the prefill)\n`);
+  console.log(
+    `  ${gen.length} tokens in ${ms.toFixed(0)} ms ` +
+      `(${(gen.length / (ms / 1000)).toFixed(1)} tok/s including the prefill)\n`,
+  );
 
   const n = Math.min(gen.length, onnx.generated.length);
   let firstDiff = -1;
   for (let i = 0; i < n; i++) {
-    if (gen[i] !== onnx.generated[i]) { firstDiff = i; break; }
+    if (gen[i] !== onnx.generated[i]) {
+      firstDiff = i;
+      break;
+    }
   }
   if (firstDiff === -1 && gen.length !== onnx.generated.length) firstDiff = n;
 
-  ok("WGSL greedy decode produces the SAME TOKEN IDS as ONNX",
+  ok(
+    "WGSL greedy decode produces the SAME TOKEN IDS as ONNX",
     firstDiff === -1 && gen.length === onnx.generated.length,
     firstDiff === -1
       ? `${gen.length} tokens identical`
-      : `diverged at token ${firstDiff}: WGSL ${gen[firstDiff]} vs ONNX ${onnx.generated[firstDiff]}`);
+      : `diverged at token ${firstDiff}: WGSL ${gen[firstDiff]} vs ONNX ${
+        onnx.generated[firstDiff]
+      }`,
+  );
 
   // If they diverged, say WHY with evidence rather than assuming drift. The margin
   // at the divergence point is the number that decides it: a margin smaller than
@@ -233,22 +293,28 @@ const cos = (a: Float32Array, b: Float32Array) => {
     const margin = logits[order[0]] - logits[order[1]];
     const onnxChoice = onnx.generated[firstDiff];
     console.log(`divergence at token ${firstDiff}:`);
-    console.log(`  WGSL top-3: ${order.slice(0, 3).map((i) => `${i}:${logits[i].toFixed(4)}`).join("  ")}`);
+    console.log(
+      `  WGSL top-3: ${order.slice(0, 3).map((i) => `${i}:${logits[i].toFixed(4)}`).join("  ")}`,
+    );
     console.log(`  ONNX chose ${onnxChoice}, whose WGSL logit is ${logits[onnxChoice].toFixed(4)}`);
     console.log(`  margin between WGSL's top two: ${margin.toExponential(2)}`);
     console.log(`  |logit| scale: ${amax(logits).toFixed(2)}`);
     const rel = margin / amax(logits);
     console.log(`  margin / scale: ${rel.toExponential(2)}`);
-    console.log(rel < 2e-2
-      ? "  -> a near-tie. Q8_0 vs f32 weights differ by ~1e-2 relative per logit,\n" +
-        "     so the two engines are entitled to disagree here. This is drift."
-      : "  -> NOT a near-tie. A margin this large is not explained by quantization;\n" +
-        "     something is wrong.");
+    console.log(
+      rel < 2e-2
+        ? "  -> a near-tie. Q8_0 vs f32 weights differ by ~1e-2 relative per logit,\n" +
+          "     so the two engines are entitled to disagree here. This is drift."
+        : "  -> NOT a near-tie. A margin this large is not explained by quantization;\n" +
+          "     something is wrong.",
+    );
   }
 
-  ok("WGSL stopped at EOS like ONNX did",
+  ok(
+    "WGSL stopped at EOS like ONNX did",
     (next === weights.eos) === Boolean(onnx.hitEos),
-    `WGSL eos ${next === weights.eos}, ONNX eos ${Boolean(onnx.hitEos)}`);
+    `WGSL eos ${next === weights.eos}, ONNX eos ${Boolean(onnx.hitEos)}`,
+  );
 }
 
 // --- prefill-vs-decode equivalence, on the WHOLE model ---------------------
@@ -262,8 +328,11 @@ const cos = (a: Float32Array, b: Float32Array) => {
   // only the cache state matters, and the last step's answer must match.
   let last = 0;
   for (let i = 0; i < promptIds.length; i++) last = await M.step([promptIds[i]]);
-  ok("the whole model: prefill then head == 28 decode steps then head",
-    viaPrefill === last, `prefill ${viaPrefill}, decode ${last}`);
+  ok(
+    "the whole model: prefill then head == 28 decode steps then head",
+    viaPrefill === last,
+    `prefill ${viaPrefill}, decode ${last}`,
+  );
 }
 
 // ============================ how long does agreement last, and why does it end?
@@ -281,12 +350,19 @@ const cos = (a: Float32Array, b: Float32Array) => {
 {
   const longPrompt = "Explain in three sentences why the sky is blue.";
   const lIn = `${tmp}/in3.json`, lOut = `${tmp}/out3.json`;
-  await Deno.writeTextFile(lIn, JSON.stringify({
-    ...paths, prompt: longPrompt, maxTokens: 80, wantHidden: false,
-  }));
+  await Deno.writeTextFile(
+    lIn,
+    JSON.stringify({
+      ...paths,
+      prompt: longPrompt,
+      maxTokens: 80,
+      wantHidden: false,
+    }),
+  );
   const p3 = await new Deno.Command("node", {
     args: [new URL("./onnx_full.mjs", import.meta.url).pathname, lIn, lOut],
-    stdout: "piped", stderr: "piped",
+    stdout: "piped",
+    stderr: "piped",
   }).output();
   if (p3.code === 0) {
     const o3 = JSON.parse(await Deno.readTextFile(lOut));
@@ -302,8 +378,11 @@ const cos = (a: Float32Array, b: Float32Array) => {
       const lg = i === 0 ? await M.logits(o3.ids) : await M.logits([next]);
       let b0 = -Infinity, i0 = 0, b1 = -Infinity;
       for (let j = 0; j < lg.length; j++) {
-        if (lg[j] > b0) { b1 = b0; b0 = lg[j]; i0 = j; }
-        else if (lg[j] > b1) b1 = lg[j];
+        if (lg[j] > b0) {
+          b1 = b0;
+          b0 = lg[j];
+          i0 = j;
+        } else if (lg[j] > b1) b1 = lg[j];
       }
       next = i0;
       margins.push((b0 - b1) / amax(lg));
@@ -313,7 +392,10 @@ const cos = (a: Float32Array, b: Float32Array) => {
 
     let at = -1;
     for (let i = 0; i < Math.min(gen.length, refIds.length); i++) {
-      if (gen[i] !== refIds[i]) { at = i; break; }
+      if (gen[i] !== refIds[i]) {
+        at = i;
+        break;
+      }
     }
     console.log(`\nlong prompt ${JSON.stringify(longPrompt)} (${o3.ids.length} prompt tokens):`);
     console.log(`  ONNX generated ${refIds.length} tokens, WGSL ${gen.length}`);
@@ -321,13 +403,17 @@ const cos = (a: Float32Array, b: Float32Array) => {
     // The measured margin floor over the run, which is the context any single
     // divergence has to be read against.
     const sorted = [...margins].sort((a, b) => a - b);
-    console.log(`  margin/scale over ${margins.length} steps: min ${sorted[0].toExponential(2)}` +
-      `  median ${sorted[sorted.length >> 1].toExponential(2)}` +
-      `  max ${sorted[sorted.length - 1].toExponential(2)}`);
+    console.log(
+      `  margin/scale over ${margins.length} steps: min ${sorted[0].toExponential(2)}` +
+        `  median ${sorted[sorted.length >> 1].toExponential(2)}` +
+        `  max ${sorted[sorted.length - 1].toExponential(2)}`,
+    );
 
-    ok("long-generation agreement lasts many tokens before any divergence",
+    ok(
+      "long-generation agreement lasts many tokens before any divergence",
       at === -1 || at >= 20,
-      at === -1 ? `identical for all ${gen.length}` : `first divergence at token ${at}`);
+      at === -1 ? `identical for all ${gen.length}` : `first divergence at token ${at}`,
+    );
 
     if (at >= 0) {
       // Re-run on the ONNX prefix so both engines are in the SAME state, and read
@@ -338,8 +424,10 @@ const cos = (a: Float32Array, b: Float32Array) => {
       const scale = amax(lg);
       const gap = (lg[order[0]] - lg[refIds[at]]) / scale;
       const rank = order.indexOf(refIds[at]) + 1;
-      console.log(`  divergence at token ${at}: WGSL ${order[0]} (${lg[order[0]].toFixed(5)}) ` +
-        `vs ONNX ${refIds[at]} (${lg[refIds[at]].toFixed(5)})`);
+      console.log(
+        `  divergence at token ${at}: WGSL ${order[0]} (${lg[order[0]].toFixed(5)}) ` +
+          `vs ONNX ${refIds[at]} (${lg[refIds[at]].toFixed(5)})`,
+      );
       console.log(`    gap/scale ${gap.toExponential(3)};  ONNX's token is WGSL's rank #${rank}`);
 
       // THE assertion. The hidden state feeding this projection differs from ONNX's
@@ -347,18 +435,25 @@ const cos = (a: Float32Array, b: Float32Array) => {
       // between the two candidate logits is smaller than that, the engines were not
       // distinguishable at this step and either answer is correct for its weights.
       const QUANT = 1.22e-2;
-      ok("the first divergence is a near-tie that quantization fully explains",
+      ok(
+        "the first divergence is a near-tie that quantization fully explains",
         gap < QUANT,
         `gap/scale ${gap.toExponential(2)} < quantization ${QUANT.toExponential(2)} ` +
-        `(${(QUANT / gap).toFixed(1)}x margin)`);
+          `(${(QUANT / gap).toFixed(1)}x margin)`,
+      );
       // A wiring bug does not leave the reference's choice at rank 2; it scatters it
       // into the tail of 151936. Rank is the structural half of the diagnosis.
-      ok("ONNX's choice is still at the very top of WGSL's ranking",
-        rank <= 3, `rank #${rank} of ${lg.length}`);
-      ok("the divergence happens at the run's tightest margin, not a typical one",
+      ok(
+        "ONNX's choice is still at the very top of WGSL's ranking",
+        rank <= 3,
+        `rank #${rank} of ${lg.length}`,
+      );
+      ok(
+        "the divergence happens at the run's tightest margin, not a typical one",
         gap <= sorted[Math.max(0, Math.floor(margins.length * 0.15))],
         `gap ${gap.toExponential(2)} vs p15 margin ` +
-        `${sorted[Math.max(0, Math.floor(margins.length * 0.15))].toExponential(2)}`);
+          `${sorted[Math.max(0, Math.floor(margins.length * 0.15))].toExponential(2)}`,
+      );
     }
   }
 }
@@ -367,12 +462,19 @@ const cos = (a: Float32Array, b: Float32Array) => {
 {
   const alt = "What is 2 + 2?";
   const altIn = `${tmp}/in2.json`, altOut = `${tmp}/out2.json`;
-  await Deno.writeTextFile(altIn, JSON.stringify({
-    ...paths, prompt: alt, maxTokens: 12, wantHidden: false,
-  }));
+  await Deno.writeTextFile(
+    altIn,
+    JSON.stringify({
+      ...paths,
+      prompt: alt,
+      maxTokens: 12,
+      wantHidden: false,
+    }),
+  );
   const p2 = new Deno.Command("node", {
     args: [new URL("./onnx_full.mjs", import.meta.url).pathname, altIn, altOut],
-    stdout: "piped", stderr: "piped",
+    stdout: "piped",
+    stderr: "piped",
   });
   const r2 = await p2.output();
   if (r2.code === 0) {
@@ -391,9 +493,13 @@ const cos = (a: Float32Array, b: Float32Array) => {
     console.log(`  WGSL ${JSON.stringify(gen)}`);
     console.log(`  ONNX ${JSON.stringify(o2.generated)}`);
     console.log(`  ONNX text: ${JSON.stringify(o2.text)}`);
-    ok(`a second prompt also matches token-for-token`, same,
-      same ? `${gen.length} tokens identical` : `first difference at ${
-        gen.findIndex((v, i) => v !== o2.generated[i])}`);
+    ok(
+      `a second prompt also matches token-for-token`,
+      same,
+      same
+        ? `${gen.length} tokens identical`
+        : `first difference at ${gen.findIndex((v, i) => v !== o2.generated[i])}`,
+    );
   }
 }
 

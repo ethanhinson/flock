@@ -9,14 +9,18 @@
 //
 // Only the tensor's own byte range is fetched (1-3MB), not the model.
 
-import { readModel, fetchRange, layerTensors } from "../server/gguf.mjs";
+import { fetchRange, layerTensors, readModel } from "../server/gguf.mjs";
+import type { MetadataValue } from "@huggingface/gguf";
 import type { LayerWeights } from "./layer.ts";
 
 const MODEL = "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf";
 const CACHE = new URL("./.cache/", import.meta.url);
 
 export interface RealTensor {
-  name: string; rows: number; cols: number; packed: Uint8Array;
+  name: string;
+  rows: number;
+  cols: number;
+  packed: Uint8Array;
 }
 
 let modelPromise: Promise<Awaited<ReturnType<typeof readModel>>> | null = null;
@@ -212,14 +216,34 @@ export async function realModel(): Promise<RealModel> {
   const [ecols, erows] = et.shape;
   const nt = find("output_norm.weight");
 
+  // GGUF metadata is an open key/value table whose keys depend on the
+  // architecture (`qwen3.embedding_length`). @huggingface/gguf types it strictly,
+  // as a union over the architectures it knows about, and qwen3 is not one of
+  // them -- so the strict type cannot name these keys at all, and reading them
+  // through it is a type error however the file is actually laid out. A copy
+  // into a plain dictionary is the honest view: the keys are runtime data, and a
+  // key that is missing is an error to raise here, not a NaN to carry into the
+  // kernels as a hidden size.
+  const metadata: Record<string, MetadataValue | undefined> = { ...model.metadata };
+  const metaNumber = (key: string): number => {
+    const v = metadata[key];
+    if (typeof v !== "number" && typeof v !== "bigint") {
+      throw new Error(
+        `${MODEL}: metadata ${key} is ${v === undefined ? "missing" : typeof v}, ` +
+          `expected a number`,
+      );
+    }
+    return Number(v);
+  };
+
   return {
     layers,
     embd: { name: et.name, rows: erows, cols: ecols, packed: at(et) },
     outputNorm: new Float32Array(at(nt).slice().buffer),
-    eos: Number(model.metadata["tokenizer.ggml.eos_token_id"]),
-    bos: Number(model.metadata["tokenizer.ggml.bos_token_id"]),
+    eos: metaNumber("tokenizer.ggml.eos_token_id"),
+    bos: metaNumber("tokenizer.ggml.bos_token_id"),
     nLayers: model.nLayers,
-    hidden: Number(model.metadata[`${model.arch}.embedding_length`]),
+    hidden: metaNumber(`${model.arch}.embedding_length`),
     vocab: erows,
   };
 }

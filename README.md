@@ -289,6 +289,26 @@ npm run test:kernels   # the WGSL engine's 13 suites, 316 assertions, on the GPU
 npm run test:gpu       # the streaming loader against real hardware and the real file
 ```
 
+Two of the 13 kernel suites (`test_model.ts`, `test_onnx.ts`) diff the engine
+against the ONNX export and skip, passing, when `kernels/.ref/` is absent; that
+leaves 297 assertions on a machine without the export and 316 with it.
+
+**What CI runs, and what it cannot.** `.github/workflows/ci.yml` runs on every
+push and pull request: `deno fmt --check`, `deno lint` and `deno check` over
+`kernels/` (the fmt and lint scope is set in `deno.json`), `node --check` over
+every module plus the inline page scripts (`npm run check`), the four unit
+tests that need neither a GPU nor the network (`allocate`, `flock`, `probe`,
+`bird_gguf`), and -- in a separate, time-boxed job -- the two that read the real
+GGUF header from HuggingFace (`gguf`, `gguf_dir`). A hosted runner has no
+WebGPU device, so the kernel suites, `test/gpu/` and the e2e group, which are
+the tests that prove the model computes the right text, are listed as a skipped
+job and run only locally. The full suite is:
+
+```bash
+npm install && npm test   # on a machine with a GPU; ~5 minutes, downloads the
+                          # 639 MB model once into kernels/.cache/
+```
+
 The e2e group is the one that matters for the membership protocol.
 `test/e2e/churn.test.mjs` runs real `tools/sim_bird.mjs` processes that hold
 nothing for 2.5 s after every assignment, joins devices between turns and

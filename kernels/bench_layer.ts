@@ -27,7 +27,10 @@ const TRIALS = 30;
 const x = randVec(cfg.hidden, 0.05);
 
 // Warm up: first call pays pipeline compilation and buffer residency.
-for (let i = 0; i < 3; i++) { layer.reset(); await layer.forward(x); }
+for (let i = 0; i < 3; i++) {
+  layer.reset();
+  await layer.forward(x);
+}
 
 // Time steady-state decode at a few cache depths. Attention is the only part
 // whose cost grows with the cache, so this says how much.
@@ -51,7 +54,7 @@ for (const depth of [1, 128, 512, 1024]) {
   const med = ms[ms.length >> 1];
   console.log(
     `${String(depth).padStart(11)}   ${med.toFixed(3).padStart(7)}   ` +
-    `${(1000 / med).toFixed(1).padStart(18)}   ${(1000 / (med * 28)).toFixed(2).padStart(19)}`,
+      `${(1000 / med).toFixed(1).padStart(18)}   ${(1000 / (med * 28)).toFixed(2).padStart(19)}`,
   );
 }
 
@@ -60,7 +63,10 @@ for (const depth of [1, 128, 512, 1024]) {
 // encode(), which queues the identical 16 dispatches and does not wait.
 {
   const timeOf = async (fn: () => Promise<void> | void) => {
-    for (let i = 0; i < 3; i++) { layer.nKeys = 0; await fn(); }
+    for (let i = 0; i < 3; i++) {
+      layer.nKeys = 0;
+      await fn();
+    }
     const ms: number[] = [];
     for (let t = 0; t < TRIALS; t++) {
       layer.nKeys = 0;
@@ -77,7 +83,10 @@ for (const depth of [1, 128, 512, 1024]) {
   // N encodes behind ONE readback, each submitting its own command buffer.
   const N = 28;
   const chained = await timeOf(async () => {
-    for (let i = 0; i < N; i++) { layer.nKeys = i; layer.encode(i === 0 ? x : undefined); }
+    for (let i = 0; i < N; i++) {
+      layer.nKeys = i;
+      layer.encode(i === 0 ? x : undefined);
+    }
     await layer.readOutput();
   });
   // N encodes sharing ONE command buffer. This is what a shard should do, and it
@@ -85,7 +94,10 @@ for (const depth of [1, 128, 512, 1024]) {
   // driver validates and dispatches N times instead of once.
   const batched = await timeOf(async () => {
     const enc = dev.createCommandEncoder();
-    for (let i = 0; i < N; i++) { layer.nKeys = i; layer.encode(i === 0 ? x : undefined, enc); }
+    for (let i = 0; i < N; i++) {
+      layer.nKeys = i;
+      layer.encode(i === 0 ? x : undefined, enc);
+    }
     dev.queue.submit([enc.finish()]);
     await layer.readOutput();
   });
@@ -94,18 +106,36 @@ for (const depth of [1, 128, 512, 1024]) {
   // per-dispatch overhead. Sum of the seven this layer issues.
   const matvecMs = (30.5 + 24.7 + 24.7 + 24.7 + 36.9 + 36.9 + 30.0) / 1000;
   console.log("\ncost per layer, by how much the host batches:");
-  console.log(`  forward()          own command buffer, own readback   ${withReadback.toFixed(3)} ms`);
-  console.log(`  encode() x${N}      own command buffer, one readback    ${(chained / N).toFixed(3)} ms` +
-    `   (${(withReadback / (chained / N)).toFixed(1)}x)`);
-  console.log(`  encode() x${N}      ONE command buffer, one readback    ${(batched / N).toFixed(3)} ms` +
-    `   (${(withReadback / (batched / N)).toFixed(1)}x)`);
+  console.log(
+    `  forward()          own command buffer, own readback   ${withReadback.toFixed(3)} ms`,
+  );
+  console.log(
+    `  encode() x${N}      own command buffer, one readback    ${(chained / N).toFixed(3)} ms` +
+      `   (${(withReadback / (chained / N)).toFixed(1)}x)`,
+  );
+  console.log(
+    `  encode() x${N}      ONE command buffer, one readback    ${(batched / N).toFixed(3)} ms` +
+      `   (${(withReadback / (batched / N)).toFixed(1)}x)`,
+  );
   console.log(`\n  floor for reference:`);
   console.log(`    sum of this layer's 16 dispatches, timed individually: ~0.72 ms`);
-  console.log(`    the 7 matvecs alone (bench.ts):                        ${matvecMs.toFixed(3)} ms`);
+  console.log(
+    `    the 7 matvecs alone (bench.ts):                        ${matvecMs.toFixed(3)} ms`,
+  );
   console.log(`\n  Two things cost more than the arithmetic, and both are host-side:`);
-  console.log(`  the map readback (~${(withReadback - chained / N).toFixed(0)} ms, so never per layer -- keep the hidden`);
+  console.log(
+    `  the map readback (~${
+      (withReadback - chained / N).toFixed(0)
+    } ms, so never per layer -- keep the hidden`,
+  );
   console.log(`  state on the GPU and read once per shard), and per-layer command`);
-  console.log(`  buffer submission (${((chained - batched) / N).toFixed(2)} ms/layer, so share one encoder).`);
-  console.log(`\n  A 28-layer pass projects to ${(1000 / batched).toFixed(1)} tok/s batched, versus`);
-  console.log(`  ${(1000 / (28 * withReadback)).toFixed(2)} tok/s with a readback and a submit per layer.`);
+  console.log(
+    `  buffer submission (${((chained - batched) / N).toFixed(2)} ms/layer, so share one encoder).`,
+  );
+  console.log(
+    `\n  A 28-layer pass projects to ${(1000 / batched).toFixed(1)} tok/s batched, versus`,
+  );
+  console.log(
+    `  ${(1000 / (28 * withReadback)).toFixed(2)} tok/s with a readback and a submit per layer.`,
+  );
 }
