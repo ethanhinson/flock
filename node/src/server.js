@@ -748,6 +748,14 @@ wss.on('connection', ws => {
         if (!bird.placed() && !convo.busy) {
           rebalance({force: true, why: `${bird.label} connected`});
         }
+        // ALWAYS tell this bird its current range, even if it has not changed.
+        // /join answers with the range at that instant, but a later device's join
+        // reallocates -- and announce() skips anyone without a socket yet, so the
+        // first device was told 4-27 at join, silently moved to 4-15, and never
+        // heard about it. Two devices then displayed 4-27 and 16-27, which looks
+        // like overlapping assignment and would compute layers 16-27 twice.
+        const mine = flock.chainFor(bird.peerId);
+        if (mine) try { ws.send(JSON.stringify(mine)); } catch {}
         // Offer the bird a direct data channel; the websocket then only
         // carries signaling.
         bird.openRTC(b => console.log(`webrtc link open to ${b.label} (${b.start}-${b.end})`));

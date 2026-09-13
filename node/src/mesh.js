@@ -521,6 +521,10 @@ export class Flock {
   /** Tell every bird its range and its successor — call whenever either changes. */
   announce() {
     for (const b of this.birds) {
+      // No socket yet: nothing to send on. That bird is caught up on its hello
+      // instead -- see the chainFor() send in the server's websocket handler. This
+      // gap is why a device could be told one range at /join and moved to another
+      // before it ever connected.
       if (!b.ws) continue;
       const c = this.chainFor(b.peerId);
       if (c) try { b.ws.send(JSON.stringify(c)); } catch {}
