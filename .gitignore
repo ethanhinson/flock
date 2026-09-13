@@ -27,3 +27,11 @@ test/unit/.*-shim-*.mjs
 
 # agent worktrees
 .claude/worktrees/
+
+# The ONNX regression reference (web/coord/, ~2.7 GB) is regenerated locally by
+# kernels/onnx_truth.mjs and is only used by test_model.ts / test_onnx.ts, which
+# skip when it is absent. It must never be committed: 2.8 GB of it in history is
+# what made pushes time out once already.
+web/coord/
+web/*.onnx
+web/*.onnx.data
