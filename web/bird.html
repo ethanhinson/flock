@@ -217,6 +217,9 @@ function progressDone(msg) {
 // id let one device take over another's slot, and localStorage cannot tell two
 // devices apart when both report navigator.platform as "MacIntel".
 let peerId = null;
+// True while the FIRST weight stream is in flight. A reassignment during it has to
+// wait, or two loads fight over the same GPU buffers.
+let loading = false, pendingChain = null;
 (async () => {
   // WHAT CAN THIS DEVICE ACTUALLY DO -- measured, and measured BEFORE joining.
   //
@@ -344,6 +347,14 @@ let peerId = null;
   set('binding', `${(device.limits.maxStorageBufferBindingSize / 1e6).toFixed(0)} MB`);
   log(`largest tensor this device can hold: ` +
       `${(device.limits.maxStorageBufferBindingSize / 1e6).toFixed(0)} MB`, 'ok');
+  // Connect BEFORE streaming. Downloading 400MB takes seconds, and any device that
+  // joins during that window reallocates us -- with no socket open, that notice is
+  // dropped and we stream (and then display) the range we were told at /join.
+  // Measured: one device downloaded all 24 layers, 401MB, while the coordinator had
+  // already moved it to 4-15, and its UI kept showing 4-27. Opening the socket first
+  // turns that lost notice into a reassignment we can act on mid-download.
+  connect();
+  loading = true;
   const t = performance.now();
   const got = await loadBirdWeights(device, meta.gguf, meta.start, meta.end, {
     onNote: m => log('gguf: ' + m),
@@ -374,9 +385,10 @@ let peerId = null;
   // avoided. Same kernels either way -- kernels/test_frombuffers.ts asserts the
   // two constructors are bit-identical.
   progress('building layers', 1, 1);
-  // Built locally and published in one statement, same as reassign() -- see the note
-  // there. Nothing can arrive here yet (the socket opens only once join is enabled),
-  // but keeping the two paths identical means there is no case to reason about.
+  // Built locally and published in one statement, same as reassign(). The socket is
+  // now open BEFORE this runs (so a mid-download reassignment is not lost), so a
+  // chain message really can arrive during the build -- it is parked in
+  // pendingChain and applied below rather than racing these buffers.
   const built = [];
   for (let i = meta.start; i <= meta.end; i++) {
     const w = got.layers[i];
@@ -386,6 +398,14 @@ let peerId = null;
   layers = built;
   progressDone('ready');
   set('backend', capability.backend, 'ok');
+  // The initial stream is done; anything that arrived while it was in flight can
+  // now be applied safely.
+  loading = false;
+  if (pendingChain) {
+    const p = pendingChain; pendingChain = null;
+    log('applying the reassignment that arrived during the download', 'ok');
+    await reassign(p);
+  }
   await report('gguf-loaded', {
     mb: +(s.bytesTotal / 1e6).toFixed(1), secs: +secs.toFixed(1),
     tensors: s.tensors, requests: s.requests, cached: s.fromCache,
@@ -402,7 +422,7 @@ let peerId = null;
     $('join').textContent = 'leave the flock';
     $('join').classList.add('leave');
     await keepAwake(true);
-    connect();
+    if (!ws || ws.readyState > 1) connect();   // already connected above
     log('rejoined automatically after refresh', 'ok');
   } else {
     log('model ready — tap join', 'ok');
@@ -730,7 +750,13 @@ function connect() {
         // weights rather than keep computing the layers we happen to have, which
         // would put the wrong layers at the right positions and produce text that is
         // wrong without looking wrong.
-        if (m.start !== meta.start || m.end !== meta.end) return reassign(m);
+        if (m.start !== meta.start || m.end !== meta.end) {
+          // Mid-initial-stream, reassign() would race loadBirdWeights for the same
+          // GPU buffers. Park it; the initial load applies it when it lands.
+          if (loading) { pendingChain = m; log(`reassigned mid-download → ` +
+              `${m.start}–${m.end}, applying when the stream finishes`); return; }
+          return reassign(m);
+        }
         if (m.next_peer && !chan) openRTC(m.next_peer);
         showLink();
       }
