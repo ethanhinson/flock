@@ -330,5 +330,37 @@ console.log('\nthe lap goes through the placed birds in LAYER order:');
   ok('an unplaced member is not in the lap', f.chain().length === 3);
 }
 
+// =========================================================================
+console.log('\n200 rounds of churn never break the invariants:');
+{
+  // The properties that, if they ever fail, produce WRONG TEXT rather than an error:
+  // a gap in the chain skips layers, an overlap runs one twice, and a duplicate slot
+  // makes two devices fight over one DOM node and one position in the lap. None of
+  // them throws, so none of them would be noticed without a check like this.
+  const f = new Flock(LAYERS(8, 0));
+  let bad = [];
+  for (let round = 0; round < 200; round++) {
+    const n = 1 + (round % 8);
+    for (const b of [...f.birds]) f.release(b.peerId);
+    for (let i = 0; i < n; i++) join(f, `d${i}_${round}`);
+    f.plan({force: true});
+    const chain = f.chain();
+    const slots = chain.map(b => b.slot);
+    if (new Set(slots).size !== slots.length) bad.push(`round ${round}: duplicate slots`);
+    if (!slots.every((s, i) => s === i)) bad.push(`round ${round}: slot != chain index`);
+    let want = 0;
+    for (const b of chain) {
+      if (b.start !== want) { bad.push(`round ${round}: gap/overlap at ${b.start}`); break; }
+      want = b.end + 1;
+    }
+    if (want !== 8 && !f.infeasible) bad.push(`round ${round}: only covered 0-${want - 1}`);
+    for (const b of f.birds) {
+      if (b.placed() && (b.start < 0 || b.end > 7)) bad.push(`round ${round}: out of plan`);
+    }
+  }
+  ok('no gaps, no overlaps, no duplicate slots, nothing outside the layer plan',
+     bad.length === 0, bad.slice(0, 3).join('; ') || '200 rounds, 1-8 devices each');
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
