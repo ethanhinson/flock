@@ -12,8 +12,8 @@
 //   node test/allocate.test.mjs
 import {allocate, device, layerPlan, Infeasible, explain, DEFAULT_RATE}
   from '../src/allocate.js';
-import {Rate, shouldRebalance, currentMakespan, MIN_SAMPLES, MIN_GAIN, COOLDOWN_MS}
-  from '../src/speed.js';
+import {Rate, shouldRebalance, currentMakespan, MIN_SAMPLES, MIN_GAIN, COOLDOWN_MS,
+        MIN_MS} from '../src/speed.js';
 
 let pass = 0, fail = 0;
 const ok = (name, cond, extra = '') => {
@@ -257,8 +257,33 @@ console.log('\nRate: a bytes/ms EWMA that one bad token cannot move far:');
   ok('halving a device\'s layers does not change its measured RATE',
      Math.abs(a.value - b.value) < 1, `${a.value} vs ${b.value}`);
 
-  ok('a zero or negative time is ignored, not divided by',
-     new Rate().observe(1 * MB, 0).samples === 0);
+  // A REPORTED ZERO IS "FASTER THAN THE CLOCK", NOT "NO MEASUREMENT". This had the
+  // inverted failure that makes it worth a test of its own: a bird reports its time
+  // rounded to 0.1ms, so a device fast enough to round to 0.0 accumulated no samples,
+  // never became trusted, and therefore blocked every rebalance -- the faster the
+  // device, the less measurable it was. Observed live: a Mac stuck at 1 sample while a
+  // phone beside it reached 54, and "waiting for timings: 1/2 devices" was the standing
+  // reason for nine turns running.
+  {
+    const z = new Rate();
+    for (let i = 0; i < MIN_SAMPLES; i++) z.observe(20 * MB, 0);
+    ok('a reported 0ms still counts as a sample', z.samples === MIN_SAMPLES,
+       `${z.samples} samples`);
+    ok('  so a device too fast to measure becomes trusted', z.trusted());
+    ok('  at the reporting resolution, not at infinity',
+       Number.isFinite(z.value) && z.value === 20 * MB / MIN_MS,
+       `${(z.value / 1e6).toFixed(0)}MB/ms`);
+    const slow = new Rate();
+    for (let i = 0; i < MIN_SAMPLES; i++) slow.observe(20 * MB, 40);
+    ok('  and still reads as far faster than a measurable device',
+       z.value > slow.value * 100, `${z.value / slow.value | 0}x`);
+  }
+  ok('a garbage time is still ignored: no sample, no NaN',
+     new Rate().observe(1 * MB, NaN).samples === 0 &&
+     new Rate().observe(1 * MB, -5).samples === 0 &&
+     new Rate().observe(1 * MB, null).samples === 0);
+  ok('zero bytes is ignored: a device holding nothing measures nothing',
+     new Rate().observe(0, 10).samples === 0);
 }
 
 // =========================================================================

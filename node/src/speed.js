@@ -53,6 +53,11 @@ export const MIN_GAIN = 0.15;
  *  relative to a token. */
 export const COOLDOWN_MS = 20000;
 
+/** The finest time a bird can report. Both bird.html and sim_bird.mjs send
+ *  `+(performance.now() - t0).toFixed(1)`, so 0.1ms is the resolution of the
+ *  measurement itself and anything faster arrives as a literal 0. */
+export const MIN_MS = 0.1;
+
 /** Tracks one device's throughput in bytes per millisecond. */
 export class Rate {
   constructor({alpha = ALPHA, minSamples = MIN_SAMPLES} = {}) {
@@ -72,8 +77,20 @@ export class Rate {
    * show up as a 13% speed difference that is really a size difference.
    */
   observe(bytes, ms) {
-    if (!(ms > 0) || !(bytes > 0)) return this;     // a zero is a lost frame
-    const r = bytes / ms;
+    if (!(bytes > 0) || ms == null || !(ms >= 0) || !Number.isFinite(ms)) return this;
+    // A REPORTED ZERO IS "FASTER THAN THE CLOCK", NOT "NO MEASUREMENT", and treating
+    // it as the latter was a real bug with an inverted failure: a bird reports its own
+    // time rounded to 0.1ms, so a device fast enough to round to 0.0 accumulated NO
+    // samples, never became trusted, and therefore blocked every rebalance -- the
+    // faster the device, the less measurable it was. Measured: a Mac sat at 1 sample
+    // while a phone next to it reached 54, and "waiting for timings: 1/2 devices" was
+    // the standing reason for nine turns in a row.
+    //
+    // Floored at the reporting resolution instead. That UNDERSTATES how fast such a
+    // device is, which is the safe direction: it still reads as much faster than
+    // anything measurable, and it cannot be given a share by a rate that is really an
+    // artefact of division by an arbitrarily small number.
+    const r = bytes / Math.max(ms, MIN_MS);
     this.value = this.value == null ? r : this.value + this.alpha * (r - this.value);
     this.samples++;
     this.lastMs = ms;
