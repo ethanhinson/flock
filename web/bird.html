@@ -742,7 +742,13 @@ async function onSignal(from, d) {
 // --- transport: one websocket, event-driven, no polling -------------------
 let beat = null;
 function connect() {
-  ws = new WebSocket(`ws://${location.host}/ws`);
+  // wss:// on an https page. A browser BLOCKS an insecure ws:// from a secure
+  // context, so this silently never opened once the coordinator started serving
+  // https for Chrome's sake -- and a bird with no socket can never be told its
+  // range changed. Every device kept whatever /join gave it, which is exactly the
+  // overlapping ranges that looked like an allocator bug.
+  const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${scheme}://${location.host}/ws`);
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => {
     ws.send(JSON.stringify({peer_id: peerId, label: navigator.platform || 'phone'}));
