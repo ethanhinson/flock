@@ -1,7 +1,7 @@
 // Validate the cooperative kernels (q8_coop.wgsl, q4_coop.wgsl) against a
 // strict-f32 CPU reference and against real GGUF weights, on BOTH decode paths.
 //
-//   deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_coop.ts
+//   deno run --unstable-webgpu --allow-all kernels/test_coop.ts
 //
 // Two things this test is built around:
 //

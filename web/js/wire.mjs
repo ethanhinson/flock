@@ -1,6 +1,6 @@
 // flock wire format — the single implementation, shared by both sides.
 //
-// The coordinator (node/src/*) imports this file directly; browsers fetch it
+// The coordinator (server/*) imports this file directly; browsers fetch it
 // from /js/wire.mjs. One copy means the two ends cannot drift apart, which is
 // the only way a binary format like this stays safe to change.
 //

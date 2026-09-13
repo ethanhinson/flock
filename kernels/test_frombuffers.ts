@@ -1,6 +1,6 @@
 // Layer.fromBuffers() against Layer.create(): the bird's construction path.
 //
-//   deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_frombuffers.ts
+//   deno run --unstable-webgpu --allow-all kernels/test_frombuffers.ts
 //
 // WHY THIS TEST EXISTS. A bird cannot use Layer.create(): that takes packed CPU
 // bytes and calls splitQ8 over the whole tensor, which is exactly the

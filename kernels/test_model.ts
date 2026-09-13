@@ -1,6 +1,6 @@
 // THE DELIVERABLE: the whole WGSL engine against the whole ONNX engine.
 //
-//   deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_model.ts
+//   deno run --unstable-webgpu --allow-all kernels/test_model.ts
 //
 // Generates text with 28 WGSL layers from GGUF Q8_0 weights -- embedding, prefill,
 // decode, output_norm, tied LM head, argmax, all on the GPU -- and requires the
@@ -24,9 +24,11 @@
 //   logits           vs a CPU projection  -- output_norm and the tied head
 //   token ids        vs head.onnx         -- the whole thing
 //
-// SKIPS rather than fails when the ONNX artifacts or onnxruntime are missing: the
-// .onnx files are gitignored build products (622 MB of embed/head weights alone)
-// and are absent in a fresh clone or a worktree.
+// SKIPS rather than fails when the ONNX artifacts or onnxruntime are missing. The
+// export is not part of the repo (622 MB of embed/head weights alone, and nothing
+// at runtime needs it); it is read from kernels/.ref/, or wherever FLOCK_ONNX_REF
+// points, laid out flat: embed.onnx, layers.onnx, head.onnx, coord.json, tok/,
+// shard0.onnx, shard1.onnx, each with its .data file beside it.
 
 import { getDevice, ok, summary } from "./lib.ts";
 import { absErrScaled, amax } from "./ops_ref.ts";
@@ -38,39 +40,36 @@ const REPO = new URL("../", import.meta.url).pathname;
 const PROMPT = "Capital of France?";
 const MAX_TOKENS = 16;
 
-/** The ONNX artifacts and onnxruntime may live outside this worktree. */
+/** The ONNX export directory (untracked, configurable) and the two npm packages
+ *  the Node-side reference runner needs. */
 function findPaths() {
-  for (const root of [REPO, "/Users/ethanhinson/dev/flock/"]) {
-    const need = [
-      `${root}web/coord/embed.onnx`, `${root}web/coord/layers.onnx`,
-      `${root}web/coord/head.onnx`, `${root}web/coord/coord.json`,
-      `${root}web/shard0.onnx`, `${root}web/shard1.onnx`,
-      `${root}node/node_modules/onnxruntime-node/dist/index.js`,
-      `${root}node/node_modules/@huggingface/transformers/dist/transformers.node.mjs`,
-    ];
-    try {
-      for (const f of need) Deno.statSync(f);
-      return {
-        coordDir: `${root}web/coord`,
-        shards: [
-          { path: `${root}web/shard0.onnx`, n_layers: 2 },
-          { path: `${root}web/shard1.onnx`, n_layers: 2 },
-        ],
-        ort: `${root}node/node_modules/onnxruntime-node/dist/index.js`,
-        transformers:
-          `${root}node/node_modules/@huggingface/transformers/dist/transformers.node.mjs`,
-      };
-    } catch { /* try the next root */ }
+  const ref = (Deno.env.get("FLOCK_ONNX_REF") || `${REPO}kernels/.ref`).replace(/\/$/, "");
+  const ort = `${REPO}node_modules/onnxruntime-node/dist/index.js`;
+  const transformers =
+    `${REPO}node_modules/@huggingface/transformers/dist/transformers.node.mjs`;
+  const need = [
+    `${ref}/embed.onnx`, `${ref}/layers.onnx`, `${ref}/head.onnx`, `${ref}/coord.json`,
+    `${ref}/shard0.onnx`, `${ref}/shard1.onnx`, ort, transformers,
+  ];
+  try {
+    for (const f of need) Deno.statSync(f);
+  } catch {
+    return null;
   }
-  return null;
+  return {
+    coordDir: ref,
+    shards: [
+      { path: `${ref}/shard0.onnx`, n_layers: 2 },
+      { path: `${ref}/shard1.onnx`, n_layers: 2 },
+    ],
+    ort, transformers,
+  };
 }
 
 const paths = findPaths();
 if (!paths) {
-  console.log("  skip  web/coord/*.onnx, web/shard*.onnx or node_modules not found.");
-  console.log("        These are gitignored build artifacts. Regenerate with");
-  console.log("        flock_export_coordinator.py and build_shards.py, and run");
-  console.log("        npm install in node/, to run this diff.");
+  console.log("  skip  no ONNX reference: needs the export under kernels/.ref/ (or");
+  console.log("        FLOCK_ONNX_REF) and onnxruntime-node from `npm install`.");
   Deno.exit(0);
 }
 
@@ -141,7 +140,7 @@ const cos = (a: Float32Array, b: Float32Array) => {
 
 // --- the hidden state after all 28 layers + output_norm ---------------------
 // onnx.normedAfterPrompt is exactly what head.onnx was FED: the last shard's
-// output, with output_norm already applied (flock_export.py applies it when
+// output, with output_norm already applied (the export applied it when
 // is_last; head.onnx never calls the norm it holds). So the WGSL tensor to compare
 // is normedState -- output_norm applied once, in the same place.
 {

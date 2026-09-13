@@ -5,7 +5,7 @@
 //
 //   npm run plan -- --birds 2
 //   npm run plan -- --url <gguf> --coord 20 --birds 3
-import {readModel, byteRanges, totalBytes, splitLayers} from './src/gguf.mjs';
+import {readModel, byteRanges, totalBytes, splitLayers} from '../server/gguf.mjs';
 
 const arg = (k, d) => {
   const i = process.argv.indexOf('--' + k);

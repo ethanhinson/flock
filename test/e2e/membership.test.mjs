@@ -1,6 +1,6 @@
 // Dynamic membership against a LIVE coordinator, with fake birds.
 //
-// What this adds over node/test/flock.test.mjs: that one drives the Flock object
+// What this adds over test/unit/flock.test.mjs: that one drives the Flock object
 // directly, this one goes through the real HTTP and websocket surface -- /join with
 // caps, the chain message, /leave, /evict, and the token-boundary rebalance inside
 // /chat. It is the test that would catch a Flock that is correct and a server that

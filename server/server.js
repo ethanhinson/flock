@@ -1,28 +1,25 @@
-// flock_server — runs the whole flock with WebRTC on every link.
+// The coordinator: runs the whole flock with WebRTC on every link.
 //
-// The coordinator holds the embedding, layers 0..cut-1, output_norm and the vocab
-// projection; each phone (a "bird") holds a contiguous slice of the rest.
-// Per token the hidden state makes one lap: coordinator -> bird -> bird -> back.
+// It holds the embedding, layers 0..cut-1, output_norm and the vocab projection;
+// each device (a "bird") holds a contiguous slice of the rest. Per token the
+// hidden state makes one lap: coordinator -> bird -> bird -> back.
 //
-// Because this is a real server rather than a Python script, the coordinator is
-// itself a WebRTC peer: it offers a data channel to each bird, and once that
-// opens the websocket carries nothing but signaling.
+// The coordinator is itself a WebRTC peer: it offers a data channel to each bird,
+// and once that opens the websocket carries nothing but signaling.
 //
-// RUN IT WITH DENO, NOT NODE:
+// RUN IT WITH DENO, NOT NODE (`npm start` does):
 //
-//   deno task start            (from node/, or `npm start` which calls it)
+//   deno run --unstable-webgpu --allow-all server/server.js
 //
-// The coordinator runs Qwen3's first 24 layers as WGSL compute kernels, so it
+// The coordinator runs its share of the layers as WGSL compute kernels, so it
 // needs a GPU, and Node has no WebGPU -- no `navigator` at all, and no flag that
 // adds one. Deno provides a device and also runs express, ws and node-datachannel
 // unchanged through its node compatibility layer, so the whole server is one
-// process on one runtime. See node/README.md for what was measured.
+// process on one runtime.
 //
-// THERE IS NO BUILD STEP. The topology used to come from web/flock.json, written
-// by build_shards.py alongside exported ONNX graphs. With GGUF a split is just a
-// choice about byte ranges, so it is computed here at startup from the model's
-// header: nothing is exported, nothing is written to disk, and the split can
-// change without rebuilding anything.
+// THERE IS NO BUILD STEP. With GGUF a split is just a choice about byte ranges,
+// so it is computed here at startup from the model's header: nothing is exported,
+// nothing is written to disk, and the split can change without rebuilding anything.
 import express from 'express';
 import {WebSocketServer} from 'ws';
 import {createServer} from 'node:http';
@@ -37,9 +34,9 @@ import {Coordinator} from './coordinator.js';
 import {Flock} from './mesh.js';
 import {readModel} from './gguf.mjs';
 import {layerPlan, Infeasible} from './allocate.js';
-import {QWEN3_06B} from '../../kernels/layer.ts';
+import {QWEN3_06B} from '../kernels/layer.ts';
 
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 process.chdir(ROOT);
 
 // Where every device -- birds AND this coordinator -- reads its weights from.

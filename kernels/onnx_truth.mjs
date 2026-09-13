@@ -31,16 +31,16 @@ if (!inPath || !outPath) {
   process.exit(2);
 }
 
-// onnxruntime-node is a native addon installed under node/node_modules, and the
+// onnxruntime-node is a native addon installed under node_modules, and the
 // caller may pass an explicit path because a git worktree does not have its own
 // node_modules. Import by URL so no resolution config is needed.
 const req0 = JSON.parse(readFileSync(inPath, 'utf8'));
 const ortPath = req0.ort ??
-  new URL('../node/node_modules/onnxruntime-node/dist/index.js', import.meta.url).pathname;
+  new URL('../node_modules/onnxruntime-node/dist/index.js', import.meta.url).pathname;
 if (!existsSync(ortPath)) {
   console.error(`onnxruntime-node not found at ${ortPath}. It is a devDependency of ` +
-    `node/ and is not installed in a worktree; pass {"ort": "<path>"} in the input ` +
-    `JSON to point at an existing install, or run npm install in node/.`);
+    `the repo and is not installed in a worktree; pass {"ort": "<path>"} in the input ` +
+    `JSON to point at an existing install, or run npm install.`);
   process.exit(3);
 }
 const ort = (await import(`file://${ortPath}`)).default;

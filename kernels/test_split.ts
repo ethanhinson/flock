@@ -1,6 +1,6 @@
 // The SHARDED forward pass == the whole-model forward pass.
 //
-//   deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_split.ts
+//   deno run --unstable-webgpu --allow-all kernels/test_split.ts
 //
 // WHAT THIS IS FOR. flock runs Qwen3 across devices: the coordinator holds the
 // embedding and layers 0..cut-1, birds hold cut..27, and the hidden state crosses
@@ -59,7 +59,7 @@ for (let i = CUT; i < m.nLayers; i++) {
 console.log(`coordinator: layers 0-${CUT - 1};  birds: layers ${CUT}-${m.nLayers - 1}\n`);
 
 /**
- * One lap, the way node/src/server.js drives it: coordinator forward, through
+ * One lap, the way server/server.js drives it: coordinator forward, through
  * every bird in order, then back to the coordinator for the head.
  *
  * The hidden state crosses a host boundary at each hop, which is what the real

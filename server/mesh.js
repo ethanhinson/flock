@@ -21,7 +21,7 @@ import nodeDataChannel from 'node-datachannel';
 // node-datachannel's sendMessageBinary and ws both want a real Buffer, so the
 // transport keeps using exactly what it used before.
 import {Buffer} from 'node:buffer';
-import {pack, unpack} from '../../web/js/wire.mjs';
+import {pack, unpack} from '../web/js/wire.mjs';
 import {allocate, device, Infeasible, explain, DEFAULT_RATE} from './allocate.js';
 import {Rate, shouldRebalance, currentMakespan, MIN_SAMPLES} from './speed.js';
 

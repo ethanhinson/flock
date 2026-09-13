@@ -1,24 +1,24 @@
-# Weight cache. Every device fetches its own bytes from the model host, so
-# nothing here is a build artifact -- it is just a download that need not repeat.
+# The whole model file, cached by kernels/real_weights.ts so the coordinator and a
+# simulated bird do not re-download 639MB per run. Not a build artifact: every
+# device fetches its own bytes from the model host, this is just a download that
+# need not repeat.
 kernels/.cache
 
-.DS_Store
-.venv/
+# The ONNX export of the same model that kernels/test_model.ts diffs the WGSL
+# engine against. It is the only independent reference in the repo and it is
+# gigabytes, so it lives here untracked; the test skips when it is absent.
+kernels/.ref
 
-# Node / Deno
-node/node_modules
-# Per-scenario module shims written and unlinked by node/test/bird_gguf.test.mjs.
+# The self-signed certificate `npm run cert` writes. A private key, so never
+# tracked; each machine makes its own.
+.certs/
+
+node_modules/
+.DS_Store
+
+# Per-scenario module shims written and unlinked by test/unit/bird_gguf.test.mjs.
 # Ignored so an interrupted run cannot leave one staged.
-node/test/.*-shim-*.mjs
+test/unit/.*-shim-*.mjs
 
 # agent worktrees
 .claude/worktrees/
-
-# ONNX build artifacts. These are GONE from the runtime (the engine is WGSL on
-# streamed GGUF) but kernels/onnx_truth.mjs can still regenerate them as a
-# dev-only reference. They are gigabytes; they must never be committed again --
-# 2.8GB of them in history is why pushes started timing out.
-web/coord/
-web/*.onnx
-web/*.onnx.data
-.certs/

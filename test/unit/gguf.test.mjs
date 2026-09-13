@@ -2,7 +2,7 @@
 // Network-dependent by design: the claim under test is that range requests
 // work against a real CDN, which a fixture cannot show.
 import {readModel, layerTensors, byteRanges, totalBytes, fetchRange, splitLayers}
-  from '../src/gguf.mjs';
+  from '../../server/gguf.mjs';
 
 const URL = 'https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf';
 const FILE_BYTES = 639446688;

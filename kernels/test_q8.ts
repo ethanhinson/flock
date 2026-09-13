@@ -11,7 +11,7 @@
 // same GPU output compared against an f64 accumulator is off by ~6e-5, which is
 // f32 summation losing that much on its own, not the kernel being wrong.
 //
-//   deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_q8.ts
+//   deno run --unstable-webgpu --allow-all kernels/test_q8.ts
 
 import {
   SERIAL, cpuMatmulQ8F32, getDevice, maxRelErr, ok, quantMatrixQ8, randVec,

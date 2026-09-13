@@ -1,6 +1,6 @@
 // flock/gguf-dir — read a GGUF file's directory in a browser, over range requests.
 //
-// WHY this exists at all, when node/src/gguf.mjs already reads directories:
+// WHY this exists at all, when server/gguf.mjs already reads directories:
 // that module imports @huggingface/gguf, a bare npm specifier, so it cannot be
 // served to a phone. The alternative was to have the coordinator parse the
 // header and hand birds the directory as JSON — which is less code here but
@@ -33,7 +33,7 @@ const T = {
 
 // block_size / type_size per ggml: a quantized "block" is N weights sharing one
 // or two scale factors, so bytes-per-tensor is not elements * width. Kept in
-// sync with the same table in node/src/gguf.mjs -- two copies because one is
+// sync with the same table in server/gguf.mjs -- two copies because one is
 // Node-only and one is browser-only, and neither can import the other.
 export const BLOCK = {
   0:  {block: 1,   bytes: 4},    // F32

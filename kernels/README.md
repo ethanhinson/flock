@@ -10,23 +10,23 @@ runs `Layer.fromBuffers` over weights streamed straight from HuggingFace. ONNX
 remains only as the reference below.
 
 ```bash
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_q8.ts      # reference matvec
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_coop.ts    # optimized Q8_0 + Q4_0
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_ops.ts     # rmsnorm, rope, swiglu, add, attention
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_head.ts    # embedding, argmax, prefill attention
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_layer.ts   # whole layer vs CPU reference
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_prefill.ts # prefill vs N decode steps
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_onnx.ts    # one layer vs web/shard0.onnx
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_model.ts   # WHOLE MODEL vs the ONNX pipeline
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_frombuffers.ts # the bird's constructor == the tested one
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_split.ts  # sharded across a cut == unsplit
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_shard.ts      # TENSOR-PARALLEL matvec, both directions
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_shard_head.ts # tensor-parallel LM head
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_shard_mem.ts  # per-shard buffers under a limit
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/bench.ts        # matvec benchmark
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/bench_layer.ts  # layer benchmark
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/bench_model.ts  # embedding, head, prefill, token
-deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/bench_shard.ts  # sharding overhead, incl. the reduction
+deno run --unstable-webgpu --allow-all kernels/test_q8.ts      # reference matvec
+deno run --unstable-webgpu --allow-all kernels/test_coop.ts    # optimized Q8_0 + Q4_0
+deno run --unstable-webgpu --allow-all kernels/test_ops.ts     # rmsnorm, rope, swiglu, add, attention
+deno run --unstable-webgpu --allow-all kernels/test_head.ts    # embedding, argmax, prefill attention
+deno run --unstable-webgpu --allow-all kernels/test_layer.ts   # whole layer vs CPU reference
+deno run --unstable-webgpu --allow-all kernels/test_prefill.ts # prefill vs N decode steps
+deno run --unstable-webgpu --allow-all kernels/test_onnx.ts    # one layer vs the ONNX shard
+deno run --unstable-webgpu --allow-all kernels/test_model.ts   # WHOLE MODEL vs the ONNX pipeline
+deno run --unstable-webgpu --allow-all kernels/test_frombuffers.ts # the bird's constructor == the tested one
+deno run --unstable-webgpu --allow-all kernels/test_split.ts  # sharded across a cut == unsplit
+deno run --unstable-webgpu --allow-all kernels/test_shard.ts      # TENSOR-PARALLEL matvec, both directions
+deno run --unstable-webgpu --allow-all kernels/test_shard_head.ts # tensor-parallel LM head
+deno run --unstable-webgpu --allow-all kernels/test_shard_mem.ts  # per-shard buffers under a limit
+deno run --unstable-webgpu --allow-all kernels/bench.ts        # matvec benchmark
+deno run --unstable-webgpu --allow-all kernels/bench_layer.ts  # layer benchmark
+deno run --unstable-webgpu --allow-all kernels/bench_model.ts  # embedding, head, prefill, token
+deno run --unstable-webgpu --allow-all kernels/bench_shard.ts  # sharding overhead, incl. the reduction
 ```
 
 189 assertions in the pre-tensor-parallel suite plus 127 in the three shard
@@ -433,9 +433,9 @@ the Deno quirk the fallback has to handle: a **failed** `requestDevice` still
 invalidates the adapter, so the retry must request a fresh one.
 
 **4. `output_norm` is applied by the last SHARD, not by `head.onnx`.**
-`flock_export_coordinator.py` builds `Head(model.model.norm, model.lm_head)`
+The export built `head.onnx` as `Head(model.model.norm, model.lm_head)`
 whose forward is `self.head(hidden).argmax(-1)` — it takes the norm in its
-constructor and never calls it. `flock_export.py` applies it when `is_last`.
+constructor and never calls it; the last shard applies it when `is_last`.
 Reading `head.onnx` as "norm then project" and applying `output_norm` twice on
 the WGSL side would be plausible and wrong.
 
@@ -600,7 +600,7 @@ real_weights.ts   range-fetch GGUF tensors/layers, or the whole model, in .cache
 shard.ts          ShardedMatvec / ShardedHead: one tensor across N shards
 shard_ref.ts      shard planning, the slicers, and both directions' CPU refs
 dequant.ts        Q8_0 -> f32, and the quantization-term estimator
-onnx_truth.mjs    runs web/shard0.onnx under Node (native addon, cannot use Deno)
+onnx_truth.mjs    runs the ONNX shard under Node (native addon, cannot use Deno)
 onnx_full.mjs     runs the WHOLE ONNX pipeline + tokenizer, for the text diff
 deno.json         import map so the tests can reach @huggingface/gguf
 ```

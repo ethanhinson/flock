@@ -1,6 +1,6 @@
 // Pin the browser-side GGUF directory parser against the Node one.
 //
-// There are two parsers on purpose: node/src/gguf.mjs uses @huggingface/gguf,
+// There are two parsers on purpose: server/gguf.mjs uses @huggingface/gguf,
 // which is a bare npm specifier and so cannot be served to a phone, and
 // web/js/gguf-dir.mjs parses the header itself. Two implementations of the same
 // format is a standing invitation to drift -- a block-size table updated in one
@@ -13,7 +13,7 @@
 // disagree about a single offset, this is where it surfaces.
 //
 // Needs no GPU, which is why it lives in `npm test` rather than in the Deno suite.
-import {readModel} from '../src/gguf.mjs';
+import {readModel} from '../../server/gguf.mjs';
 import {readDirectory, layerTensors, byteRanges, totalBytes}
   from '../../web/js/gguf-dir.mjs';
 

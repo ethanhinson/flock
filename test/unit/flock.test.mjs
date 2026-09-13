@@ -7,13 +7,13 @@
 //
 // The links are stubbed -- a fake `ws` object with a send() -- because what is under
 // test is membership and placement, not the transport. The transport is unchanged and
-// is covered by node/test/bird_ui.test.mjs against a live coordinator.
+// is covered by test/e2e/bird_ui.test.mjs against a live coordinator.
 //
 // Needs no GPU and no network.
 //
 //   node test/flock.test.mjs
-import {Flock} from '../src/mesh.js';
-import {MIN_SAMPLES, COOLDOWN_MS} from '../src/speed.js';
+import {Flock} from '../../server/mesh.js';
+import {MIN_SAMPLES, COOLDOWN_MS} from '../../server/speed.js';
 
 let pass = 0, fail = 0;
 const ok = (name, cond, extra = '') => {

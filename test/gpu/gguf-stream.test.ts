@@ -31,7 +31,7 @@
 import {
   loadLayersToGPU, readDirectory, layerTensors, byteRanges, totalBytes,
   streamTensorToGPU, fetchRange, STAGING, allocStorage,
-} from "./gguf-stream.mjs";
+} from "../../web/js/gguf-stream.mjs";
 import { splitQ8 } from "../../kernels/lib.ts";
 import { realLayer } from "../../kernels/real_weights.ts";
 

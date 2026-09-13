@@ -2,7 +2,7 @@
 // argmax (GPU reduction versus reading 151936 floats back), prefill, and a whole
 // generated token.
 //
-//   deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/bench_model.ts
+//   deno run --unstable-webgpu --allow-all kernels/bench_model.ts
 //
 // READ kernels/README.md "the measurement traps" FIRST. Four of them produce
 // confident wrong numbers, and two apply directly to everything below:

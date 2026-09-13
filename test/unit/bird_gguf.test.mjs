@@ -12,7 +12,7 @@
 // Self-contained on purpose: it stubs the coordinator rather than needing one, so
 // it runs in CI without a GPU and without the network. The real streaming is
 // covered by web/js/gguf-stream.test.ts against real hardware and the real file,
-// and the real layers by node/test/bird_ui.test.mjs against a live coordinator;
+// and the real layers by test/e2e/bird_ui.test.mjs against a live coordinator;
 // what is under test HERE is only the branching and the failure reporting.
 //
 //   node test/bird_gguf.test.mjs
@@ -93,7 +93,7 @@ async function run({gguf, gpu, ggufModule, layerModule, join = null}) {
   const nodes = new Map();
   for (const id of ['sub', 'card', 'layers', 'of', 'count', 'dl', 'dlwhat', 'dlpct',
                     'dlfill', 'backend', 'link', 'cache', 'ms', 'kb', 'next',
-                    'problem', 'ptitle', 'pdetail', 'pfix', 'join', 'status']) {
+                    'problem', 'ptitle', 'pdetail', 'pfix', 'join', 'status', 'binding']) {
     const n = mk(); n.id = id; nodes.set(id, n);
   }
   nodes.get('join').disabled = true;
@@ -102,6 +102,11 @@ async function run({gguf, gpu, ggufModule, layerModule, join = null}) {
     getElementById: id => nodes.get(id) || null,
     createElement: mk, addEventListener() {}, visibilityState: 'visible',
   };
+  // The page registers a window-level pagehide listener (to hand its layers back
+  // when the tab closes); a headless harness has no window, so stub the global too.
+  globalThis.addEventListener = () => {};
+  // The no-WebGPU branch asks window.isSecureContext to word its advice.
+  globalThis.window = {isSecureContext: true};
   const store = new Map();
   globalThis.localStorage = {
     getItem: k => store.has(k) ? store.get(k) : null,
@@ -125,9 +130,9 @@ async function run({gguf, gpu, ggufModule, layerModule, join = null}) {
   // every scenario import the FIRST scenario's shim -- the throwing one never
   // threw, and two checks passed for the wrong reason.
   const tag = `${process.pid}-${nextShim++}`;
-  const ggufPath = path.join(ROOT, `node/test/.gguf-shim-${tag}.mjs`);
+  const ggufPath = path.join(ROOT, `test/unit/.gguf-shim-${tag}.mjs`);
   writeFileSync(ggufPath, ggufModule);
-  const layerPath = path.join(ROOT, `node/test/.layer-shim-${tag}.mjs`);
+  const layerPath = path.join(ROOT, `test/unit/.layer-shim-${tag}.mjs`);
   writeFileSync(layerPath, layerModule);
 
   const rewritten = src
@@ -223,6 +228,9 @@ const GGUF_URL = 'https://example.invalid/model.gguf';
 globalThis.GPUBufferUsage = {STORAGE: 1, COPY_SRC: 2, COPY_DST: 4, MAP_READ: 8};
 globalThis.GPUMapMode = {READ: 1};
 const fakeDevice = () => ({
+  // The page reads the GRANTED limits back off the device after requestDevice,
+  // not only the adapter's advertised ones.
+  limits: {maxBufferSize: 1 << 30, maxStorageBufferBindingSize: 1 << 28},
   createShaderModule: () => ({}),
   createComputePipeline: () => ({getBindGroupLayout: () => ({})}),
   createBuffer: ({size}) => ({

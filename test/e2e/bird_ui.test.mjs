@@ -55,7 +55,7 @@ const mk = () => {
 };
 for (const id of ['sub', 'card', 'layers', 'of', 'count', 'dl', 'dlwhat', 'dlpct',
                   'dlfill', 'backend', 'link', 'cache', 'ms', 'kb', 'next',
-                  'problem', 'ptitle', 'pdetail', 'pfix', 'join', 'status']) {
+                  'problem', 'ptitle', 'pdetail', 'pfix', 'join', 'status', 'binding']) {
   const n = mk(); n.id = id; nodes.set(id, n);
 }
 // Match the markup: the join button ships disabled and the load path enables it.
@@ -67,6 +67,9 @@ globalThis.document = {
   addEventListener() {},
   visibilityState: 'visible',
 };
+// The page also registers a window-level pagehide listener; stub the global.
+globalThis.addEventListener = () => {};
+globalThis.window = {isSecureContext: true};
 globalThis.localStorage = {
   _m: new Map(),
   getItem(k) { return this._m.has(k) ? this._m.get(k) : null; },

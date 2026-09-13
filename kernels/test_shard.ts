@@ -1,6 +1,6 @@
 // A matvec split across N shards == the unsharded matvec.
 //
-//   deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_shard.ts
+//   deno run --unstable-webgpu --allow-all kernels/test_shard.ts
 //
 // THE TWO CLAIMS ARE DIFFERENT AND ARE ASSERTED DIFFERENTLY.
 //

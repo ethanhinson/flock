@@ -193,7 +193,7 @@ async function bird(tag) {
       // Echo the hidden state back unchanged. The TEXT will be wrong, and that is
       // fine and explicit: a fake bird tests the allocation, the chain and the
       // rebalancer, never the arithmetic. Correctness is what a real simulated bird
-      // and node/test/bird_ui.test.mjs are for.
+      // and test/e2e/bird_ui.test.mjs are for.
       await stall(SLOW * layers.length);
       flat = h;
     } else {

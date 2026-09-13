@@ -11,9 +11,9 @@
 //
 //   node test/allocate.test.mjs
 import {allocate, device, layerPlan, Infeasible, explain, DEFAULT_RATE}
-  from '../src/allocate.js';
+  from '../../server/allocate.js';
 import {Rate, shouldRebalance, currentMakespan, MIN_SAMPLES, MIN_GAIN, COOLDOWN_MS,
-        MIN_MS} from '../src/speed.js';
+        MIN_MS} from '../../server/speed.js';
 
 let pass = 0, fail = 0;
 const ok = (name, cond, extra = '') => {
