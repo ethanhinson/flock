@@ -25,7 +25,7 @@
 // bird's path without either test having to do both jobs.
 
 import { getDevice, ok, randVec, splitQ8, storageBuffer, summary } from "./lib.ts";
-import { Layer, QWEN3_06B, type LayerBuffers } from "./layer.ts";
+import { Layer, type LayerBuffers, QWEN3_06B } from "./layer.ts";
 import { realLayer } from "./real_weights.ts";
 
 const dev = await getDevice();
@@ -43,8 +43,10 @@ const gpu: LayerBuffers = {};
 for (const [name, t] of Object.entries(w.q8)) {
   const { qs, scales } = splitQ8(t.packed, t.rows, t.cols);
   gpu[name] = {
-    rows: t.rows, cols: t.cols,
-    qs: storageBuffer(dev, qs), scales: storageBuffer(dev, scales),
+    rows: t.rows,
+    cols: t.cols,
+    qs: storageBuffer(dev, qs),
+    scales: storageBuffer(dev, scales),
   };
 }
 for (const [name, v] of Object.entries(w.f32)) {
@@ -56,9 +58,11 @@ for (const [name, v] of Object.entries(w.f32)) {
 const packed = await Layer.create(dev, w, cfg);
 const streamed = await Layer.fromBuffers(dev, gpu, cfg);
 
-ok("fromBuffers builds a layer from pre-built GPU buffers",
-   streamed instanceof Layer,
-   `${Object.keys(gpu).length} tensors`);
+ok(
+  "fromBuffers builds a layer from pre-built GPU buffers",
+  streamed instanceof Layer,
+  `${Object.keys(gpu).length} tensors`,
+);
 
 // --- decode: several steps, so the KV cache is exercised and not just step 0 ---
 //
@@ -76,11 +80,17 @@ for (let step = 0; step < 4; step++) {
   for (let i = 0; i < a.length; i++) diff = Math.max(diff, Math.abs(a[i] - b[i]));
   if (diff !== 0) allExact = false;
   worst = Math.max(worst, diff);
-  ok(`decode step ${step} (nKeys=${step}) is bit-identical across both constructors`,
-     diff === 0, `max |diff| ${diff.toExponential(1)}`);
+  ok(
+    `decode step ${step} (nKeys=${step}) is bit-identical across both constructors`,
+    diff === 0,
+    `max |diff| ${diff.toExponential(1)}`,
+  );
 }
-ok("every decode step agreed exactly, not merely closely", allExact,
-   `worst |diff| over 4 steps ${worst.toExponential(1)}`);
+ok(
+  "every decode step agreed exactly, not merely closely",
+  allExact,
+  `worst |diff| over 4 steps ${worst.toExponential(1)}`,
+);
 
 // --- prefill: the other dispatch path, which uses the dimsPre uniforms ---
 //
@@ -97,8 +107,11 @@ const pa = await packed.readOutput(N);
 const pb = await streamed.readOutput(N);
 let pdiff = 0;
 for (let i = 0; i < pa.length; i++) pdiff = Math.max(pdiff, Math.abs(pa[i] - pb[i]));
-ok(`prefill of ${N} tokens is bit-identical across both constructors`, pdiff === 0,
-   `max |diff| ${pdiff.toExponential(1)} over ${pa.length} floats`);
+ok(
+  `prefill of ${N} tokens is bit-identical across both constructors`,
+  pdiff === 0,
+  `max |diff| ${pdiff.toExponential(1)} over ${pa.length} floats`,
+);
 
 // --- the guard that makes a missing tensor loud -----------------------------
 //
@@ -115,8 +128,11 @@ for (const drop of ["attn_q.weight", "attn_k_norm.weight"]) {
   } catch (e) {
     threw = String((e as Error).message);
   }
-  ok(`a missing ${drop} throws and names the tensor`,
-     threw.includes(drop), threw || "(did not throw)");
+  ok(
+    `a missing ${drop} throws and names the tensor`,
+    threw.includes(drop),
+    threw || "(did not throw)",
+  );
 }
 
 Deno.exit(summary());

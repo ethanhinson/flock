@@ -34,16 +34,12 @@
 // Column-wise is built and validated anyway, because "row-wise is better" is not
 // a finding unless the alternative exists and was measured.
 
-import {
-  coopSource, probeUnpack, probeUnpackF16, uniformBuffer, type SplitQ8,
-} from "./lib.ts";
+import { coopSource, probeUnpack, probeUnpackF16, type SplitQ8, uniformBuffer } from "./lib.ts";
 import { wgslSource } from "./layer.ts";
-import {
-  memShardPlan, shardRanges, sliceCols, sliceRows, type ShardRange,
-} from "./shard_ref.ts";
+import { memShardPlan, type ShardRange, shardRanges, sliceCols, sliceRows } from "./shard_ref.ts";
 
-const ROWS_PER_WG = 4;     // must match q8_shard.wgsl
-const REDUCE_WG = 256;     // must match shard_reduce.wgsl
+const ROWS_PER_WG = 4; // must match q8_shard.wgsl
+const REDUCE_WG = 256; // must match shard_reduce.wgsl
 
 export type Direction = "row" | "col";
 
@@ -97,7 +93,8 @@ function probeOnce(dev: GPUDevice) {
   let p = probeCache.get(dev);
   if (!p) {
     p = (async () => ({
-      unpack8: await probeUnpack(dev), unpackF16: await probeUnpackF16(dev),
+      unpack8: await probeUnpack(dev),
+      unpackF16: await probeUnpackF16(dev),
     }))();
     probeCache.set(dev, p);
   }
@@ -157,31 +154,50 @@ export class ShardedMatvec {
   readonly uploadedBytes: number;
 
   private constructor(
-    dev: GPUDevice, rows: number, cols: number, direction: Direction,
-    ranges: ShardRange[], matvec: GPUComputePipeline, reduce: GPUComputePipeline | null,
-    shards: ShardGpu[], xBuf: GPUBuffer, outBuf: GPUBuffer,
-    partsBuf: GPUBuffer | null, reduceDims: GPUBuffer | null,
+    dev: GPUDevice,
+    rows: number,
+    cols: number,
+    direction: Direction,
+    ranges: ShardRange[],
+    matvec: GPUComputePipeline,
+    reduce: GPUComputePipeline | null,
+    shards: ShardGpu[],
+    xBuf: GPUBuffer,
+    outBuf: GPUBuffer,
+    partsBuf: GPUBuffer | null,
+    reduceDims: GPUBuffer | null,
   ) {
     this.dev = dev;
-    this.rows = rows; this.cols = cols; this.direction = direction;
-    this.ranges = ranges; this.matvec = matvec; this.reduce = reduce;
-    this.shards = shards; this.xBuf = xBuf; this.outBuf = outBuf;
-    this.partsBuf = partsBuf; this.reduceDims = reduceDims;
+    this.rows = rows;
+    this.cols = cols;
+    this.direction = direction;
+    this.ranges = ranges;
+    this.matvec = matvec;
+    this.reduce = reduce;
+    this.shards = shards;
+    this.xBuf = xBuf;
+    this.outBuf = outBuf;
+    this.partsBuf = partsBuf;
+    this.reduceDims = reduceDims;
     this.uploadedBytes = shards.reduce((a, s) => a + s.qsBytes + s.scalesBytes, 0);
 
     // Bind groups built once. Rebuilding them per dispatch cost ~4 ms/layer of
     // 5.4 in the layer benchmark, and a sharded matvec issues N of them.
     const target = direction === "col" ? this.partsBuf! : this.outBuf;
-    this.bgs = shards.map((s) => dev.createBindGroup({
-      layout: matvec.getBindGroupLayout(0),
-      entries: [s.qs, s.scales, this.xBuf, target, s.dims].map(
-        (buffer, binding) => ({ binding, resource: { buffer } })),
-    }));
+    this.bgs = shards.map((s) =>
+      dev.createBindGroup({
+        layout: matvec.getBindGroupLayout(0),
+        entries: [s.qs, s.scales, this.xBuf, target, s.dims].map(
+          (buffer, binding) => ({ binding, resource: { buffer } }),
+        ),
+      })
+    );
     if (direction === "col") {
       this.reduceBg = dev.createBindGroup({
         layout: reduce!.getBindGroupLayout(0),
         entries: [this.partsBuf!, this.outBuf, this.reduceDims!].map(
-          (buffer, binding) => ({ binding, resource: { buffer } })),
+          (buffer, binding) => ({ binding, resource: { buffer } }),
+        ),
       });
     }
   }
@@ -196,8 +212,13 @@ export class ShardedMatvec {
    * see the note there; the latter would upload the whole tensor to every shard.
    */
   static async create(
-    dev: GPUDevice, split: SplitQ8, rows: number, cols: number,
-    n: number, direction: Direction, opts: ShardedMatvecOpts = {},
+    dev: GPUDevice,
+    split: SplitQ8,
+    rows: number,
+    cols: number,
+    n: number,
+    direction: Direction,
+    opts: ShardedMatvecOpts = {},
   ): Promise<ShardedMatvec> {
     if (cols % 32 !== 0) throw new Error(`cols ${cols} must be a multiple of 32`);
     const limit = opts.bindingLimit ?? dev.limits.maxStorageBufferBindingSize;
@@ -206,14 +227,19 @@ export class ShardedMatvec {
     // test_shard_mem.ts asserts against, so a configuration that passes that test
     // is a configuration this constructor accepts.
     const plan = memShardPlan(
-      { name: "W", rows, cols }, n, direction, limit);
+      { name: "W", rows, cols },
+      n,
+      direction,
+      limit,
+    );
     if (!plan.fits) {
       throw new Error(
         `${direction}-wise ${n} shards of ${rows}x${cols} need a ${plan.maxBindingBytes} ` +
-        `byte binding, over the ${limit} byte limit; ` +
-        (plan.minShardsForLimit === null
-          ? "no shard count fits"
-          : `${plan.minShardsForLimit} shards would fit`));
+          `byte binding, over the ${limit} byte limit; ` +
+          (plan.minShardsForLimit === null
+            ? "no shard count fits"
+            : `${plan.minShardsForLimit} shards would fit`),
+      );
     }
 
     // Probed once per device and cached: the probe deliberately compiles a shader
@@ -221,21 +247,21 @@ export class ShardedMatvec {
     // regardless of the error scope, so probing per construction buries a test's
     // output in the same expected message N times.
     const { unpack8, unpackF16 } = await probeOnce(dev);
-    const mk = (code: string) => dev.createComputePipeline({
-      layout: "auto",
-      compute: { module: dev.createShaderModule({ code }), entryPoint: "main" },
-    });
+    const mk = (code: string) =>
+      dev.createComputePipeline({
+        layout: "auto",
+        compute: { module: dev.createShaderModule({ code }), entryPoint: "main" },
+      });
     const matvec = mk(coopSource(await wgslSource("q8_shard.wgsl"), { unpack8, unpackF16 }));
     const reduce = direction === "col" ? mk(await wgslSource("shard_reduce.wgsl")) : null;
 
-    const ranges = direction === "row"
-      ? shardRanges(rows, n, 1)
-      : shardRanges(cols, n, 32);
+    const ranges = direction === "row" ? shardRanges(rows, n, 1) : shardRanges(cols, n, 32);
 
-    const rw = (bytes: number) => dev.createBuffer({
-      size: Math.max(16, bytes),
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
+    const rw = (bytes: number) =>
+      dev.createBuffer({
+        size: Math.max(16, bytes),
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      });
     // x is the WHOLE input in both directions. Column-wise shards read their own
     // window through `col_off` rather than being handed a pre-sliced copy, which
     // is what lets test_shard.ts assert that slicing x on the host and offsetting
@@ -245,9 +271,7 @@ export class ShardedMatvec {
     const xBuf = rw(cols * 4);
     const outBuf = rw(rows * 4);
     const partsBuf = direction === "col" ? rw(n * rows * 4) : null;
-    const reduceDims = direction === "col"
-      ? uniformBuffer(dev, [rows, n, 0, 0])
-      : null;
+    const reduceDims = direction === "col" ? uniformBuffer(dev, [rows, n, 0, 0]) : null;
 
     const shards: ShardGpu[] = ranges.map((rg) => {
       const sl = direction === "row"
@@ -265,7 +289,8 @@ export class ShardedMatvec {
         // 32-column block is 8 vec4s -- which is why every column boundary is a
         // multiple of 32 (shardRanges enforces it) and col_off/4 is always exact.
         dims: uniformBuffer(dev, [
-          sRows, sCols,
+          sRows,
+          sCols,
           direction === "row" ? rg.start : rg.index * rows,
           direction === "row" ? 0 : rg.start / 4,
         ]),
@@ -276,8 +301,19 @@ export class ShardedMatvec {
     });
 
     return new ShardedMatvec(
-      dev, rows, cols, direction, ranges, matvec, reduce, shards,
-      xBuf, outBuf, partsBuf, reduceDims);
+      dev,
+      rows,
+      cols,
+      direction,
+      ranges,
+      matvec,
+      reduce,
+      shards,
+      xBuf,
+      outBuf,
+      partsBuf,
+      reduceDims,
+    );
   }
 
   /** Upload the input vector. `cols` floats, the whole x, in both directions. */
@@ -361,7 +397,9 @@ export class ShardedMatvec {
   }
 
   /** The buffer holding the final y. */
-  output(): GPUBuffer { return this.outBuf; }
+  output(): GPUBuffer {
+    return this.outBuf;
+  }
 
   /** The n * rows partials buffer. Column-wise only; this is the all-reduce payload. */
   partials(): GPUBuffer {
@@ -381,9 +419,15 @@ export class ShardedMatvec {
   }
 
   destroy() {
-    for (const s of this.shards) { s.qs.destroy(); s.scales.destroy(); s.dims.destroy(); }
-    this.xBuf.destroy(); this.outBuf.destroy();
-    this.partsBuf?.destroy(); this.reduceDims?.destroy();
+    for (const s of this.shards) {
+      s.qs.destroy();
+      s.scales.destroy();
+      s.dims.destroy();
+    }
+    this.xBuf.destroy();
+    this.outBuf.destroy();
+    this.partsBuf?.destroy();
+    this.reduceDims?.destroy();
   }
 }
 
@@ -423,26 +467,43 @@ export class ShardedHead {
   private perShard: {
     range: ShardRange;
     groups: number;
-    pVal: GPUBuffer; pIdx: GPUBuffer;
-    oVal: GPUBuffer; oIdx: GPUBuffer;
-    d1: GPUBuffer; d2: GPUBuffer;
+    pVal: GPUBuffer;
+    pIdx: GPUBuffer;
+    oVal: GPUBuffer;
+    oIdx: GPUBuffer;
+    d1: GPUBuffer;
+    d2: GPUBuffer;
     dummy: GPUBuffer;
     /** Argmax stage-1 and stage-2 bind groups, built once. */
-    bg1: GPUBindGroup; bg2: GPUBindGroup;
+    bg1: GPUBindGroup;
+    bg2: GPUBindGroup;
     /** A view of the sharded matvec's output covering just this shard's rows. */
     logitsOffset: number;
   }[] = [];
   private logitsSlice: GPUBuffer[] = [];
 
-  private constructor(dev: GPUDevice, vocab: number, hidden: number, mv: ShardedMatvec,
-                      am1: GPUComputePipeline, am2: GPUComputePipeline) {
-    this.dev = dev; this.vocab = vocab; this.hidden = hidden; this.mv = mv;
-    this.am1 = am1; this.am2 = am2;
+  private constructor(
+    dev: GPUDevice,
+    vocab: number,
+    hidden: number,
+    mv: ShardedMatvec,
+    am1: GPUComputePipeline,
+    am2: GPUComputePipeline,
+  ) {
+    this.dev = dev;
+    this.vocab = vocab;
+    this.hidden = hidden;
+    this.mv = mv;
+    this.am1 = am1;
+    this.am2 = am2;
     this.nShards = mv.ranges.length;
   }
 
   static async create(
-    dev: GPUDevice, split: SplitQ8, vocab: number, hidden: number,
+    dev: GPUDevice,
+    split: SplitQ8,
+    vocab: number,
+    hidden: number,
     opts: ShardedHeadOpts,
   ): Promise<ShardedHead> {
     // Row-wise is not a parameter. See the header: the direction is the finding,
@@ -450,18 +511,27 @@ export class ShardedHead {
     // plus a full logits buffer on every shard -- which defeats the purpose,
     // since the logits are `vocab` long on EVERY column shard.
     const mv = await ShardedMatvec.create(
-      dev, split, vocab, hidden, opts.shards, "row", opts);
+      dev,
+      split,
+      vocab,
+      hidden,
+      opts.shards,
+      "row",
+      opts,
+    );
     const src = await wgslSource("argmax.wgsl");
-    const mk = (entryPoint: string) => dev.createComputePipeline({
-      layout: "auto",
-      compute: { module: dev.createShaderModule({ code: src }), entryPoint },
-    });
+    const mk = (entryPoint: string) =>
+      dev.createComputePipeline({
+        layout: "auto",
+        compute: { module: dev.createShaderModule({ code: src }), entryPoint },
+      });
     const H = new ShardedHead(dev, vocab, hidden, mv, mk("pass1"), mk("pass2"));
 
-    const rw = (n: number) => dev.createBuffer({
-      size: Math.max(16, n * 4),
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
+    const rw = (n: number) =>
+      dev.createBuffer({
+        size: Math.max(16, n * 4),
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      });
     for (const rg of mv.ranges) {
       // Stage-1 groups sized so each thread handles ~1 element, the same sizing
       // model.ts uses (594 groups for 151936). Capped so stage 2's single
@@ -480,12 +550,21 @@ export class ShardedHead {
       // what a real distributed shard has: it never holds the other shards' logits.
       const slice = rw(rg.count);
       H.logitsSlice.push(slice);
-      const bg = (pipe: GPUComputePipeline, bufs: GPUBuffer[]) => dev.createBindGroup({
-        layout: pipe.getBindGroupLayout(0),
-        entries: bufs.map((buffer, binding) => ({ binding, resource: { buffer } })),
-      });
+      const bg = (pipe: GPUComputePipeline, bufs: GPUBuffer[]) =>
+        dev.createBindGroup({
+          layout: pipe.getBindGroupLayout(0),
+          entries: bufs.map((buffer, binding) => ({ binding, resource: { buffer } })),
+        });
       H.perShard.push({
-        range: rg, groups, pVal, pIdx, oVal, oIdx, d1, d2, dummy,
+        range: rg,
+        groups,
+        pVal,
+        pIdx,
+        oVal,
+        oIdx,
+        d1,
+        d2,
+        dummy,
         // Built once here rather than per encode(). `dummy` is the buffer
         // argmax.wgsl's pass1 binds for `xidx`, which it declares (so both passes
         // share one auto layout) but reads nothing live from -- it cannot be the
@@ -500,7 +579,9 @@ export class ShardedHead {
   }
 
   /** Upload the (already normed) hidden state. */
-  setInput(h: Float32Array) { this.mv.setInput(h); }
+  setInput(h: Float32Array) {
+    this.mv.setInput(h);
+  }
 
   /**
    * Encode the whole head: N shard matvecs, then per-shard argmax stages.
@@ -517,7 +598,12 @@ export class ShardedHead {
     for (let i = 0; i < this.perShard.length; i++) {
       const s = this.perShard[i];
       enc.copyBufferToBuffer(
-        logits, s.logitsOffset * 4, this.logitsSlice[i], 0, s.range.count * 4);
+        logits,
+        s.logitsOffset * 4,
+        this.logitsSlice[i],
+        0,
+        s.range.count * 4,
+      );
     }
     // Bind groups are built once (see `bgs` below), not per encode. Rebuilding
     // them per step cost ~4 ms of a 5.4 ms layer in the layer benchmark, and a
@@ -538,12 +624,16 @@ export class ShardedHead {
   }
 
   /** The concatenated logits buffer, `vocab` long. For tests. */
-  logits(): GPUBuffer { return this.mv.output(); }
+  logits(): GPUBuffer {
+    return this.mv.output();
+  }
 
   /** Per-shard (value, shard-local index, row offset), ready for reduceShardArgmax. */
   argmaxBuffers(): { oVal: GPUBuffer; oIdx: GPUBuffer; rowOffset: number }[] {
     return this.perShard.map((s) => ({
-      oVal: s.oVal, oIdx: s.oIdx, rowOffset: s.range.start,
+      oVal: s.oVal,
+      oIdx: s.oIdx,
+      rowOffset: s.range.start,
     }));
   }
 
@@ -555,8 +645,13 @@ export class ShardedHead {
   destroy() {
     this.mv.destroy();
     for (const s of this.perShard) {
-      s.pVal.destroy(); s.pIdx.destroy(); s.oVal.destroy(); s.oIdx.destroy();
-      s.d1.destroy(); s.d2.destroy(); s.dummy.destroy();
+      s.pVal.destroy();
+      s.pIdx.destroy();
+      s.oVal.destroy();
+      s.oIdx.destroy();
+      s.d1.destroy();
+      s.d2.destroy();
+      s.dummy.destroy();
     }
     for (const b of this.logitsSlice) b.destroy();
   }

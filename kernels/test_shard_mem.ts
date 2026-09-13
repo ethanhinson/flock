@@ -33,8 +33,8 @@
 // totalBytes is reported separately, because the two bound different things: one is
 // a binding limit, the other is device memory.
 
-import { getDevice, ok, quantMatrixQ8, randVec, readBack, splitQ8, summary } from "./lib.ts";
-import { memShardPlan, shardRanges, type TensorSpec } from "./shard_ref.ts";
+import { getDevice, limitOf, ok, randVec, readBack, splitQ8, summary } from "./lib.ts";
+import { memShardPlan, type TensorSpec } from "./shard_ref.ts";
 import { ShardedMatvec } from "./shard.ts";
 import { realModel } from "./real_weights.ts";
 
@@ -59,10 +59,11 @@ console.log("-- Qwen3-14B Q4_K_M output.weight: 638 MB as ONE tensor\n");
   // output.weight to Q6_K, and Q6_K is 6.5625 bits/weight). Using the measured
   // total rather than a nominal 4.5 bits is the point: the tensor is 638 MB
   // because that is what the file says, and the split has to work on that number.
-  const Q6K_BYTES_PER_WEIGHT = 210 / 256;   // Q6_K: 210 bytes per 256 weights
+  const Q6K_BYTES_PER_WEIGHT = 210 / 256; // Q6_K: 210 bytes per 256 weights
   const t: TensorSpec = {
     name: "output.weight (Qwen3-14B Q4_K_M)",
-    rows: 151936, cols: 5120,
+    rows: 151936,
+    cols: 5120,
     bytesPerWeight: Q6K_BYTES_PER_WEIGHT,
     // Q6_K carries its scales inside the 210 bytes, so there is no separate scales
     // binding to account for. Set to 0 rather than left at the Q8_0 default, which
@@ -71,31 +72,43 @@ console.log("-- Qwen3-14B Q4_K_M output.weight: 638 MB as ONE tensor\n");
   };
   const whole = memShardPlan(t, 1, "row", DEFAULT_LIMIT);
   console.log(`  unsharded largest binding: ${mb(whole.unshardedMaxBindingBytes)}`);
-  ok("the tensor really is ~638 MB",
-     Math.abs(whole.unshardedMaxBindingBytes / 1e6 - 638) < 5,
-     `${mb(whole.unshardedMaxBindingBytes)}`);
-  ok("it does NOT fit a 128 MiB binding limit unsharded", !whole.fits,
-     `${mb(whole.maxBindingBytes)} > ${mb(DEFAULT_LIMIT)}`);
+  ok(
+    "the tensor really is ~638 MB",
+    Math.abs(whole.unshardedMaxBindingBytes / 1e6 - 638) < 5,
+    `${mb(whole.unshardedMaxBindingBytes)}`,
+  );
+  ok(
+    "it does NOT fit a 128 MiB binding limit unsharded",
+    !whole.fits,
+    `${mb(whole.maxBindingBytes)} > ${mb(DEFAULT_LIMIT)}`,
+  );
 
   // Split 8 ways: the brief's specific ask.
   const p8 = memShardPlan(t, 8, "row", DEFAULT_LIMIT);
   for (const s of p8.shards) {
     console.log(`    shard ${s.index}: ${s.rows} rows, largest binding ${mb(s.maxBindingBytes)}`);
   }
-  ok("split 8 ways, every shard's largest binding is under 128 MiB", p8.fits,
-     `max ${mb(p8.maxBindingBytes)} < ${mb(DEFAULT_LIMIT)}`);
-  ok("8 shards is not gratuitous: fewer would also fit, and the plan says how few",
-     p8.minShardsForLimit !== null && p8.minShardsForLimit <= 8,
-     `minimum ${p8.minShardsForLimit} shards`);
+  ok(
+    "split 8 ways, every shard's largest binding is under 128 MiB",
+    p8.fits,
+    `max ${mb(p8.maxBindingBytes)} < ${mb(DEFAULT_LIMIT)}`,
+  );
+  ok(
+    "8 shards is not gratuitous: fewer would also fit, and the plan says how few",
+    p8.minShardsForLimit !== null && p8.minShardsForLimit <= 8,
+    `minimum ${p8.minShardsForLimit} shards`,
+  );
 
   // Column-wise gives the same capacity relief, which is worth asserting because
   // it is the reason the direction choice is NOT a capacity argument -- both
   // directions divide rows*cols by N. The choice rests on bit-exactness, on
   // contiguity, and on what crosses the wire. See shard_ref.ts's header.
   const c8 = memShardPlan(t, 8, "col", DEFAULT_LIMIT);
-  ok("column-wise 8 shards fits the same limit (capacity does not prefer a direction)",
-     c8.fits && Math.abs(c8.maxBindingBytes - p8.maxBindingBytes) / p8.maxBindingBytes < 0.01,
-     `row ${mb(p8.maxBindingBytes)} vs col ${mb(c8.maxBindingBytes)}`);
+  ok(
+    "column-wise 8 shards fits the same limit (capacity does not prefer a direction)",
+    c8.fits && Math.abs(c8.maxBindingBytes - p8.maxBindingBytes) / p8.maxBindingBytes < 0.01,
+    `row ${mb(p8.maxBindingBytes)} vs col ${mb(c8.maxBindingBytes)}`,
+  );
 }
 
 // ------------------------------------ a sweep: how many shards does a limit need
@@ -107,14 +120,21 @@ console.log("\n-- how many shards each limit needs\n");
 {
   const tensors: TensorSpec[] = [
     { name: "Qwen3-0.6B token_embd (Q8_0, tied)", rows: 151936, cols: 1024 },
-    { name: "Qwen3-14B output.weight (Q6_K)", rows: 151936, cols: 5120,
-      bytesPerWeight: 210 / 256, scaleBytesPerBlock: 0 },
+    {
+      name: "Qwen3-14B output.weight (Q6_K)",
+      rows: 151936,
+      cols: 5120,
+      bytesPerWeight: 210 / 256,
+      scaleBytesPerBlock: 0,
+    },
     { name: "a 248320-row head (Q8_0)", rows: 248320, cols: 5120 },
   ];
   const limits = [64 * MIB, 128 * MIB, 256 * MIB, 1024 * MIB];
   let bad = 0;
-  console.log(`  ${"tensor".padEnd(38)} ${"unsharded".padStart(10)}   ` +
-              limits.map((l) => `${(l / MIB)}MiB`.padStart(8)).join(" "));
+  console.log(
+    `  ${"tensor".padEnd(38)} ${"unsharded".padStart(10)}   ` +
+      limits.map((l) => `${(l / MIB)}MiB`.padStart(8)).join(" "),
+  );
   for (const t of tensors) {
     const cells: string[] = [];
     for (const lim of limits) {
@@ -130,11 +150,16 @@ console.log("\n-- how many shards each limit needs\n");
       }
     }
     const p1 = memShardPlan(t, 1, "row", DEFAULT_LIMIT);
-    console.log(`  ${t.name.padEnd(38)} ${mb(p1.unshardedMaxBindingBytes).padStart(10)}   ` +
-                cells.map((c) => c.padStart(8)).join(" "));
+    console.log(
+      `  ${t.name.padEnd(38)} ${mb(p1.unshardedMaxBindingBytes).padStart(10)}   ` +
+        cells.map((c) => c.padStart(8)).join(" "),
+    );
   }
-  ok("every reported minimum shard count fits, and one fewer does not", bad === 0,
-     `${bad} defects over ${tensors.length} tensors x ${limits.length} limits`);
+  ok(
+    "every reported minimum shard count fits, and one fewer does not",
+    bad === 0,
+    `${bad} defects over ${tensors.length} tensors x ${limits.length} limits`,
+  );
 }
 
 // ------------------------------------ the real tensor, actually uploaded and run
@@ -149,23 +174,35 @@ console.log("\n-- the real 155.6 MB tied head, uploaded as shards under a simula
   const split = splitQ8(m.embd.packed, m.embd.rows, m.embd.cols);
   const qsBytes = split.qs.byteLength, scBytes = split.scales.byteLength;
   console.log(`  token_embd.weight repacked: qs ${mb(qsBytes)}, scales ${mb(scBytes)}`);
-  ok("the repacked qs really is over the 128 MiB default limit",
-     qsBytes > DEFAULT_LIMIT, `${mb(qsBytes)} > ${mb(DEFAULT_LIMIT)}`);
+  ok(
+    "the repacked qs really is over the 128 MiB default limit",
+    qsBytes > DEFAULT_LIMIT,
+    `${mb(qsBytes)} > ${mb(DEFAULT_LIMIT)}`,
+  );
 
   // The model's own arithmetic must agree with the bytes actually produced. If
   // memShardPlan and splitQ8 disagree, every capacity claim above is unfounded.
   const planned = memShardPlan(
-    { name: "token_embd", rows: m.embd.rows, cols: m.embd.cols }, 1, "row", DEFAULT_LIMIT);
-  ok("memShardPlan's unsharded figure matches the bytes splitQ8 actually produced",
-     planned.unshardedMaxBindingBytes === qsBytes,
-     `planned ${planned.unshardedMaxBindingBytes}, actual ${qsBytes}`);
+    { name: "token_embd", rows: m.embd.rows, cols: m.embd.cols },
+    1,
+    "row",
+    DEFAULT_LIMIT,
+  );
+  ok(
+    "memShardPlan's unsharded figure matches the bytes splitQ8 actually produced",
+    planned.unshardedMaxBindingBytes === qsBytes,
+    `planned ${planned.unshardedMaxBindingBytes}, actual ${qsBytes}`,
+  );
 
   const x = randVec(m.embd.cols, 0.1);
   // 32 MiB: a limit this tensor needs 5 shards to satisfy, so it exercises the
   // "more shards than the obvious power of two" path rather than a tidy split.
   const LIMIT = 32 * MIB;
   const need = memShardPlan(
-    { name: "token_embd", rows: m.embd.rows, cols: m.embd.cols }, 1, "row", LIMIT
+    { name: "token_embd", rows: m.embd.rows, cols: m.embd.cols },
+    1,
+    "row",
+    LIMIT,
   ).minShardsForLimit!;
   console.log(`  a ${mb(LIMIT)} limit needs ${need} shards`);
 
@@ -181,9 +218,20 @@ console.log("\n-- the real 155.6 MB tied head, uploaded as shards under a simula
 
   for (const n of [need, 8]) {
     const mv = await ShardedMatvec.create(
-      dev, split, m.embd.rows, m.embd.cols, n, "row", { bindingLimit: LIMIT });
+      dev,
+      split,
+      m.embd.rows,
+      m.embd.cols,
+      n,
+      "row",
+      { bindingLimit: LIMIT },
+    );
     const plan = memShardPlan(
-      { name: "token_embd", rows: m.embd.rows, cols: m.embd.cols }, n, "row", LIMIT);
+      { name: "token_embd", rows: m.embd.rows, cols: m.embd.cols },
+      n,
+      "row",
+      LIMIT,
+    );
     mv.setInput(x);
     enc = dev.createCommandEncoder();
     mv.encode(enc);
@@ -191,15 +239,20 @@ console.log("\n-- the real 155.6 MB tied head, uploaded as shards under a simula
     const out = await readBack(dev, mv.output(), m.embd.rows * 4);
     let diff = 0;
     for (let i = 0; i < m.embd.rows; i++) diff = Math.max(diff, Math.abs(out[i] - refOut[i]));
-    ok(`N=${n} under a ${mb(LIMIT)} limit: largest binding ${mb(plan.maxBindingBytes)}, ` +
-       `answer bit-identical`, diff === 0 && plan.fits,
-       `max |diff| ${diff.toExponential(1)}, largest binding ${plan.maxBindingBytes} bytes`);
+    ok(
+      `N=${n} under a ${mb(LIMIT)} limit: largest binding ${mb(plan.maxBindingBytes)}, ` +
+        `answer bit-identical`,
+      diff === 0 && plan.fits,
+      `max |diff| ${diff.toExponential(1)}, largest binding ${plan.maxBindingBytes} bytes`,
+    );
     // Every shard's uploaded bytes must match the plan, not just the plan's own
     // arithmetic. This is the check that catches a slicer handing a shard more
     // bytes than its range -- which would fit the plan on paper and not in fact.
-    ok(`N=${n}: uploaded bytes equal the whole tensor, no shard double-counted`,
-       mv.uploadedBytes === qsBytes + scBytes,
-       `uploaded ${mb(mv.uploadedBytes)}, tensor ${mb(qsBytes + scBytes)}`);
+    ok(
+      `N=${n}: uploaded bytes equal the whole tensor, no shard double-counted`,
+      mv.uploadedBytes === qsBytes + scBytes,
+      `uploaded ${mb(mv.uploadedBytes)}, tensor ${mb(qsBytes + scBytes)}`,
+    );
     mv.destroy();
   }
 }
@@ -229,17 +282,24 @@ console.log("\n-- per-call wire traffic, the two directions\n");
     // every shard. The output of an LM head is the whole vocabulary, so this is
     // where column-wise loses by orders of magnitude.
     const colBytes = cols * 4 + n * rows * 4;
-    console.log(`  ${name.padEnd(22)} N=4  row-wise ${(rowBytes / 1024).toFixed(0).padStart(6)} KB   ` +
-                `col-wise ${(colBytes / 1024).toFixed(0).padStart(6)} KB   ` +
-                `ratio ${(colBytes / rowBytes).toFixed(1)}x`);
+    console.log(
+      `  ${name.padEnd(22)} N=4  row-wise ${(rowBytes / 1024).toFixed(0).padStart(6)} KB   ` +
+        `col-wise ${(colBytes / 1024).toFixed(0).padStart(6)} KB   ` +
+        `ratio ${(colBytes / rowBytes).toFixed(1)}x`,
+    );
     if (rows > cols && rowBytes < colBytes) rowWinsHead++;
   }
-  ok("row-wise moves strictly less per call whenever rows > cols (every head shape)",
-     rowWinsHead === 2, `${rowWinsHead} of 2 head shapes`);
+  ok(
+    "row-wise moves strictly less per call whenever rows > cols (every head shape)",
+    rowWinsHead === 2,
+    `${rowWinsHead} of 2 head shapes`,
+  );
 }
 
-console.log(`\nthis adapter's maxStorageBufferBindingSize: ` +
-            `${mb(dev.limits.maxStorageBufferBindingSize)} ` +
-            `(the WebGPU default is ${mb(DEFAULT_LIMIT)})`);
+console.log(
+  `\nthis adapter's maxStorageBufferBindingSize: ` +
+    `${mb(limitOf(dev.limits, "maxStorageBufferBindingSize"))} ` +
+    `(the WebGPU default is ${mb(DEFAULT_LIMIT)})`,
+);
 
 Deno.exit(summary() ? 1 : 0);

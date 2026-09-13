@@ -52,9 +52,7 @@
 // input too), and because a claim that one direction is better is worth nothing
 // without the other one built and measured.
 
-import {
-  fma32, halfToF32, Q8_BLOCK, Q8_BYTES, splitQ8, type SplitQ8,
-} from "./lib.ts";
+import { fma32, halfToF32, Q8_BLOCK, Q8_BYTES, type SplitQ8, splitQ8 } from "./lib.ts";
 
 const fr = Math.fround;
 
@@ -106,7 +104,8 @@ export function shardRanges(total: number, n: number, align = 1): ShardRange[] {
   const units = total / align;
   if (units < n) {
     throw new Error(
-      `cannot cut ${total} into ${n} shards aligned to ${align}: only ${units} units`);
+      `cannot cut ${total} into ${n} shards aligned to ${align}: only ${units} units`,
+    );
   }
   const base = Math.floor(units / n), extra = units % n;
   const out: ShardRange[] = [];
@@ -136,7 +135,11 @@ export function shardRanges(total: number, n: number, align = 1): ShardRange[] {
  * writeBuffer directly will silently upload the whole tensor from 0.
  */
 export function sliceRows(
-  t: SplitQ8, rows: number, cols: number, start: number, end: number,
+  t: SplitQ8,
+  rows: number,
+  cols: number,
+  start: number,
+  end: number,
 ): SplitQ8 {
   if (start < 0 || end > rows || start > end) {
     throw new Error(`row range ${start}..${end} is not inside 0..${rows}`);
@@ -161,11 +164,16 @@ export function sliceRows(
  * shards; shardRanges(cols, n, 32) is how to get them.
  */
 export function sliceCols(
-  t: SplitQ8, rows: number, cols: number, start: number, end: number,
+  t: SplitQ8,
+  rows: number,
+  cols: number,
+  start: number,
+  end: number,
 ): SplitQ8 {
   if (start % Q8_BLOCK !== 0 || end % Q8_BLOCK !== 0) {
     throw new Error(
-      `column range ${start}..${end} must be multiples of ${Q8_BLOCK}: a Q8_0 block's scale cannot be split`);
+      `column range ${start}..${end} must be multiples of ${Q8_BLOCK}: a Q8_0 block's scale cannot be split`,
+    );
   }
   if (start < 0 || end > cols || start > end) {
     throw new Error(`column range ${start}..${end} is not inside 0..${cols}`);
@@ -177,14 +185,20 @@ export function sliceCols(
   for (let r = 0; r < rows; r++) {
     qs.set(t.qs.subarray(r * cols + start, r * cols + end), r * w);
     scales.set(
-      t.scales.subarray((r * nb + b0) * 2, (r * nb + b0 + wb) * 2), r * wb * 2);
+      t.scales.subarray((r * nb + b0) * 2, (r * nb + b0 + wb) * 2),
+      r * wb * 2,
+    );
   }
   return { qs, scales };
 }
 
 /** The on-disk 34-byte Q8_0 layout, columns [start, end) of every row. */
 export function slicePackedCols(
-  packed: Uint8Array, rows: number, cols: number, start: number, end: number,
+  packed: Uint8Array,
+  rows: number,
+  cols: number,
+  start: number,
+  end: number,
 ): Uint8Array {
   if (start % Q8_BLOCK !== 0 || end % Q8_BLOCK !== 0) {
     throw new Error(`column range ${start}..${end} must be multiples of ${Q8_BLOCK}`);
@@ -194,14 +208,19 @@ export function slicePackedCols(
   for (let r = 0; r < rows; r++) {
     out.set(
       packed.subarray((r * nb + b0) * Q8_BYTES, (r * nb + b0 + wb) * Q8_BYTES),
-      r * wb * Q8_BYTES);
+      r * wb * Q8_BYTES,
+    );
   }
   return out;
 }
 
 /** The on-disk layout, rows [start, end). Contiguous, like sliceRows. */
 export function slicePackedRows(
-  packed: Uint8Array, rows: number, cols: number, start: number, end: number,
+  packed: Uint8Array,
+  rows: number,
+  cols: number,
+  start: number,
+  end: number,
 ): Uint8Array {
   if (start < 0 || end > rows || start > end) {
     throw new Error(`row range ${start}..${end} is not inside 0..${rows}`);
@@ -257,7 +276,11 @@ function treeSum(a: Float32Array): number {
  * applied to the slicer.
  */
 export function shardMatvecRef(
-  packed: Uint8Array, x: Float32Array, rows: number, cols: number, lanes = 64,
+  packed: Uint8Array,
+  x: Float32Array,
+  rows: number,
+  cols: number,
+  lanes = 64,
 ): Float32Array {
   const nb = cols / Q8_BLOCK;
   const dv = new DataView(packed.buffer, packed.byteOffset, packed.byteLength);
@@ -265,8 +288,11 @@ export function shardMatvecRef(
   const part = new Float32Array(lanes);
   // The kernel's four word-pairs per block: (0..3, 4..7), (8..11, 12..15), ...
   const pairs = [0, 1, 2, 3].map((g) =>
-    [[0, 1, 2, 3].map((k) => g * 8 + k), [0, 1, 2, 3].map((k) => g * 8 + 4 + k)] as
-      [number[], number[]]);
+    [[0, 1, 2, 3].map((k) => g * 8 + k), [0, 1, 2, 3].map((k) => g * 8 + 4 + k)] as [
+      number[],
+      number[],
+    ]
+  );
   const q = new Array<number>(32);
   for (let r = 0; r < rows; r++) {
     part.fill(0);
@@ -325,14 +351,22 @@ export function shardReduceRef(parts: Float32Array[]): Float32Array {
  * dropped a block.
  */
 export function shardedColMatvecRef(
-  packed: Uint8Array, x: Float32Array, rows: number, cols: number,
-  ranges: ShardRange[], lanes = 64,
+  packed: Uint8Array,
+  x: Float32Array,
+  rows: number,
+  cols: number,
+  ranges: ShardRange[],
+  lanes = 64,
 ): Float32Array {
   const parts = ranges.map((rg) =>
     shardMatvecRef(
       slicePackedCols(packed, rows, cols, rg.start, rg.end),
       x.subarray(rg.start, rg.end) as Float32Array,
-      rows, rg.count, lanes));
+      rows,
+      rg.count,
+      lanes,
+    )
+  );
   return shardReduceRef(parts);
 }
 
@@ -342,13 +376,22 @@ export function shardedColMatvecRef(
  * to equal the UNSHARDED reference exactly, not merely closely.
  */
 export function shardedRowMatvecRef(
-  packed: Uint8Array, x: Float32Array, rows: number, cols: number,
-  ranges: ShardRange[], lanes = 64,
+  packed: Uint8Array,
+  x: Float32Array,
+  rows: number,
+  cols: number,
+  ranges: ShardRange[],
+  lanes = 64,
 ): Float32Array {
   const out = new Float32Array(rows);
   for (const rg of ranges) {
     const y = shardMatvecRef(
-      slicePackedRows(packed, rows, cols, rg.start, rg.end), x, rg.count, cols, lanes);
+      slicePackedRows(packed, rows, cols, rg.start, rg.end),
+      x,
+      rg.count,
+      cols,
+      lanes,
+    );
     out.set(y, rg.start);
   }
   return out;
@@ -396,7 +439,10 @@ export function reduceShardArgmax(parts: ShardArgmax[]): number {
   let bi = -1, bv = -Infinity;
   for (const p of parts) {
     const gi = p.rowOffset + p.index;
-    if (p.value > bv || (p.value === bv && gi < bi)) { bv = p.value; bi = gi; }
+    if (p.value > bv || (p.value === bv && gi < bi)) {
+      bv = p.value;
+      bi = gi;
+    }
   }
   return bi;
 }
@@ -461,7 +507,9 @@ export interface MemPlan {
  * wire. See the header.
  */
 export function memShardPlan(
-  t: TensorSpec, n: number, direction: "row" | "col",
+  t: TensorSpec,
+  n: number,
+  direction: "row" | "col",
   limitBytes = 128 * 1024 * 1024,
 ): MemPlan {
   const bpw = t.bytesPerWeight ?? 1;
@@ -472,14 +520,15 @@ export function memShardPlan(
     // blocks per row; a row-wise shard has fewer rows. Same product.
     const scalesBytes = rows * Math.ceil(cols / Q8_BLOCK) * sbb;
     return {
-      rows, cols, qsBytes, scalesBytes,
+      rows,
+      cols,
+      qsBytes,
+      scalesBytes,
       maxBindingBytes: Math.max(qsBytes, scalesBytes),
       totalBytes: qsBytes + scalesBytes,
     };
   };
-  const ranges = direction === "row"
-    ? shardRanges(t.rows, n, 1)
-    : shardRanges(t.cols, n, Q8_BLOCK);
+  const ranges = direction === "row" ? shardRanges(t.rows, n, 1) : shardRanges(t.cols, n, Q8_BLOCK);
   const shards: ShardMemory[] = ranges.map((rg) => ({
     index: rg.index,
     ...(direction === "row" ? per(rg.count, t.cols) : per(t.rows, rg.count)),
@@ -493,17 +542,26 @@ export function memShardPlan(
   let minShardsForLimit: number | null = null;
   const maxN = direction === "row" ? t.rows : t.cols / Q8_BLOCK;
   for (let k = 1; k <= maxN; k++) {
-    const p = direction === "row"
-      ? shardRanges(t.rows, k, 1)
-      : shardRanges(t.cols, k, Q8_BLOCK);
-    const m = Math.max(...p.map((rg) =>
-      (direction === "row" ? per(rg.count, t.cols) : per(t.rows, rg.count)).maxBindingBytes));
-    if (m <= limitBytes) { minShardsForLimit = k; break; }
+    const p = direction === "row" ? shardRanges(t.rows, k, 1) : shardRanges(t.cols, k, Q8_BLOCK);
+    const m = Math.max(
+      ...p.map((rg) =>
+        (direction === "row" ? per(rg.count, t.cols) : per(t.rows, rg.count)).maxBindingBytes
+      ),
+    );
+    if (m <= limitBytes) {
+      minShardsForLimit = k;
+      break;
+    }
   }
 
   return {
-    tensor: t.name, direction, shards, maxBindingBytes,
-    unshardedMaxBindingBytes: unsharded, minShardsForLimit, limitBytes,
+    tensor: t.name,
+    direction,
+    shards,
+    maxBindingBytes,
+    unshardedMaxBindingBytes: unsharded,
+    minShardsForLimit,
+    limitBytes,
     fits: maxBindingBytes <= limitBytes,
   };
 }
@@ -517,15 +575,18 @@ export function memShardPlan(
  * same tensor column-wise is N * 155.6 MB of copying.
  */
 export function shardTensor(
-  packed: Uint8Array, rows: number, cols: number, n: number, direction: "row" | "col",
+  packed: Uint8Array,
+  rows: number,
+  cols: number,
+  n: number,
+  direction: "row" | "col",
 ): { ranges: ShardRange[]; shards: SplitQ8[]; split: SplitQ8 } {
   const split = splitQ8(packed, rows, cols);
-  const ranges = direction === "row"
-    ? shardRanges(rows, n, 1)
-    : shardRanges(cols, n, Q8_BLOCK);
+  const ranges = direction === "row" ? shardRanges(rows, n, 1) : shardRanges(cols, n, Q8_BLOCK);
   const shards = ranges.map((rg) =>
     direction === "row"
       ? sliceRows(split, rows, cols, rg.start, rg.end)
-      : sliceCols(split, rows, cols, rg.start, rg.end));
+      : sliceCols(split, rows, cols, rg.start, rg.end)
+  );
   return { ranges, shards, split };
 }

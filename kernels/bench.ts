@@ -34,11 +34,20 @@
 // ignores dequantize work, so it understates what the kernel does.
 
 import {
-  coopSource, getDevice, probeUnpack, probeUnpackF16, quantMatrixQ4,
-  quantMatrixQ8, randVec, splitQ4, splitQ8, storageBuffer, uniformBuffer,
+  coopSource,
+  getDevice,
+  probeUnpack,
+  probeUnpackF16,
+  quantMatrixQ4,
+  quantMatrixQ8,
+  randVec,
+  splitQ4,
+  splitQ8,
+  storageBuffer,
+  uniformBuffer,
 } from "./lib.ts";
 
-const TRIALS = 5;       // timed batches per variant; the median is reported
+const TRIALS = 5; // timed batches per variant; the median is reported
 
 // attn and ffn projections of Qwen3-0.6B (hidden 1024, ffn 3072).
 const SHAPES: [number, number, string][] = [
@@ -65,14 +74,19 @@ interface Run {
 /** q8_matmul.wgsl: one thread per row, byte-extracted from the 34-byte layout. */
 function refVariant(code: string, wg: number): Variant {
   const pipe = dev.createComputePipeline({
-    layout: "auto", compute: { module: dev.createShaderModule({ code }), entryPoint: "main" },
+    layout: "auto",
+    compute: { module: dev.createShaderModule({ code }), entryPoint: "main" },
   });
   return {
     name: "reference",
     setup(packed, x, rows, cols) {
       const bufs = [
-        storageBuffer(dev, packed), storageBuffer(dev, x),
-        dev.createBuffer({ size: rows * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
+        storageBuffer(dev, packed),
+        storageBuffer(dev, x),
+        dev.createBuffer({
+          size: rows * 4,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+        }),
         uniformBuffer(dev, [rows, cols, cols / 32, 0]),
       ];
       const bg = dev.createBindGroup({
@@ -81,9 +95,15 @@ function refVariant(code: string, wg: number): Variant {
       });
       const groups = Math.ceil(rows / wg);
       return {
-        dispatch(p) { p.setPipeline(pipe); p.setBindGroup(0, bg); p.dispatchWorkgroups(groups); },
+        dispatch(p) {
+          p.setPipeline(pipe);
+          p.setBindGroup(0, bg);
+          p.dispatchWorkgroups(groups);
+        },
         out: bufs[2],
-        free() { for (const b of bufs) b.destroy(); },
+        free() {
+          for (const b of bufs) b.destroy();
+        },
       };
     },
   };
@@ -91,19 +111,27 @@ function refVariant(code: string, wg: number): Variant {
 
 /** q8_coop.wgsl / q4_coop.wgsl: split buffers, vec4 dots, workgroup reduction. */
 function coopVariant(
-  name: string, code: string, rowsPerWg: number,
+  name: string,
+  code: string,
+  rowsPerWg: number,
   split: (p: Uint8Array, r: number, c: number) => { qs: Uint8Array; scales: Uint8Array },
 ): Variant {
   const pipe = dev.createComputePipeline({
-    layout: "auto", compute: { module: dev.createShaderModule({ code }), entryPoint: "main" },
+    layout: "auto",
+    compute: { module: dev.createShaderModule({ code }), entryPoint: "main" },
   });
   return {
     name,
     setup(packed, x, rows, cols) {
       const { qs, scales } = split(packed, rows, cols);
       const bufs = [
-        storageBuffer(dev, qs), storageBuffer(dev, scales), storageBuffer(dev, x),
-        dev.createBuffer({ size: rows * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
+        storageBuffer(dev, qs),
+        storageBuffer(dev, scales),
+        storageBuffer(dev, x),
+        dev.createBuffer({
+          size: rows * 4,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+        }),
         uniformBuffer(dev, [rows, cols, 1, 0]),
       ];
       const bg = dev.createBindGroup({
@@ -112,9 +140,15 @@ function coopVariant(
       });
       const groups = Math.ceil(rows / rowsPerWg);
       return {
-        dispatch(p) { p.setPipeline(pipe); p.setBindGroup(0, bg); p.dispatchWorkgroups(groups); },
+        dispatch(p) {
+          p.setPipeline(pipe);
+          p.setBindGroup(0, bg);
+          p.dispatchWorkgroups(groups);
+        },
         out: bufs[3],
-        free() { for (const b of bufs) b.destroy(); },
+        free() {
+          for (const b of bufs) b.destroy();
+        },
       };
     },
   };
@@ -125,7 +159,10 @@ function coopVariant(
  * buffer and await mapAsync. Anything cheaper returns before the GPU is done.
  */
 async function fencedSubmit(build: (p: GPUComputePassEncoder) => void, out: GPUBuffer) {
-  const rd = dev.createBuffer({ size: 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  const rd = dev.createBuffer({
+    size: 4,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
   const enc = dev.createCommandEncoder();
   const p = enc.beginComputePass();
   build(p);
@@ -159,7 +196,7 @@ async function timeBatched(run: Run, reps: number, fenceMs: number): Promise<num
   const build = (p: GPUComputePassEncoder) => {
     for (let i = 0; i < reps; i++) run.dispatch(p);
   };
-  await fencedSubmit(build, run.out);                   // warmup
+  await fencedSubmit(build, run.out); // warmup
   const ms: number[] = [];
   for (let t = 0; t < TRIALS; t++) {
     const t0 = performance.now();
@@ -195,18 +232,27 @@ const fenceMs = await measureFenceOverhead();
 // subtraction is a small correction rather than the whole measurement.
 const REPS = 2000;
 
-console.log(`unpack4xI8/unpack4xU8: ${unpack8 ? "yes" : "NO -- shift/mask fallback is what runs here"}`);
+console.log(
+  `unpack4xI8/unpack4xU8: ${unpack8 ? "yes" : "NO -- shift/mask fallback is what runs here"}`,
+);
 console.log(`unpack2x16float:       ${unpackF16 ? "yes" : "no"}`);
 console.log(`map fence overhead:    ${fenceMs.toFixed(2)} ms (subtracted)`);
 console.log(`${REPS} dispatches per fenced batch, median of ${TRIALS} batches\n`);
 
-interface Row { quant: string; shape: string; variant: string; us: number }
+interface Row {
+  quant: string;
+  shape: string;
+  variant: string;
+  us: number;
+}
 const rows: Row[] = [];
 
-for (const [quant, variants, quantize] of [
-  ["Q8_0", q8Variants, quantMatrixQ8],
-  ["Q4_0", q4Variants, quantMatrixQ4],
-] as [string, Variant[], typeof quantMatrixQ8][]) {
+for (
+  const [quant, variants, quantize] of [
+    ["Q8_0", q8Variants, quantMatrixQ8],
+    ["Q4_0", q4Variants, quantMatrixQ4],
+  ] as [string, Variant[], typeof quantMatrixQ8][]
+) {
   if (!variants.length) continue;
   for (const [r, c, label] of SHAPES) {
     const w = randVec(r * c, 0.05);
@@ -220,7 +266,7 @@ for (const [quant, variants, quantize] of [
       const gflops = (2 * r * c) / (us * 1e3);
       console.log(
         `${quant}  ${`${r}x${c}`.padEnd(10)} ${v.name.padEnd(15)} ` +
-        `${us.toFixed(2).padStart(8)} us  ${gflops.toFixed(1).padStart(7)} GFLOP/s   ${label}`,
+          `${us.toFixed(2).padStart(8)} us  ${gflops.toFixed(1).padStart(7)} GFLOP/s   ${label}`,
       );
     }
   }
@@ -261,11 +307,19 @@ for (const [k, rs] of byShape) {
     },
   });
   const bg = dev.createBindGroup({
-    layout: pipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: o } }],
+    layout: pipe.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: o } }],
   });
   const run: Run = {
-    dispatch(p) { p.setPipeline(pipe); p.setBindGroup(0, bg); p.dispatchWorkgroups(1); },
-    out: o, free() { o.destroy(); },
+    dispatch(p) {
+      p.setPipeline(pipe);
+      p.setBindGroup(0, bg);
+      p.dispatchWorkgroups(1);
+    },
+    out: o,
+    free() {
+      o.destroy();
+    },
   };
   const us = (await timeBatched(run, REPS, fenceMs)) * 1000;
   console.log(`\nempty 1-workgroup dispatch: ${us.toFixed(2)} us`);

@@ -15,7 +15,7 @@
 // round of quantization on already-quantized values, which is a LOWER bound on the
 // real term. Stated in test_onnx.ts, and the reason that test allows margin.
 
-import { halfToF32, quantMatrixQ8, Q8_BYTES } from "./lib.ts";
+import { halfToF32, Q8_BYTES, quantMatrixQ8 } from "./lib.ts";
 import type { LayerWeights } from "./layer.ts";
 
 /** Dequantize one Q8_0 tensor to f32. */
@@ -27,7 +27,8 @@ export function dequantQ8(packed: Uint8Array, rows: number, cols: number): Float
       const base = r * nb * Q8_BYTES + b * Q8_BYTES;
       const scale = halfToF32(dv.getUint16(base, true));
       for (let i = 0; i < 32; i++) {
-        let q = packed[base + 2 + i]; if (q > 127) q -= 256;
+        let q = packed[base + 2 + i];
+        if (q > 127) q -= 256;
         out[r * cols + b * 32 + i] = Math.fround(q * scale);
       }
     }
@@ -59,8 +60,10 @@ export function requantWithNoise(w: LayerWeights, seed = 1): LayerWeights {
   // xorshift32: deterministic, and good enough for perturbation noise.
   let s = seed | 0 || 1;
   const rand = () => {
-    s ^= s << 13; s ^= s >>> 17; s ^= s << 5;
-    return ((s >>> 0) / 4294967296) - 0.5;   // [-0.5, 0.5)
+    s ^= s << 13;
+    s ^= s >>> 17;
+    s ^= s << 5;
+    return ((s >>> 0) / 4294967296) - 0.5; // [-0.5, 0.5)
   };
   for (const [name, t] of Object.entries(w.q8)) {
     const f32 = dequantQ8(t.packed, t.rows, t.cols);

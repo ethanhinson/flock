@@ -22,35 +22,41 @@
 // far larger than quantization alone can explain. The test computes both, and
 // also quantizes the ONNX weights itself to predict what the quantization term
 // should be, so the comparison has something to be measured against.
+//
+// This file runs under Node, never Deno (see above), so `process` is the right
+// global here; the lint rule discouraging it is a Deno rule for Deno code.
+// deno-lint-ignore-file no-process-globals
 
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 const [, , inPath, outPath] = process.argv;
 if (!inPath || !outPath) {
-  console.error('usage: node kernels/onnx_truth.mjs <in.json> <out.json>');
+  console.error("usage: node kernels/onnx_truth.mjs <in.json> <out.json>");
   process.exit(2);
 }
 
 // onnxruntime-node is a native addon installed under node_modules, and the
 // caller may pass an explicit path because a git worktree does not have its own
 // node_modules. Import by URL so no resolution config is needed.
-const req0 = JSON.parse(readFileSync(inPath, 'utf8'));
+const req0 = JSON.parse(readFileSync(inPath, "utf8"));
 const ortPath = req0.ort ??
-  new URL('../node_modules/onnxruntime-node/dist/index.js', import.meta.url).pathname;
+  new URL("../node_modules/onnxruntime-node/dist/index.js", import.meta.url).pathname;
 if (!existsSync(ortPath)) {
-  console.error(`onnxruntime-node not found at ${ortPath}. It is a devDependency of ` +
-    `the repo and is not installed in a worktree; pass {"ort": "<path>"} in the input ` +
-    `JSON to point at an existing install, or run npm install.`);
+  console.error(
+    `onnxruntime-node not found at ${ortPath}. It is a devDependency of ` +
+      `the repo and is not installed in a worktree; pass {"ort": "<path>"} in the input ` +
+      `JSON to point at an existing install, or run npm install.`,
+  );
   process.exit(3);
 }
 const ort = (await import(`file://${ortPath}`)).default;
 
 const req = req0;
 const {
-  shard = new URL('./.ref/shard0.onnx', import.meta.url).pathname,
-  hidden,          // flat f32, length nTokens * 1024
+  shard = new URL("./.ref/shard0.onnx", import.meta.url).pathname,
+  hidden, // flat f32, length nTokens * 1024
   nTokens = 1,
-  positions,       // int64 position ids, length nTokens
+  positions, // int64 position ids, length nTokens
   kvHeads = 8,
   headDim = 128,
   nLayers = 2,
@@ -60,19 +66,19 @@ const {
 const sess = await ort.InferenceSession.create(shard);
 
 const feeds = {
-  hidden: new ort.Tensor('float32', Float32Array.from(hidden), [1, nTokens, 1024]),
-  position_ids: new ort.Tensor('int64', BigInt64Array.from(positions.map(BigInt)), [1, nTokens]),
+  hidden: new ort.Tensor("float32", Float32Array.from(hidden), [1, nTokens, 1024]),
+  position_ids: new ort.Tensor("int64", BigInt64Array.from(positions.map(BigInt)), [1, nTokens]),
 };
 // Empty KV cache is a zero-length tensor, not a missing input: the graph's
 // concat needs something with the right rank.
 for (let l = 0; l < nLayers; l++) {
   const n = pastLen * kvHeads * headDim;
   const shape = [1, kvHeads, pastLen, headDim];
-  feeds[`past_k${l}`] = new ort.Tensor('float32', new Float32Array(n), shape);
-  feeds[`past_v${l}`] = new ort.Tensor('float32', new Float32Array(n), shape);
+  feeds[`past_k${l}`] = new ort.Tensor("float32", new Float32Array(n), shape);
+  feeds[`past_v${l}`] = new ort.Tensor("float32", new Float32Array(n), shape);
   if (req[`past_k${l}`]) {
-    feeds[`past_k${l}`] = new ort.Tensor('float32', Float32Array.from(req[`past_k${l}`]), shape);
-    feeds[`past_v${l}`] = new ort.Tensor('float32', Float32Array.from(req[`past_v${l}`]), shape);
+    feeds[`past_k${l}`] = new ort.Tensor("float32", Float32Array.from(req[`past_k${l}`]), shape);
+    feeds[`past_v${l}`] = new ort.Tensor("float32", Float32Array.from(req[`past_v${l}`]), shape);
   }
 }
 

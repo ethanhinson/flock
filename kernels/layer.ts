@@ -45,8 +45,15 @@
 // count matters more than the arithmetic.
 
 import {
-  attnSource, coopSource, probeUnpack, probeUnpackF16, ropeSource, splitQ8,
-  storageBuffer, uniformBuffer, type RopePairing,
+  attnSource,
+  coopSource,
+  probeUnpack,
+  probeUnpackF16,
+  type RopePairing,
+  ropeSource,
+  splitQ8,
+  storageBuffer,
+  uniformBuffer,
 } from "./lib.ts";
 
 export interface LayerWeights {
@@ -78,14 +85,14 @@ export interface GpuTensor {
 export type LayerBuffers = Record<string, GpuTensor>;
 
 export interface LayerConfig {
-  hidden: number;      // 1024
-  nHeads: number;      // 16
-  nKvHeads: number;    // 8
-  headDim: number;     // 128
-  ffn: number;         // 3072
-  eps: number;         // 1e-6
-  ropeBase: number;    // 1e6
-  maxKeys: number;     // KV cache capacity
+  hidden: number; // 1024
+  nHeads: number; // 16
+  nKvHeads: number; // 8
+  headDim: number; // 128
+  ffn: number; // 3072
+  eps: number; // 1e-6
+  ropeBase: number; // 1e6
+  maxKeys: number; // KV cache capacity
   /**
    * Largest prefill batch, which sizes every activation buffer (q, k, v, the ffn
    * intermediates). Prefill is what makes those buffers N-wide: a decode step
@@ -110,13 +117,19 @@ export interface LayerConfig {
 // 4096 versus 21 us at 2048, a 15x cliff for 2x the context. Raise it only with
 // that number in hand.
 export const QWEN3_06B: LayerConfig = {
-  hidden: 1024, nHeads: 16, nKvHeads: 8, headDim: 128, ffn: 3072,
-  eps: 9.999999974752427e-7, ropeBase: 1e6, maxKeys: 2048, maxPrefill: 512,
+  hidden: 1024,
+  nHeads: 16,
+  nKvHeads: 8,
+  headDim: 128,
+  ffn: 3072,
+  eps: 9.999999974752427e-7,
+  ropeBase: 1e6,
+  maxKeys: 2048,
+  maxPrefill: 512,
   ropePairing: "neox",
 };
 
-const ROWS_PER_WG = 4;     // must match q8_coop.wgsl
-const COOP_LANES = 64;     // must match q8_coop.wgsl
+const ROWS_PER_WG = 4; // must match q8_coop.wgsl
 
 /**
  * queue.writeBuffer, but correct for a TypedArray that VIEWS part of a larger
@@ -178,12 +191,14 @@ export class Layer {
   private pipes!: Record<string, GPUComputePipeline>;
   private buf: Record<string, GPUBuffer> = {};
   private wq: Record<string, {
-    qs: GPUBuffer; sc: GPUBuffer;
+    qs: GPUBuffer;
+    sc: GPUBuffer;
     /** matvec Dims with n_tokens = 1, for decode. */
     dims: GPUBuffer;
     /** matvec Dims with n_tokens = the current prefill batch, rewritten per chunk. */
     dimsPre: GPUBuffer;
-    rows: number; cols: number;
+    rows: number;
+    cols: number;
   }> = {};
   /** How many keys are currently in the cache. */
   nKeys = 0;
@@ -211,7 +226,9 @@ export class Layer {
    * required tensors are checked by name here.
    */
   static async fromBuffers(
-    dev: GPUDevice, w: LayerBuffers, cfg: LayerConfig = QWEN3_06B,
+    dev: GPUDevice,
+    w: LayerBuffers,
+    cfg: LayerConfig = QWEN3_06B,
   ): Promise<Layer> {
     const L = await Layer.build(dev, cfg);
     for (const [name, t] of Object.entries(w)) {
@@ -220,12 +237,15 @@ export class Layer {
         // two dims uniforms are per-weight state, not weight bytes, so they are
         // built here exactly as create() builds them.
         L.wq[name] = {
-          qs: t.qs, sc: t.scales,
+          qs: t.qs,
+          sc: t.scales,
           dims: uniformBuffer(dev, [t.rows, t.cols, 1, 0]),
           dimsPre: dev.createBuffer({
-            size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            size: 16,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
           }),
-          rows: t.rows, cols: t.cols,
+          rows: t.rows,
+          cols: t.cols,
         };
       } else if (t.data) {
         L.buf["g_" + name] = t.data;
@@ -247,21 +267,29 @@ export class Layer {
    * bisecting a wrong model.
    */
   private requireWeights() {
-    const q8 = ["attn_q.weight", "attn_k.weight", "attn_v.weight",
-                "attn_output.weight", "ffn_gate.weight", "ffn_up.weight",
-                "ffn_down.weight"];
-    const f32 = ["attn_norm.weight", "attn_q_norm.weight", "attn_k_norm.weight",
-                 "ffn_norm.weight"];
-    const missing = [...q8.filter(n => !this.wq[n]),
-                     ...f32.filter(n => !this.buf["g_" + n])];
+    const q8 = [
+      "attn_q.weight",
+      "attn_k.weight",
+      "attn_v.weight",
+      "attn_output.weight",
+      "ffn_gate.weight",
+      "ffn_up.weight",
+      "ffn_down.weight",
+    ];
+    const f32 = ["attn_norm.weight", "attn_q_norm.weight", "attn_k_norm.weight", "ffn_norm.weight"];
+    const missing = [...q8.filter((n) => !this.wq[n]), ...f32.filter((n) => !this.buf["g_" + n])];
     if (missing.length) {
-      throw new Error(`layer is missing ${missing.length} tensor(s): ` +
-                      missing.join(", "));
+      throw new Error(
+        `layer is missing ${missing.length} tensor(s): ` +
+          missing.join(", "),
+      );
     }
   }
 
   static async create(
-    dev: GPUDevice, w: LayerWeights, cfg: LayerConfig = QWEN3_06B,
+    dev: GPUDevice,
+    w: LayerWeights,
+    cfg: LayerConfig = QWEN3_06B,
   ): Promise<Layer> {
     const L = await Layer.build(dev, cfg);
     // Weights: repack each Q8_0 tensor into split qs/scales once, here.
@@ -275,12 +303,15 @@ export class Layer {
     for (const [name, t] of Object.entries(w.q8)) {
       const { qs, scales } = splitQ8(t.packed, t.rows, t.cols);
       L.wq[name] = {
-        qs: storageBuffer(dev, qs), sc: storageBuffer(dev, scales),
+        qs: storageBuffer(dev, qs),
+        sc: storageBuffer(dev, scales),
         dims: uniformBuffer(dev, [t.rows, t.cols, 1, 0]),
         dimsPre: dev.createBuffer({
-          size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+          size: 16,
+          usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
         }),
-        rows: t.rows, cols: t.cols,
+        rows: t.rows,
+        cols: t.cols,
       };
     }
     for (const [name, v] of Object.entries(w.f32)) {
@@ -304,9 +335,11 @@ export class Layer {
     const unpack8 = await probeUnpack(dev);
     const unpackF16 = await probeUnpackF16(dev);
     const src = wgslSource;
-    const mk = (code: string, entryPoint = "main") => dev.createComputePipeline({
-      layout: "auto", compute: { module: dev.createShaderModule({ code }), entryPoint },
-    });
+    const mk = (code: string, entryPoint = "main") =>
+      dev.createComputePipeline({
+        layout: "auto",
+        compute: { module: dev.createShaderModule({ code }), entryPoint },
+      });
     const ew = await src("elementwise.wgsl");
     L.pipes = {
       matvec: mk(coopSource(await src("q8_coop.wgsl"), { unpack8, unpackF16 })),
@@ -328,10 +361,11 @@ export class Layer {
 
     const { hidden, nHeads, nKvHeads, headDim, ffn, maxKeys } = cfg;
     const P = Math.max(1, cfg.maxPrefill);
-    const rw = (n: number) => dev.createBuffer({
-      size: n * 4,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
+    const rw = (n: number) =>
+      dev.createBuffer({
+        size: n * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      });
     // WebGPU forbids binding one buffer as both `read` and `read_write` in a
     // single dispatch, so no op can write its own input. Every stage therefore
     // has a distinct destination -- qn/kn for the per-head norms, h2 for the
@@ -343,14 +377,14 @@ export class Layer {
     // there is one Layer class and not two -- the KV cache, the bind-group cache
     // and the weights are shared, and prefill differs only in the dispatch sizes
     // and in which attention kernel runs.
-    L.buf.h = rw(P * hidden);      // hidden state in / residual source
-    L.buf.h2 = rw(P * hidden);     // after the attention residual
-    L.buf.out = rw(P * hidden);    // after the ffn residual: the layer's output
-    L.buf.nh = rw(P * hidden);     // normalized hidden
+    L.buf.h = rw(P * hidden); // hidden state in / residual source
+    L.buf.h2 = rw(P * hidden); // after the attention residual
+    L.buf.out = rw(P * hidden); // after the ffn residual: the layer's output
+    L.buf.nh = rw(P * hidden); // normalized hidden
     L.buf.q = rw(P * nHeads * headDim);
-    L.buf.qn = rw(P * nHeads * headDim);     // q after per-head norm
+    L.buf.qn = rw(P * nHeads * headDim); // q after per-head norm
     L.buf.k = rw(P * nKvHeads * headDim);
-    L.buf.kn = rw(P * nKvHeads * headDim);   // k after per-head norm
+    L.buf.kn = rw(P * nKvHeads * headDim); // k after per-head norm
     L.buf.v = rw(P * nKvHeads * headDim);
     L.buf.attn = rw(P * nHeads * headDim);
     L.buf.proj = rw(P * hidden);
@@ -367,7 +401,8 @@ export class Layer {
     // as raw bits at its byte offset.
     const normDims = (n: number, nVecs: number) => {
       const b = dev.createBuffer({
-        size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
       dev.queue.writeBuffer(b, 0, new Uint32Array([n, nVecs, 0, 0]));
       dev.queue.writeBuffer(b, 8, new Float32Array([cfg.eps]));
@@ -379,9 +414,11 @@ export class Layer {
     L.buf.d_ew_hidden = uniformBuffer(dev, [hidden, 0, 0, 0]);
     L.buf.d_ew_ffn = uniformBuffer(dev, [ffn, 0, 0, 0]);
     // Rewritten every step, never reallocated -- see the bind-group cache note.
-    const posU = () => dev.createBuffer({
-      size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
+    const posU = () =>
+      dev.createBuffer({
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
     L.buf.d_rope_q = posU();
     L.buf.d_rope_k = posU();
     L.buf.d_attn = posU();
@@ -398,7 +435,8 @@ export class Layer {
     L.buf.dp_ew_hidden = posU();
     L.buf.dp_ew_ffn = posU();
     L.buf.dp_attn = dev.createBuffer({
-      size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      size: 32,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     // eps never changes, so write it into the prefill norm uniforms once here; only
     // the n/n_vecs words are rewritten per chunk.
@@ -410,7 +448,9 @@ export class Layer {
   }
 
   /** Reset the KV cache, e.g. for a new sequence. */
-  reset() { this.nKeys = 0; }
+  reset() {
+    this.nKeys = 0;
+  }
 
   /**
    * Bind groups, memoized by pipeline and buffer identity.
@@ -428,7 +468,10 @@ export class Layer {
     let key = this.pipeKey.get(pipe) ?? "?";
     for (const b of bufs) {
       let id = this.bufId.get(b);
-      if (id === undefined) { id = this.bufId.size; this.bufId.set(b, id); }
+      if (id === undefined) {
+        id = this.bufId.size;
+        this.bufId.set(b, id);
+      }
       key += "/" + id;
     }
     let bg = this.bgCache.get(key);
@@ -450,20 +493,29 @@ export class Layer {
    * rides on workgroup_id.y, so N tokens are one dispatch rather than N.
    */
   private matvec(
-    p: GPUComputePassEncoder, wName: string, xBuf: GPUBuffer, outBuf: GPUBuffer,
+    p: GPUComputePassEncoder,
+    wName: string,
+    xBuf: GPUBuffer,
+    outBuf: GPUBuffer,
     nTokens = 1,
   ) {
     const w = this.wq[wName];
     const pipe = this.pipes.matvec;
     p.setPipeline(pipe);
-    p.setBindGroup(0, this.bind(pipe,
-      [w.qs, w.sc, xBuf, outBuf, nTokens === 1 ? w.dims : w.dimsPre]));
+    p.setBindGroup(
+      0,
+      this.bind(pipe, [w.qs, w.sc, xBuf, outBuf, nTokens === 1 ? w.dims : w.dimsPre]),
+    );
     p.dispatchWorkgroups(Math.ceil(w.rows / ROWS_PER_WG), nTokens);
   }
 
   private norm(
-    p: GPUComputePassEncoder, xBuf: GPUBuffer, gain: GPUBuffer, outBuf: GPUBuffer,
-    dims: GPUBuffer, nVecs: number,
+    p: GPUComputePassEncoder,
+    xBuf: GPUBuffer,
+    gain: GPUBuffer,
+    outBuf: GPUBuffer,
+    dims: GPUBuffer,
+    nVecs: number,
   ) {
     const pipe = this.pipes.rmsnorm;
     p.setPipeline(pipe);
@@ -472,8 +524,13 @@ export class Layer {
   }
 
   private elementwise(
-    p: GPUComputePassEncoder, kind: "swiglu" | "add", a: GPUBuffer, b: GPUBuffer,
-    out: GPUBuffer, dims: GPUBuffer, n: number,
+    p: GPUComputePassEncoder,
+    kind: "swiglu" | "add",
+    a: GPUBuffer,
+    b: GPUBuffer,
+    out: GPUBuffer,
+    dims: GPUBuffer,
+    n: number,
   ) {
     const pipe = this.pipes[kind];
     p.setPipeline(pipe);
@@ -566,8 +623,10 @@ export class Layer {
 
     const p2 = enc.beginComputePass();
     p2.setPipeline(this.pipes.attn);
-    p2.setBindGroup(0, this.bind(this.pipes.attn,
-      [buf.qn, buf.kcache, buf.vcache, buf.attn, buf.d_attn]));
+    p2.setBindGroup(
+      0,
+      this.bind(this.pipes.attn, [buf.qn, buf.kcache, buf.vcache, buf.attn, buf.d_attn]),
+    );
     p2.dispatchWorkgroups(nHeads);
 
     // Output projection and the first residual. h2 = h + proj.
@@ -647,8 +706,7 @@ export class Layer {
     dev.queue.writeBuffer(buf.dp_norm_k, 0, u32(headDim, nTokens * nKvHeads));
     dev.queue.writeBuffer(buf.dp_ew_hidden, 0, u32(nTokens * H, 0, 0, 0));
     dev.queue.writeBuffer(buf.dp_ew_ffn, 0, u32(nTokens * ffn, 0, 0, 0));
-    dev.queue.writeBuffer(buf.dp_attn, 0,
-      u32(nHeads, nKvHeads, headDim, nTokens, pos, 0, 0, 0));
+    dev.queue.writeBuffer(buf.dp_attn, 0, u32(nHeads, nKvHeads, headDim, nTokens, pos, 0, 0, 0));
     dev.queue.writeBuffer(buf.d_rope_q, 0, u32(nTokens, nHeads, headDim, pos));
     dev.queue.writeBuffer(buf.d_rope_k, 0, u32(nTokens, nKvHeads, headDim, pos));
     for (const name of Object.keys(this.wq)) {
@@ -664,10 +722,8 @@ export class Layer {
     this.matvec(p, "attn_q.weight", buf.nh, buf.q, nTokens);
     this.matvec(p, "attn_k.weight", buf.nh, buf.k, nTokens);
     this.matvec(p, "attn_v.weight", buf.nh, buf.v, nTokens);
-    this.norm(p, buf.q, buf["g_attn_q_norm.weight"], buf.qn, buf.dp_norm_q,
-      nTokens * nHeads);
-    this.norm(p, buf.k, buf["g_attn_k_norm.weight"], buf.kn, buf.dp_norm_k,
-      nTokens * nKvHeads);
+    this.norm(p, buf.q, buf["g_attn_q_norm.weight"], buf.qn, buf.dp_norm_q, nTokens * nHeads);
+    this.norm(p, buf.k, buf["g_attn_k_norm.weight"], buf.kn, buf.dp_norm_k, nTokens * nKvHeads);
 
     const rope = (dims: GPUBuffer, x: GPUBuffer, heads: number) => {
       p.setPipeline(this.pipes.rope);
@@ -686,8 +742,10 @@ export class Layer {
 
     const p2 = enc.beginComputePass();
     p2.setPipeline(this.pipes.attnPre);
-    p2.setBindGroup(0, this.bind(this.pipes.attnPre,
-      [buf.qn, buf.kcache, buf.vcache, buf.attn, buf.dp_attn]));
+    p2.setBindGroup(
+      0,
+      this.bind(this.pipes.attnPre, [buf.qn, buf.kcache, buf.vcache, buf.attn, buf.dp_attn]),
+    );
     // (head, query): one workgroup per pair, which is what keeps prefill wide.
     p2.dispatchWorkgroups(nHeads, nTokens);
 
@@ -709,7 +767,9 @@ export class Layer {
   }
 
   /** The buffer holding this layer's output, for a caller chaining layers itself. */
-  outputBuffer(): GPUBuffer { return this.buf.out; }
+  outputBuffer(): GPUBuffer {
+    return this.buf.out;
+  }
 
   /**
    * The buffer this layer reads its input from.
@@ -719,7 +779,9 @@ export class Layer {
    * a readback and an upload per layer, ~24 ms each on this backend against a
    * whole-token budget of a few ms.
    */
-  inputBuffer(): GPUBuffer { return this.buf.h; }
+  inputBuffer(): GPUBuffer {
+    return this.buf.h;
+  }
 
   /**
    * The KV cache buffers. Exposed so a test can assert that a prefill left the
@@ -740,14 +802,16 @@ export class Layer {
     const { dev, cfg, buf } = this;
     const bytes = nTokens * cfg.hidden * 4;
     const rd = dev.createBuffer({
-      size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+      size: bytes,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
     const enc = dev.createCommandEncoder();
     enc.copyBufferToBuffer(buf.out, 0, rd, 0, bytes);
     dev.queue.submit([enc.finish()]);
     await rd.mapAsync(GPUMapMode.READ);
     const out = new Float32Array(rd.getMappedRange().slice(0));
-    rd.unmap(); rd.destroy();
+    rd.unmap();
+    rd.destroy();
     return out;
   }
 }

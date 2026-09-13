@@ -24,24 +24,28 @@
 // applying output_norm twice on the WGSL side would be a subtle, plausible-looking
 // error, so it is stated here in the file that defines the reference.
 //
-// head.onnx returns only the argmax, so this also computes the logits itself from
-// the same tied matrix when asked. That matters for the divergence diagnosis: if
-// WGSL and ONNX pick different tokens, the question is immediately "by how much"
-// -- a 1e-5 gap between the top two logits is f32 drift, a large gap is a bug --
-// and an argmax alone cannot answer it.
+// head.onnx returns only the argmax, so this dumps the NORMED HIDDEN STATE after
+// the prompt (`wantHidden`) rather than logits: the WGSL side projects it through
+// the same tied matrix, which is what lets test_model.ts say "by how much" when
+// the two engines pick different tokens -- a 1e-5 gap between the top two logits
+// is f32 drift, a large gap is a bug -- and an argmax alone cannot answer that.
+//
+// This file runs under Node, never Deno (see above), so `process` is the right
+// global here; the lint rule discouraging it is a Deno rule for Deno code.
+// deno-lint-ignore-file no-process-globals
 
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 const [, , inPath, outPath] = process.argv;
 if (!inPath || !outPath) {
-  console.error('usage: node kernels/onnx_full.mjs <in.json> <out.json>');
+  console.error("usage: node kernels/onnx_full.mjs <in.json> <out.json>");
   process.exit(2);
 }
-const req = JSON.parse(readFileSync(inPath, 'utf8'));
+const req = JSON.parse(readFileSync(inPath, "utf8"));
 
 const ortPath = req.ort ??
-  new URL('../node_modules/onnxruntime-node/dist/index.js', import.meta.url).pathname;
+  new URL("../node_modules/onnxruntime-node/dist/index.js", import.meta.url).pathname;
 if (!existsSync(ortPath)) {
   console.error(`onnxruntime-node not found at ${ortPath}`);
   process.exit(3);
@@ -49,16 +53,15 @@ if (!existsSync(ortPath)) {
 const ort = (await import(`file://${ortPath}`)).default;
 
 const {
-  coordDir,            // the export dir: embed.onnx, layers.onnx, head.onnx, coord.json, tok/
-  shards = [],         // [{path, n_layers}] in order, covering the layers coord does not
-  prompt,              // raw text; the chat template is applied here
-  ids: rawIds,         // OR explicit token ids, skipping the tokenizer
+  coordDir, // the export dir: embed.onnx, layers.onnx, head.onnx, coord.json, tok/
+  shards = [], // [{path, n_layers}] in order, covering the layers coord does not
+  prompt, // raw text; the chat template is applied here
+  ids: rawIds, // OR explicit token ids, skipping the tokenizer
   maxTokens = 16,
-  wantLogits = false,
   wantHidden = false,
 } = req;
 
-const meta = JSON.parse(readFileSync(join(coordDir, 'coord.json'), 'utf8'));
+const meta = JSON.parse(readFileSync(join(coordDir, "coord.json"), "utf8"));
 
 // --- tokenizer -------------------------------------------------------------
 // The chat template with enable_thinking:false, then encode with
@@ -69,20 +72,21 @@ let ids = rawIds;
 let tok = null;
 if (!ids) {
   const tfPath = req.transformers ??
-    new URL('../node_modules/@huggingface/transformers/dist/transformers.mjs',
-      import.meta.url).pathname;
+    new URL("../node_modules/@huggingface/transformers/dist/transformers.mjs", import.meta.url)
+      .pathname;
   const { AutoTokenizer } = await import(`file://${tfPath}`);
-  tok = await AutoTokenizer.from_pretrained(join(coordDir, 'tok'), { local_files_only: true });
+  tok = await AutoTokenizer.from_pretrained(join(coordDir, "tok"), { local_files_only: true });
   const text = tok.apply_chat_template(
-    [{ role: 'user', content: prompt }],
-    { tokenize: false, add_generation_prompt: true, enable_thinking: false });
+    [{ role: "user", content: prompt }],
+    { tokenize: false, add_generation_prompt: true, enable_thinking: false },
+  );
   ids = Array.from(tok(text, { add_special_tokens: false }).input_ids.data).map(Number);
 }
 
 // --- sessions --------------------------------------------------------------
-const embed = await ort.InferenceSession.create(join(coordDir, 'embed.onnx'));
-const layers = await ort.InferenceSession.create(join(coordDir, 'layers.onnx'));
-const head = await ort.InferenceSession.create(join(coordDir, 'head.onnx'));
+const embed = await ort.InferenceSession.create(join(coordDir, "embed.onnx"));
+const layers = await ort.InferenceSession.create(join(coordDir, "layers.onnx"));
+const head = await ort.InferenceSession.create(join(coordDir, "head.onnx"));
 const shardSess = [];
 for (const s of shards) {
   shardSess.push({
@@ -93,7 +97,7 @@ for (const s of shards) {
 }
 
 const H = meta.hidden, KVH = meta.kv_heads, HD = meta.head_dim;
-const empty = () => new ort.Tensor('float32', new Float32Array(0), [1, KVH, 0, HD]);
+const empty = () => new ort.Tensor("float32", new Float32Array(0), [1, KVH, 0, HD]);
 
 let coordPast = null;
 let embeddingOfPrompt = null;
@@ -102,10 +106,13 @@ let embeddingOfPrompt = null;
 async function forward(stepIds, offset) {
   const n = stepIds.length;
   const emb = await embed.run({
-    ids: new ort.Tensor('int64', BigInt64Array.from(stepIds.map(BigInt)), [1, n]),
+    ids: new ort.Tensor("int64", BigInt64Array.from(stepIds.map(BigInt)), [1, n]),
   });
-  const posIds = new ort.Tensor('int64',
-    BigInt64Array.from({ length: n }, (_, i) => BigInt(offset + i)), [1, n]);
+  const posIds = new ort.Tensor(
+    "int64",
+    BigInt64Array.from({ length: n }, (_, i) => BigInt(offset + i)),
+    [1, n],
+  );
   // The embedding of the PROMPT, kept so the WGSL gather can be diffed against the
   // tensor the ONNX pipeline actually feeds its layers. Only the first call: later
   // ones are single generated tokens.
@@ -117,7 +124,7 @@ async function forward(stepIds, offset) {
     feed[`past_k${i}`] = coordPast ? coordPast[`new_k${i}`] : empty();
     feed[`past_v${i}`] = coordPast ? coordPast[`new_v${i}`] : empty();
   }
-  let out = await layers.run(feed);
+  const out = await layers.run(feed);
   coordPast = {};
   for (let i = 0; i < meta.n_layers; i++) {
     coordPast[`new_k${i}`] = out[`new_k${i}`];
@@ -144,7 +151,7 @@ async function forward(stepIds, offset) {
   // The last position is the one that gets projected.
   const flat = hidden.data;
   const last = new Float32Array(flat.slice((n - 1) * H, n * H));
-  const lastT = new ort.Tensor('float32', last, [1, 1, H]);
+  const lastT = new ort.Tensor("float32", last, [1, 1, H]);
   const res = await head.run({ hidden: lastT });
   return { token: Number(res.token.data[0]), normed: last };
 }
@@ -159,7 +166,10 @@ for (let t = 0; t <= maxTokens; t++) {
   if (wantHidden && t === 0) result.normedAfterPrompt = Array.from(normed);
   result.steps.push(rec);
   if (t === maxTokens) break;
-  if (token === meta.eos) { result.hitEos = true; break; }
+  if (token === meta.eos) {
+    result.hitEos = true;
+    break;
+  }
   result.generated.push(token);
   cur = [token];
 }

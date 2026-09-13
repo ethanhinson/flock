@@ -17,9 +17,24 @@
 // builtin path is reported as skipped rather than silently assumed.
 
 import {
-  coop, coopSource, cpuMatmulQ4F32, cpuMatmulQ8F32, getDevice, maxRelErr, ok,
-  probeUnpack, probeUnpackF16, quantMatrixQ4, quantMatrixQ8, randVec, readBack,
-  splitQ4, splitQ8, storageBuffer, summary, uniformBuffer,
+  coop,
+  coopSource,
+  cpuMatmulQ4F32,
+  cpuMatmulQ8F32,
+  getDevice,
+  maxRelErr,
+  ok,
+  probeUnpack,
+  probeUnpackF16,
+  quantMatrixQ4,
+  quantMatrixQ8,
+  randVec,
+  readBack,
+  splitQ4,
+  splitQ8,
+  storageBuffer,
+  summary,
+  uniformBuffer,
 } from "./lib.ts";
 import { absErrScaled, amax } from "./ops_ref.ts";
 import { realQ8Tensor } from "./real_weights.ts";
@@ -29,7 +44,11 @@ const LANES = 64, ROWS_PER_WG = 4;
 const dev = await getDevice();
 const unpack8 = await probeUnpack(dev);
 const unpackF16 = await probeUnpackF16(dev);
-console.log(`unpack4xI8/unpack4xU8: ${unpack8 ? "yes" : "no"}   unpack2x16float: ${unpackF16 ? "yes" : "no"}\n`);
+console.log(
+  `unpack4xI8/unpack4xU8: ${unpack8 ? "yes" : "no"}   unpack2x16float: ${
+    unpackF16 ? "yes" : "no"
+  }\n`,
+);
 
 // Every combination this device can actually compile. The f16 axis is tested
 // separately from the 8-bit axis because they are independently available --
@@ -37,7 +56,11 @@ console.log(`unpack4xI8/unpack4xU8: ${unpack8 ? "yes" : "no"}   unpack2x16float:
 const paths: { label: string; unpack8: boolean; unpackF16: boolean }[] = [];
 for (const u8 of unpack8 ? [true, false] : [false]) {
   for (const uf of unpackF16 ? [true, false] : [false]) {
-    paths.push({ label: `i8=${u8 ? "builtin" : "shift"} f16=${uf ? "builtin" : "manual"}`, unpack8: u8, unpackF16: uf });
+    paths.push({
+      label: `i8=${u8 ? "builtin" : "shift"} f16=${uf ? "builtin" : "manual"}`,
+      unpack8: u8,
+      unpackF16: uf,
+    });
   }
 }
 if (!unpack8) {
@@ -47,16 +70,23 @@ if (!unpack8) {
 function makePipeline(src: string, opts: { unpack8: boolean; unpackF16: boolean }) {
   const code = coopSource(src, opts);
   return dev.createComputePipeline({
-    layout: "auto", compute: { module: dev.createShaderModule({ code }), entryPoint: "main" },
+    layout: "auto",
+    compute: { module: dev.createShaderModule({ code }), entryPoint: "main" },
   });
 }
 
 async function run(
-  pipe: GPUComputePipeline, qs: Uint8Array, scales: Uint8Array,
-  x: Float32Array, rows: number, cols: number,
+  pipe: GPUComputePipeline,
+  qs: Uint8Array,
+  scales: Uint8Array,
+  x: Float32Array,
+  rows: number,
+  cols: number,
 ) {
   const bufs = [
-    storageBuffer(dev, qs), storageBuffer(dev, scales), storageBuffer(dev, x),
+    storageBuffer(dev, qs),
+    storageBuffer(dev, scales),
+    storageBuffer(dev, x),
     dev.createBuffer({ size: rows * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
     uniformBuffer(dev, [rows, cols, 1, 0]),
   ];
@@ -66,8 +96,10 @@ async function run(
   });
   const enc = dev.createCommandEncoder();
   const p = enc.beginComputePass();
-  p.setPipeline(pipe); p.setBindGroup(0, bg);
-  p.dispatchWorkgroups(Math.ceil(rows / ROWS_PER_WG)); p.end();
+  p.setPipeline(pipe);
+  p.setBindGroup(0, bg);
+  p.dispatchWorkgroups(Math.ceil(rows / ROWS_PER_WG));
+  p.end();
   dev.queue.submit([enc.finish()]);
   const out = await readBack(dev, bufs[3], rows * 4);
   for (const b of bufs) b.destroy();
@@ -79,7 +111,13 @@ async function run(
 // that must still reach every barrier; 64x32 is a single block per row, so most
 // of the 64 lanes contribute nothing and the tree reduction is summing zeros.
 const SHAPES: [number, number][] = [
-  [64, 32], [30, 1024], [128, 1024], [1024, 1024], [2048, 1024], [3072, 1024], [1024, 3072],
+  [64, 32],
+  [30, 1024],
+  [128, 1024],
+  [1024, 1024],
+  [2048, 1024],
+  [3072, 1024],
+  [1024, 3072],
 ];
 
 const q8src = await Deno.readTextFile(new URL("./q8_coop.wgsl", import.meta.url));
@@ -143,8 +181,11 @@ for (const path of paths) {
   const gpu = await run(pipe, s.qs, s.scales, x, rows, cols);
   const serial = cpuMatmulQ8F32(packed, x, rows, cols);
   const err = absErrScaled(gpu, serial, amax(serial));
-  ok("coop agrees with the serial kernel to f32 noise", err > 0 && err < 1e-6,
-    `abs err / scale ${err.toExponential(1)} (nonzero is expected: different summation order)`);
+  ok(
+    "coop agrees with the serial kernel to f32 noise",
+    err > 0 && err < 1e-6,
+    `abs err / scale ${err.toExponential(1)} (nonzero is expected: different summation order)`,
+  );
 }
 
 // Repacking must be lossless: same bytes, different arrangement.

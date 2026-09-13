@@ -3,5 +3,22 @@
   "nodeModulesDir": "manual",
   "imports": {
     "@huggingface/gguf": "npm:@huggingface/gguf@^0.4.6"
+  },
+  "//fmt": "fmt and lint are scoped to kernels/, the TypeScript engine, which is the code Deno owns end to end. server/, web/, tools/ and test/ are Node-style JavaScript ({a, b} braces, single quotes) that deno fmt has no option to accept without rewriting every file; they are checked by `node --check` and tools/check_html.mjs instead (`npm run check`). Widen `include` when a directory is brought over to this style. fmt covers only the .ts and .mjs sources: kernels/README.md is a hand-written document whose tables deno fmt would re-pad on every edit for no gain. The .cache and .ref directories hold downloaded weights and are never source.",
+  "fmt": {
+    "include": ["kernels/*.ts", "kernels/*.mjs"],
+    "exclude": ["kernels/.cache/", "kernels/.ref/"],
+    "lineWidth": 100,
+    "indentWidth": 2,
+    "semiColons": true,
+    "singleQuote": false,
+    "proseWrap": "preserve"
+  },
+  "lint": {
+    "include": ["kernels/"],
+    "exclude": ["kernels/.cache/", "kernels/.ref/"],
+    "rules": {
+      "tags": ["recommended"]
+    }
   }
 }

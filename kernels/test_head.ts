@@ -16,8 +16,18 @@
 // 34-byte layout rather than the repacked one.
 
 import {
-  coopSource, getDevice, ok, probeUnpack, probeUnpackF16, quantMatrixQ8, randVec,
-  readBack, splitQ8, storageBuffer, summary, uniformBuffer,
+  coopSource,
+  getDevice,
+  ok,
+  probeUnpack,
+  probeUnpackF16,
+  quantMatrixQ8,
+  randVec,
+  readBack,
+  splitQ8,
+  storageBuffer,
+  summary,
+  uniformBuffer,
 } from "./lib.ts";
 import { absErrScaled, amax, attnRef, relErr } from "./ops_ref.ts";
 import { argmaxRef, attnPrefillRef, embedRef } from "./head_ref.ts";
@@ -29,7 +39,8 @@ const unpackF16 = await probeUnpackF16(dev);
 const src = (f: string) => Deno.readTextFile(new URL("./" + f, import.meta.url));
 const mk = (code: string, entryPoint = "main") =>
   dev.createComputePipeline({
-    layout: "auto", compute: { module: dev.createShaderModule({ code }), entryPoint },
+    layout: "auto",
+    compute: { module: dev.createShaderModule({ code }), entryPoint },
   });
 
 const bind = (pipe: GPUComputePipeline, bufs: GPUBuffer[]) =>
@@ -55,11 +66,15 @@ console.log("embed.wgsl -- Q8_0 row gather\n");
 const embedPipe = mk(coopSource(await src("embed.wgsl"), { unpack8, unpackF16 }));
 
 async function gpuEmbed(
-  packed: Uint8Array, rows: number, cols: number, ids: number[],
+  packed: Uint8Array,
+  rows: number,
+  cols: number,
+  ids: number[],
 ): Promise<Float32Array> {
   const { qs, scales } = splitQ8(packed, rows, cols);
   const bufs = [
-    storageBuffer(dev, qs), storageBuffer(dev, scales),
+    storageBuffer(dev, qs),
+    storageBuffer(dev, scales),
     storageBuffer(dev, new Uint8Array(new Uint32Array(ids).buffer)),
     dev.createBuffer({
       size: ids.length * cols * 4,
@@ -81,8 +96,11 @@ async function gpuEmbed(
   for (const ids of [[0], [63], [7], [0, 1, 2], [63, 0, 31, 31, 5]]) {
     const got = await gpuEmbed(packed, rows, cols, ids);
     const want = embedRef(packed, ids, cols);
-    ok(`embed ${rows}x${cols} ids=[${ids}]`, relErr(got, want, 1e-9) === 0,
-      `rel err ${relErr(got, want, 1e-9).toExponential(1)}`);
+    ok(
+      `embed ${rows}x${cols} ids=[${ids}]`,
+      relErr(got, want, 1e-9) === 0,
+      `rel err ${relErr(got, want, 1e-9).toExponential(1)}`,
+    );
   }
   // A repeated id must produce identical rows -- the check that catches a gather
   // reading a stride instead of an index.
@@ -94,17 +112,22 @@ async function gpuEmbed(
   let differs = 0;
   const two = await gpuEmbed(packed, rows, cols, [17, 18]);
   for (let i = 0; i < cols; i++) if (two[i] !== two[cols + i]) differs++;
-  ok("adjacent rows differ (not reading one row twice)", differs > cols * 0.9,
-    `${differs}/${cols} entries differ`);
+  ok(
+    "adjacent rows differ (not reading one row twice)",
+    differs > cols * 0.9,
+    `${differs}/${cols} entries differ`,
+  );
 }
 
 // The real token_embd. 151936 rows, so only a handful of ids are checked -- but
 // they are checked against a decoder reading the ORIGINAL 34-byte layout, which
 // makes this a test of splitQ8 on a 165 MB tensor as much as of the kernel.
 const embd = await realQ8Tensor("token_embd.weight");
-ok("token_embd.weight is [151936 rows, 1024 cols] Q8_0",
+ok(
+  "token_embd.weight is [151936 rows, 1024 cols] Q8_0",
   embd.rows === 151936 && embd.cols === 1024,
-  `${embd.rows}x${embd.cols}, ${(embd.packed.byteLength / 1e6).toFixed(0)} MB`);
+  `${embd.rows}x${embd.cols}, ${(embd.packed.byteLength / 1e6).toFixed(0)} MB`,
+);
 {
   // Include 0, the last row, and the special tokens the chat template uses, since
   // a bug at the top of the vocab (where the special tokens live, above 151643)
@@ -113,10 +136,16 @@ ok("token_embd.weight is [151936 rows, 1024 cols] Q8_0",
   const got = await gpuEmbed(embd.packed, embd.rows, embd.cols, ids);
   const want = embedRef(embd.packed, ids, embd.cols);
   const err = relErr(got, want, 1e-9);
-  ok(`real token_embd gather, ids=[${ids.slice(0, 4)}...] (${ids.length} rows)`,
-    err === 0, `rel err ${err.toExponential(1)} (bit-exact expected: dequant is one multiply)`);
-  ok("real embedding rows are finite and not all zero",
-    got.every(Number.isFinite) && amax(got) > 1e-4, `|max| ${amax(got).toExponential(2)}`);
+  ok(
+    `real token_embd gather, ids=[${ids.slice(0, 4)}...] (${ids.length} rows)`,
+    err === 0,
+    `rel err ${err.toExponential(1)} (bit-exact expected: dequant is one multiply)`,
+  );
+  ok(
+    "real embedding rows are finite and not all zero",
+    got.every(Number.isFinite) && amax(got) > 1e-4,
+    `|max| ${amax(got).toExponential(2)}`,
+  );
 }
 
 // ==================================================================== argmax
@@ -125,7 +154,6 @@ console.log("\nargmax.wgsl -- two-stage max-index reduction\n");
 const argmaxSrc = await src("argmax.wgsl");
 const amPass1 = mk(argmaxSrc, "pass1");
 const amPass2 = mk(argmaxSrc, "pass2");
-const AM_WG = 256;
 
 /** The host half of the two-stage reduction: returns the winning index. */
 async function gpuArgmax(x: Float32Array, nGroups = 64): Promise<number> {
@@ -191,10 +219,15 @@ async function gpuArgmax(x: Float32Array, nGroups = 64): Promise<number> {
   // f32. This is constructed rather than hoped for.
   {
     const x = new Float32Array(151936).fill(-1);
-    x[900] = 3; x[40000] = 3; x[151000] = 3;
+    x[900] = 3;
+    x[40000] = 3;
+    x[151000] = 3;
     const got = await gpuArgmax(x);
-    ok("argmax breaks ties toward the LOWEST index (numpy/torch rule)",
-      got === 900 && argmaxRef(x) === 900, `got ${got}, ref ${argmaxRef(x)}`);
+    ok(
+      "argmax breaks ties toward the LOWEST index (numpy/torch rule)",
+      got === 900 && argmaxRef(x) === 900,
+      `got ${got}, ref ${argmaxRef(x)}`,
+    );
   }
   // Group count must not change the answer: 594 groups is what the LM head uses
   // (151936 / 256), and 1 group exercises the degenerate stage 2.
@@ -203,8 +236,11 @@ async function gpuArgmax(x: Float32Array, nGroups = 64): Promise<number> {
     const want = argmaxRef(x);
     const results = [];
     for (const g of [1, 8, 64, 594]) results.push(await gpuArgmax(x, g));
-    ok("argmax is independent of the stage-1 group count",
-      results.every((r) => r === want), `${results.join(", ")} vs want ${want}`);
+    ok(
+      "argmax is independent of the stage-1 group count",
+      results.every((r) => r === want),
+      `${results.join(", ")} vs want ${want}`,
+    );
   }
   // All-negative logits: the sentinel must not win. Softmax inputs are routinely
   // all-negative, and an initial max of 0 instead of -FLT_MAX would return 0 here.
@@ -212,8 +248,11 @@ async function gpuArgmax(x: Float32Array, nGroups = 64): Promise<number> {
     const x = new Float32Array(151936);
     for (let i = 0; i < x.length; i++) x[i] = -100 - (x.length - i) * 1e-3;
     const got = await gpuArgmax(x);
-    ok("argmax handles all-negative input", got === argmaxRef(x),
-      `got ${got}, want ${argmaxRef(x)} (last index, largest = least negative)`);
+    ok(
+      "argmax handles all-negative input",
+      got === argmaxRef(x),
+      `got ${got}, want ${argmaxRef(x)} (last index, largest = least negative)`,
+    );
   }
 }
 
@@ -223,11 +262,19 @@ console.log("\nattention_prefill.wgsl -- N-query causal GQA, streaming softmax\n
 const prePipe = mk(await src("attention_prefill.wgsl"));
 
 async function gpuPrefillAttn(
-  q: Float32Array, k: Float32Array, v: Float32Array,
-  nHeads: number, nKvHeads: number, headDim: number, nQueries: number, pos0: number,
+  q: Float32Array,
+  k: Float32Array,
+  v: Float32Array,
+  nHeads: number,
+  nKvHeads: number,
+  headDim: number,
+  nQueries: number,
+  pos0: number,
 ): Promise<Float32Array> {
   const bufs = [
-    storageBuffer(dev, q), storageBuffer(dev, k), storageBuffer(dev, v),
+    storageBuffer(dev, q),
+    storageBuffer(dev, k),
+    storageBuffer(dev, v),
     dev.createBuffer({
       size: nQueries * nHeads * headDim * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
@@ -263,8 +310,11 @@ async function gpuPrefillAttn(
     const got = await gpuPrefillAttn(q, k, v, nH, nKv, hd, nQ, pos0);
     const want = attnPrefillRef(q, k, v, nH, nKv, hd, nQ, pos0);
     const err = absErrScaled(got, want, amax(want));
-    ok(`prefill attn ${nH}q/${nKv}kv nQ=${nQ} pos0=${pos0}`, err < 1e-5,
-      `abs err / scale ${err.toExponential(1)}  (${label})`);
+    ok(
+      `prefill attn ${nH}q/${nKv}kv nQ=${nQ} pos0=${pos0}`,
+      err < 1e-5,
+      `abs err / scale ${err.toExponential(1)}  (${label})`,
+    );
   }
 }
 
@@ -281,12 +331,22 @@ async function gpuPrefillAttn(
   for (const at of [0, 1, 4, nQ - 1]) {
     // Decode reference for query `at`: it sees keys 0..at.
     const qOne = q.slice(at * nH * hd, (at + 1) * nH * hd);
-    const want = attnRef(qOne, k.subarray(0, (at + 1) * nKv * hd),
-      v.subarray(0, (at + 1) * nKv * hd), nH, nKv, hd, at + 1);
+    const want = attnRef(
+      qOne,
+      k.subarray(0, (at + 1) * nKv * hd),
+      v.subarray(0, (at + 1) * nKv * hd),
+      nH,
+      nKv,
+      hd,
+      at + 1,
+    );
     const got = pre.slice(at * nH * hd, (at + 1) * nH * hd);
     const err = absErrScaled(got, want, amax(want));
-    ok(`prefill query ${at} matches the decode reference at position ${at}`,
-      err < 2e-5, `abs err / scale ${err.toExponential(1)}`);
+    ok(
+      `prefill query ${at} matches the decode reference at position ${at}`,
+      err < 2e-5,
+      `abs err / scale ${err.toExponential(1)}`,
+    );
   }
 }
 
@@ -310,13 +370,22 @@ async function gpuPrefillAttn(
   for (let qi = 0; qi < nQ; qi++) {
     for (let i = 0; i < nH * hd; i++) {
       const at = qi * nH * hd + i;
-      if (base[at] !== pert[at]) { if (qi < 5) beforeChanged++; else afterChanged++; }
+      if (base[at] !== pert[at]) {
+        if (qi < 5) beforeChanged++;
+        else afterChanged++;
+      }
     }
   }
-  ok("queries before a changed key are bit-identical (causal mask is real)",
-    beforeChanged === 0, `${beforeChanged} changed before, ${afterChanged} at/after`);
-  ok("queries at and after a changed key DO change (the key is actually read)",
-    afterChanged > nH * hd, `${afterChanged} entries changed`);
+  ok(
+    "queries before a changed key are bit-identical (causal mask is real)",
+    beforeChanged === 0,
+    `${beforeChanged} changed before, ${afterChanged} at/after`,
+  );
+  ok(
+    "queries at and after a changed key DO change (the key is actually read)",
+    afterChanged > nH * hd,
+    `${afterChanged} entries changed`,
+  );
 }
 
 Deno.exit(summary() ? 1 : 0);

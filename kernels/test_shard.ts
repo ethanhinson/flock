@@ -32,13 +32,27 @@
 // so remainder handling is exercised rather than assumed.
 
 import {
-  cpuMatmulQ8F32, coop, getDevice, ok, quantMatrixQ8, randVec, readBack, splitQ8,
-  storageBuffer, summary,
+  coop,
+  cpuMatmulQ8F32,
+  getDevice,
+  ok,
+  quantMatrixQ8,
+  randVec,
+  readBack,
+  splitQ8,
+  summary,
 } from "./lib.ts";
 import { absErrScaled, amax } from "./ops_ref.ts";
 import {
-  memShardPlan, shardRanges, shardedColMatvecRef, shardedRowMatvecRef,
-  shardMatvecRef, shardReduceRef, slicePackedCols, slicePackedRows, sliceCols,
+  memShardPlan,
+  shardedColMatvecRef,
+  shardedRowMatvecRef,
+  shardMatvecRef,
+  shardRanges,
+  shardReduceRef,
+  sliceCols,
+  slicePackedCols,
+  slicePackedRows,
   sliceRows,
 } from "./shard_ref.ts";
 import { ShardedMatvec } from "./shard.ts";
@@ -48,8 +62,12 @@ const LANES = 64;
 const dev = await getDevice();
 
 async function runSharded(
-  packed: Uint8Array, x: Float32Array, rows: number, cols: number,
-  n: number, direction: "row" | "col",
+  packed: Uint8Array,
+  x: Float32Array,
+  rows: number,
+  cols: number,
+  n: number,
+  direction: "row" | "col",
 ): Promise<Float32Array> {
   const split = splitQ8(packed, rows, cols);
   const mv = await ShardedMatvec.create(dev, split, rows, cols, n, direction);
@@ -70,8 +88,15 @@ async function runSharded(
 // plausible numbers.
 {
   const cases: [number, number, number][] = [
-    [1024, 1, 32], [1024, 2, 32], [1024, 3, 32], [1024, 4, 32],
-    [1024, 5, 32], [1024, 7, 32], [3072, 3, 32], [151936, 8, 1], [30, 4, 1],
+    [1024, 1, 32],
+    [1024, 2, 32],
+    [1024, 3, 32],
+    [1024, 4, 32],
+    [1024, 5, 32],
+    [1024, 7, 32],
+    [3072, 3, 32],
+    [151936, 8, 1],
+    [30, 4, 1],
   ];
   let bad = 0, worstSkew = 0;
   for (const [total, n, align] of cases) {
@@ -87,24 +112,43 @@ async function runSharded(
     const counts = rs.map((r) => r.count);
     worstSkew = Math.max(worstSkew, Math.max(...counts) - Math.min(...counts));
   }
-  ok("shardRanges partitions exactly, with no gaps or overlaps", bad === 0,
-     `${cases.length} cases, ${bad} defects`);
-  ok("shard sizes differ by at most one alignment unit", worstSkew <= 32,
-     `worst spread ${worstSkew}`);
+  ok(
+    "shardRanges partitions exactly, with no gaps or overlaps",
+    bad === 0,
+    `${cases.length} cases, ${bad} defects`,
+  );
+  ok(
+    "shard sizes differ by at most one alignment unit",
+    worstSkew <= 32,
+    `worst spread ${worstSkew}`,
+  );
 
   // A column boundary inside a Q8_0 block would split an f16 scale between two
   // shards, and there is no correct way to divide it. This has to throw, not
   // round, because rounding would silently give one shard 16 of another's columns.
   let threw = "";
-  try { sliceCols({ qs: new Uint8Array(0), scales: new Uint8Array(0) }, 1, 64, 0, 16); }
-  catch (e) { threw = String((e as Error).message); }
-  ok("a column boundary inside a Q8_0 block is rejected, not rounded",
-     threw.includes("32"), threw || "(did not throw)");
+  try {
+    sliceCols({ qs: new Uint8Array(0), scales: new Uint8Array(0) }, 1, 64, 0, 16);
+  } catch (e) {
+    threw = String((e as Error).message);
+  }
+  ok(
+    "a column boundary inside a Q8_0 block is rejected, not rounded",
+    threw.includes("32"),
+    threw || "(did not throw)",
+  );
 
   threw = "";
-  try { shardRanges(1024, 100, 32); } catch (e) { threw = String((e as Error).message); }
-  ok("more shards than 32-column units is rejected", threw.includes("units"),
-     threw || "(did not throw)");
+  try {
+    shardRanges(1024, 100, 32);
+  } catch (e) {
+    threw = String((e as Error).message);
+  }
+  ok(
+    "more shards than 32-column units is rejected",
+    threw.includes("units"),
+    threw || "(did not throw)",
+  );
 }
 
 // --------------------------------------------------- the slicers are lossless
@@ -146,10 +190,8 @@ async function runSharded(
       }
     }
   }
-  ok("sliceRows reproduces the original bytes for N = 1..5", rowBad === 0,
-     `${rowBad} mismatches`);
-  ok("sliceCols reproduces the original bytes for N = 1..5", colBad === 0,
-     `${colBad} mismatches`);
+  ok("sliceRows reproduces the original bytes for N = 1..5", rowBad === 0, `${rowBad} mismatches`);
+  ok("sliceCols reproduces the original bytes for N = 1..5", colBad === 0, `${colBad} mismatches`);
 
   // And the on-disk-layout slicers, which the CPU reference uses. Deliberately a
   // separate implementation from the split-layout ones, so the two cannot share a
@@ -174,8 +216,11 @@ async function runSharded(
       }
     }
   }
-  ok("the on-disk-layout slicers agree with the split-layout ones", pBad === 0,
-     `${pBad} mismatches`);
+  ok(
+    "the on-disk-layout slicers agree with the split-layout ones",
+    pBad === 0,
+    `${pBad} mismatches`,
+  );
 }
 
 // -------------------------------------- ROW-WISE: bit-identical at every N
@@ -186,7 +231,13 @@ async function runSharded(
 // has idle rows that must still reach every barrier; 64x32 is one block per row,
 // so 63 of 64 lanes contribute zero).
 const SHAPES: [number, number][] = [
-  [64, 32], [30, 1024], [128, 1024], [1024, 1024], [2048, 1024], [3072, 1024], [1024, 3072],
+  [64, 32],
+  [30, 1024],
+  [128, 1024],
+  [1024, 1024],
+  [2048, 1024],
+  [3072, 1024],
+  [1024, 3072],
 ];
 
 console.log("\n-- row-wise (output-split): expected BIT-IDENTICAL\n");
@@ -199,8 +250,11 @@ for (const [rows, cols] of SHAPES) {
     const gpu = await runSharded(packed, x, rows, cols, n, "row");
     let diff = 0;
     for (let i = 0; i < rows; i++) diff = Math.max(diff, Math.abs(gpu[i] - unsharded[i]));
-    ok(`row-wise ${rows}x${cols} N=${n} is bit-identical to unsharded`, diff === 0,
-       `max |diff| ${diff.toExponential(1)}`);
+    ok(
+      `row-wise ${rows}x${cols} N=${n} is bit-identical to unsharded`,
+      diff === 0,
+      `max |diff| ${diff.toExponential(1)}`,
+    );
   }
 }
 
@@ -217,15 +271,20 @@ for (const [rows, cols] of SHAPES) {
     const ref = shardedRowMatvecRef(packed, x, rows, cols, shardRanges(rows, n, 1), LANES);
     for (let i = 0; i < rows; i++) worst = Math.max(worst, Math.abs(ref[i] - unsharded[i]));
   }
-  ok("the row-wise CPU reference is exactly the unsharded reference at N = 1,2,3,4,7",
-     worst === 0, `max |diff| ${worst.toExponential(1)}`);
+  ok(
+    "the row-wise CPU reference is exactly the unsharded reference at N = 1,2,3,4,7",
+    worst === 0,
+    `max |diff| ${worst.toExponential(1)}`,
+  );
 }
 
 // ------------------------- COLUMN-WISE: exact against the SHARDED reference
 //
 // The honest claim. Bit-identical to a reference that models the sharded order,
 // and a MEASURED (not assumed) residual against the unsharded answer.
-console.log("\n-- column-wise (input-split): exact vs the SHARDED reference, reassociated vs unsharded\n");
+console.log(
+  "\n-- column-wise (input-split): exact vs the SHARDED reference, reassociated vs unsharded\n",
+);
 const colResiduals: { shape: string; n: number; rel: number }[] = [];
 for (const [rows, cols] of SHAPES) {
   const w = randVec(rows * cols, 0.05), x = randVec(cols);
@@ -239,9 +298,12 @@ for (const [rows, cols] of SHAPES) {
     const ref = shardedColMatvecRef(packed, x, rows, cols, ranges, LANES);
     let exact = 0;
     for (let i = 0; i < rows; i++) exact = Math.max(exact, Math.abs(gpu[i] - ref[i]));
-    ok(`col-wise ${rows}x${cols} N=${n} matches the FMA-modelled sharded reference exactly`,
-       exact === 0, `max |diff| ${exact.toExponential(1)}` +
-       `  (shards: ${ranges.map((r) => r.count).join("/")})`);
+    ok(
+      `col-wise ${rows}x${cols} N=${n} matches the FMA-modelled sharded reference exactly`,
+      exact === 0,
+      `max |diff| ${exact.toExponential(1)}` +
+        `  (shards: ${ranges.map((r) => r.count).join("/")})`,
+    );
     const rel = absErrScaled(gpu, unsharded, scale);
     colResiduals.push({ shape: `${rows}x${cols}`, n, rel });
   }
@@ -266,19 +328,26 @@ for (const [rows, cols] of SHAPES) {
   const worst = Math.max(...colResiduals.map((r) => r.rel));
   const worstAt = colResiduals.find((r) => r.rel === worst)!;
   for (const r of colResiduals) {
-    if (r.n === 4) console.log(`     ${r.shape.padEnd(10)} N=4  residual/scale ${r.rel.toExponential(1)}`);
+    if (r.n === 4) {
+      console.log(`     ${r.shape.padEnd(10)} N=4  residual/scale ${r.rel.toExponential(1)}`);
+    }
   }
   // The THRESHOLD is 1e-5, three orders below quantization; the MEASURED values
   // come in around 1e-7, five orders below. Both figures are stated because they
   // mean different things: 1e-5 is the bar the assertion holds to (deliberately
   // loose, so it does not become a bit-exactness test by accident on one machine's
   // rounding), and ~1e-7 is what this hardware actually does.
-  ok("column-wise reassociation stays far below Q8_0's own quantization error",
-     worst < 1e-5,
-     `worst ${worst.toExponential(1)} at ${worstAt.shape} N=${worstAt.n}, ` +
-     `vs quantization 1.34e-2 (threshold 1e-5, i.e. 3 orders; measured is ~5)`);
-  ok("column-wise is NOT bit-identical, as predicted (the residual is real)",
-     worst > 0, `worst residual/scale ${worst.toExponential(1)}`);
+  ok(
+    "column-wise reassociation stays far below Q8_0's own quantization error",
+    worst < 1e-5,
+    `worst ${worst.toExponential(1)} at ${worstAt.shape} N=${worstAt.n}, ` +
+      `vs quantization 1.34e-2 (threshold 1e-5, i.e. 3 orders; measured is ~5)`,
+  );
+  ok(
+    "column-wise is NOT bit-identical, as predicted (the residual is real)",
+    worst > 0,
+    `worst residual/scale ${worst.toExponential(1)}`,
+  );
 }
 
 // ----------------------------------------- the reduction, on its own
@@ -317,11 +386,16 @@ for (const [rows, cols] of SHAPES) {
   const ref = shardReduceRef(parts);
   let diff = 0;
   for (let i = 0; i < rows; i++) diff = Math.max(diff, Math.abs(gpu[i] - ref[i]));
-  ok("shard_reduce.wgsl matches shardReduceRef bit-for-bit", diff === 0,
-     `max |diff| ${diff.toExponential(1)}`);
-  ok("the reduction sums in SHARD ORDER, not as a tree",
-     gpu[0] === 1.0,
-     `1.0 + 3x1e-8 gave ${gpu[0]} (serial f32 gives exactly 1; a pairwise tree gives 1.0000000298)`);
+  ok(
+    "shard_reduce.wgsl matches shardReduceRef bit-for-bit",
+    diff === 0,
+    `max |diff| ${diff.toExponential(1)}`,
+  );
+  ok(
+    "the reduction sums in SHARD ORDER, not as a tree",
+    gpu[0] === 1.0,
+    `1.0 + 3x1e-8 gave ${gpu[0]} (serial f32 gives exactly 1; a pairwise tree gives 1.0000000298)`,
+  );
   mv.destroy();
 }
 
@@ -344,11 +418,19 @@ for (const [rows, cols] of SHAPES) {
   const viaSlice = shardReduceRef(ranges.map((rg) =>
     shardMatvecRef(
       slicePackedCols(packed, rows, cols, rg.start, rg.end),
-      x.slice(rg.start, rg.end), rows, rg.count, LANES)));
+      x.slice(rg.start, rg.end),
+      rows,
+      rg.count,
+      LANES,
+    )
+  ));
   let diff = 0;
   for (let i = 0; i < rows; i++) diff = Math.max(diff, Math.abs(viaOffset[i] - viaSlice[i]));
-  ok("col_off into a whole x == a pre-sliced x, exactly", diff === 0,
-     `max |diff| ${diff.toExponential(1)}`);
+  ok(
+    "col_off into a whole x == a pre-sliced x, exactly",
+    diff === 0,
+    `max |diff| ${diff.toExponential(1)}`,
+  );
 }
 
 // ------------------------------------------------------------ real weights
@@ -366,8 +448,11 @@ for (const name of ["blk.24.attn_k.weight", "blk.24.ffn_gate.weight", "blk.24.ff
     const g = await runSharded(t.packed, x, t.rows, t.cols, n, "row");
     let d = 0;
     for (let i = 0; i < t.rows; i++) d = Math.max(d, Math.abs(g[i] - unsharded[i]));
-    ok(`real ${name} row-wise N=${n} bit-identical`, d === 0,
-       `${t.rows}x${t.cols}, max |diff| ${d.toExponential(1)}`);
+    ok(
+      `real ${name} row-wise N=${n} bit-identical`,
+      d === 0,
+      `${t.rows}x${t.cols}, max |diff| ${d.toExponential(1)}`,
+    );
   }
   {
     const n = 3;
@@ -377,8 +462,11 @@ for (const name of ["blk.24.attn_k.weight", "blk.24.ffn_gate.weight", "blk.24.ff
     let d = 0;
     for (let i = 0; i < t.rows; i++) d = Math.max(d, Math.abs(g[i] - ref[i]));
     const resid = absErrScaled(g, unsharded, amax(unsharded));
-    ok(`real ${name} col-wise N=${n} exact vs sharded reference`, d === 0,
-       `max |diff| ${d.toExponential(1)}, residual vs unsharded ${resid.toExponential(1)}`);
+    ok(
+      `real ${name} col-wise N=${n} exact vs sharded reference`,
+      d === 0,
+      `max |diff| ${d.toExponential(1)}, residual vs unsharded ${resid.toExponential(1)}`,
+    );
   }
 }
 
@@ -396,18 +484,34 @@ for (const name of ["blk.24.attn_k.weight", "blk.24.ffn_gate.weight", "blk.24.ff
     // 1 MiB limit against a 1 MB qs binding split 1 way: must refuse and must say
     // how many shards would fit.
     await ShardedMatvec.create(dev, split, rows, cols, 1, "row", { bindingLimit: 400_000 });
-  } catch (e) { threw = String((e as Error).message); }
-  ok("a binding over the limit is refused before upload, not left to write zeros",
-     threw.includes("over the") && threw.includes("shards would fit"),
-     threw || "(did not throw)");
+  } catch (e) {
+    threw = String((e as Error).message);
+  }
+  ok(
+    "a binding over the limit is refused before upload, not left to write zeros",
+    threw.includes("over the") && threw.includes("shards would fit"),
+    threw || "(did not throw)",
+  );
 
   // And the shard count it named must actually work.
   const plan = memShardPlan({ name: "W", rows, cols }, 1, "row", 400_000);
   const need = plan.minShardsForLimit!;
   const mv = await ShardedMatvec.create(
-    dev, split, rows, cols, need, "row", { bindingLimit: 400_000 });
-  ok(`the shard count the error names (${need}) does fit`, true,
-     `largest binding ${memShardPlan({ name: "W", rows, cols }, need, "row", 400_000).maxBindingBytes} bytes under 400000`);
+    dev,
+    split,
+    rows,
+    cols,
+    need,
+    "row",
+    { bindingLimit: 400_000 },
+  );
+  ok(
+    `the shard count the error names (${need}) does fit`,
+    true,
+    `largest binding ${
+      memShardPlan({ name: "W", rows, cols }, need, "row", 400_000).maxBindingBytes
+    } bytes under 400000`,
+  );
   mv.destroy();
 }
 
