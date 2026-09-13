@@ -15,7 +15,8 @@
 // success, on failure, and on Ctrl-C.
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:net';
-import {readdirSync} from 'node:fs';
+import {readdirSync, mkdtempSync, rmSync} from 'node:fs';
+import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 
@@ -118,8 +119,12 @@ if (pick('e2e')) {
   // 8 bird layers rather than the default 24: enough for every scenario (three
   // devices need three), and a real bird page joining streams 67MB instead of
   // 200MB, which is the difference between a test and a download.
+  // Its own state directory, thrown away afterwards: the coordinator persists
+  // the conversation journal and the sessions it issued, and a test run must
+  // neither read a real flock's nor leave its own behind.
+  const stateDir = mkdtempSync(path.join(tmpdir(), 'flock-test-state-'));
   const coord = background([...DENO, 'server/server.js'],
-    {PORT: String(port), FLOCK_NO_TLS: '1', FLOCK_BIRD_LAYERS: '8'});
+    {PORT: String(port), FLOCK_NO_TLS: '1', FLOCK_BIRD_LAYERS: '8', FLOCK_STATE_DIR: stateDir});
   let coordUp = false;
   try {
     await waitFor(async () => (await fetch(`${BASE}/status`)).ok, 240000,
@@ -133,6 +138,9 @@ if (pick('e2e')) {
     const env = {FLOCK_URL: BASE};
     await run('e2e: membership.test.mjs', 'node', ['test/e2e/membership.test.mjs'], {env});
     await run('e2e: churn.test.mjs', 'node', ['test/e2e/churn.test.mjs'], {env});
+    // Session durability needs REAL birds (it asserts on text); it starts and
+    // kills its own.
+    await run('e2e: session.test.mjs', 'node', ['test/e2e/session.test.mjs'], {env});
 
     // The two page-driving tests need the layers covered by REAL birds (they
     // assert on generated text), so a GPU sim holds them all first.
@@ -151,6 +159,10 @@ if (pick('e2e')) {
     stop(sim);
   }
   stop(coord);
+  rmSync(stateDir, {recursive: true, force: true});
+  // The restart test needs a coordinator it can kill, so it starts its own on
+  // another free port with its own state directory.
+  await run('e2e: restart.test.mjs', 'node', ['test/e2e/restart.test.mjs']);
 }
 
 // --- kernels ---------------------------------------------------------------
