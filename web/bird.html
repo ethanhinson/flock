@@ -241,7 +241,47 @@ function progressDone(msg) {
 // identity is a property of a live membership, not of a browser profile: a stale
 // id let one device take over another's slot, and localStorage cannot tell two
 // devices apart when both report navigator.platform as "MacIntel".
+//
+// What IS kept is the SESSION the coordinator issued with that id -- a random
+// token bound to the id, this device's limits and its address -- and only in
+// sessionStorage: per tab, gone when the tab closes, never shared between tabs
+// or devices. A refresh presents it and RE-ATTACHES to the same membership: same
+// peer id, same layers, nobody else moves. The K/V cache in this tab's GPU
+// buffers is gone with the old page, so the coordinator replays the
+// conversation into the new one before the next turn. localStorage stays out:
+// a token that outlived its tab is exactly the stale identity that caused the
+// takeover.
 let peerId = null;
+const store = {
+  get: k => { try { return sessionStorage.getItem(k); } catch { return null; } },
+  set: (k, v) => { try { sessionStorage.setItem(k, v); } catch {} },
+  del: k => { try { sessionStorage.removeItem(k); } catch {} },
+};
+let session = store.get('flock.session');
+let caps = null;            // what the probe measured; the session is bound to it
+let paused = false;         // this tab told the coordinator it is going away
+
+/** Ask the coordinator for a place -- as ourselves, if we have a session. Keeps
+ *  asking while the answer is `wait`: that means a token was in flight and our
+ *  layers are assigned at the next boundary, which is milliseconds, not a
+ *  failure. The peer id and session from any answer are kept: retrying without
+ *  them would be a second join. */
+async function claim() {
+  let j = null;
+  for (let attempt = 0; attempt < 150; attempt++) {
+    j = await (await fetch('/join', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({peer_id: peerId, session, caps,
+                            label: navigator.platform || 'phone'}),
+    })).json();
+    if (j.peer_id) peerId = j.peer_id;
+    if (j.session) { session = j.session; store.set('flock.session', session); }
+    if (!j.wait) break;
+    if (attempt === 0) log(j.reason || 'waiting for a layer assignment');
+    await new Promise(r => setTimeout(r, j.retry_ms || 1200));
+  }
+  return j;
+}
 // True while the FIRST weight stream is in flight. A reassignment during it has to
 // wait, or two loads fight over the same GPU buffers.
 let loading = false, pendingChain = null;
@@ -253,7 +293,6 @@ let loading = false, pendingChain = null;
   // first is the difference between "this device cannot hold layer 39, here is the
   // tensor and the number" and a phone downloading gigabytes and then failing to
   // allocate a buffer. Same module /check runs -- see /js/probe.mjs.
-  let caps = null;
   if (hasGPU) {
     try {
       const p = await probe();
@@ -267,24 +306,10 @@ let loading = false, pendingChain = null;
     } catch (e) { log('could not probe this device: ' + e.message, 'bad'); }
   }
 
-  // Ask for a place, and keep asking if the answer is "wait". `wait` means the
-  // coordinator admitted us but a token was in flight, so our layers get assigned at
-  // the next token boundary -- a reassignment mid-token would move K/V cache the
-  // running token is still writing into. That is milliseconds, not a failure.
-  // A join during a turn is applied when the turn ENDS, so this can take as long
-  // as an answer takes to generate; the coordinator keeps our id across retries.
-  let j = null;
-  for (let attempt = 0; attempt < 150; attempt++) {
-    j = await (await fetch('/join', {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({peer_id: peerId, label: navigator.platform || 'phone',
-                            caps}),
-    })).json();
-    if (!j.wait) break;
-    if (attempt === 0) log(j.reason || 'waiting for a layer assignment');
-    peerId = j.peer_id || peerId;
-    await new Promise(r => setTimeout(r, j.retry_ms || 1200));
-  }
+  // Ask for a place -- with the session from before a refresh, if this tab has
+  // one. A join during a turn is applied when the turn ENDS, so this can take as
+  // long as an answer takes to generate.
+  const j = await claim();
   if (j.error) {
     // There is no "flock full" any more -- any number of devices is allowed in.
     // What CAN fail is that the devices present cannot hold the model, and the
@@ -301,11 +326,12 @@ let loading = false, pendingChain = null;
   }
   meta = j; peerId = j.peer_id;
   if (j.why) log(`share: ${j.why}`);
-  // (Deliberately not persisted -- see the note where peerId is declared.)
   $('layers').textContent = `${meta.start}–${meta.end}`;
   $('of').textContent = `of ${meta.n_total} · ${meta.n_layers} layer` +
                         (meta.n_layers === 1 ? '' : 's');
-  log(`joined as bird ${meta.slot} — I own layers ${meta.start}–${meta.end}`, 'ok');
+  log(j.reattached
+    ? `re-attached after a refresh as bird ${meta.slot} — still own layers ${meta.start}–${meta.end}`
+    : `joined as bird ${meta.slot} — I own layers ${meta.start}–${meta.end}`, 'ok');
 
   // --- weights: streamed from the model host straight into GPU buffers -----
   //
@@ -442,13 +468,15 @@ let loading = false, pendingChain = null;
     layers: layers.length,
   });
   $('join').disabled = false;
-  // A refresh shouldn't drop us out of the flock: if we were a member, rejoin.
-  // A reload means a new membership, so there is nothing to restore. Auto-joining
-  // from a stored flag would claim layers the moment a page is opened -- including
-  // a tab someone left behind -- which is how slots ended up held by devices that
-  // were not really participating.
-  if (new URLSearchParams(location.search).get('join') === '1') {
+  // A refresh must not drop us out of the flock. If this tab had tapped join and
+  // the coordinator re-attached it, carry on as a member without a second tap.
+  // The flag is in sessionStorage, so it dies with the tab: a tab someone left
+  // behind cannot claim layers on the strength of a stored flag, which is how
+  // slots used to end up held by devices that were not really participating.
+  if (new URLSearchParams(location.search).get('join') === '1' ||
+      (j.reattached && store.get('flock.running') === '1')) {
     running = true;
+    store.set('flock.running', '1');
     $('join').textContent = 'leave the flock';
     $('join').classList.add('leave');
     await keepAwake(true);
@@ -502,7 +530,11 @@ function showLink() {
 // back to the coordinator. Only the LAST bird answers the coordinator, so a
 // lap costs one round trip no matter how many devices are in the chain.
 function forward(out, m) {
-  const frame = pack(out, {seq: m.seq, hidden: meta.hidden, offset: m.offset});
+  // The flags travel with the frame. A successor fed over our data channel has
+  // to see the same reset (and the same replay marker) this frame carried, or its
+  // cache keeps growing across a conversation that restarted.
+  const frame = pack(out, {seq: m.seq, hidden: meta.hidden, offset: m.offset,
+                           reset: m.reset, replay: m.replay});
   if (chan && chan.readyState === 'open') { chan.send(frame); return 'bird'; }
   if (inChan && inChan.readyState === 'open') { inChan.send(frame); return 'coord'; }
   ws.send(frame);
@@ -524,6 +556,21 @@ async function runFrame(floats, m) {
     cachedTokens = 0;
     set('cache', '0 tokens');
   }
+  // The frame's position must be where our cache ends. If it is not, the
+  // coordinator and this device disagree about the conversation, and computing
+  // anyway would append keys at the wrong positions -- text that is wrong without
+  // looking wrong. Refusing it makes the coordinator rewind and replay.
+  if (layers[0].nKeys !== m.offset) {
+    const e = new Error(`cache holds ${layers[0].nKeys} positions, frame is at ${m.offset}`);
+    e.desync = true;
+    throw e;
+  }
+  // A REPLAY frame is the conversation being rebuilt into this device after a
+  // refresh, a reassignment or a coordinator restart: journaled history, fed
+  // again verbatim in chunks. It fills the cache like any other frame and goes
+  // on to the next device like any other frame, but it is not a token this
+  // device computed for an answer, so it is not counted or timed as one.
+  if (m.replay && m.reset) log(`replaying the conversation into my cache (from position ${m.offset})`, 'ok');
   const seq = m.seq;
 
   const t0 = performance.now();
@@ -561,8 +608,10 @@ async function runFrame(floats, m) {
   const bytes = cachedTokens * layers.length * 2 * meta.kv_heads * meta.head_dim * 4;
   set('cache', `${cachedTokens} tokens · ${(bytes / 1e6).toFixed(1)}MB`);
 
-  count++;
-  $('count').textContent = count;
+  if (!m.replay) {
+    count++;
+    $('count').textContent = count;
+  }
   set('ms', ms + ' ms');
   set('kb', (floats.length * 2 / 1024).toFixed(1) + ' KB f16');
   $('card').classList.remove('idle');
@@ -701,10 +750,17 @@ async function handleFrame(buf) {
     }
     const {out, ms} = await runFrame(parsed.data, m);
     forward(out, m);
-    ws.send(JSON.stringify({t: 'stats', ms}));
+    // A replay chunk's timing describes a 64-token prefill, not a token; reporting
+    // it would skew the rate the allocator plans on.
+    if (!m.replay) ws.send(JSON.stringify({t: 'stats', ms}));
     clearProblem();
   } catch (e) {
     const msg = String(e.message || e);
+    if (e.desync) {
+      log('refused a frame: ' + msg, 'bad');
+      nack(m, 'desync', msg);
+      return;
+    }
     log('frame failed: ' + msg, 'bad');
     report('frame-failed', msg);
     nack(m, 'failed', msg);
@@ -798,7 +854,9 @@ function connect() {
   ws = new WebSocket(`${scheme}://${location.host}/ws`);
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => {
-    ws.send(JSON.stringify({peer_id: peerId, label: navigator.platform || 'phone'}));
+    // The session proves this socket belongs to the device the peer id was
+    // issued to; the coordinator refuses a hello without it.
+    ws.send(JSON.stringify({peer_id: peerId, session, label: navigator.platform || 'phone'}));
     log('websocket open — waiting for activations', 'ok');
     showLink();
     clearProblem();
@@ -881,23 +939,68 @@ async function keepAwake(on) {
     else if (wake) { await wake.release(); wake = null; }
   } catch (e) { log('wake lock unavailable: ' + e.message); }
 }
-document.addEventListener('visibilitychange', async () => {
-  if (document.visibilityState === 'visible' && running) {
-    await keepAwake(true);
-    if (!ws || ws.readyState > 1) connect();
-    log('tab active again', 'ok');
-  }
+
+/** A message that has to get out even as the page is being suspended or torn
+ *  down. sendBeacon survives unload; fetch usually does not. */
+function beacon(path, body) {
+  const blob = new Blob([JSON.stringify(body)], {type: 'application/json'});
+  if (navigator.sendBeacon) return navigator.sendBeacon(path, blob);
+  fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json'},
+               body: JSON.stringify(body), keepalive: true}).catch(() => {});
+}
+
+// GOING TO THE BACKGROUND, EXPLICITLY. A backgrounded tab cannot compute: iOS
+// suspends its JS, its sockets and its WebGPU work together, and nothing here
+// can change that. What this device CAN do is say so. Told nothing, the
+// coordinator saw a device that was alive-but-silent for its 40s grace and then
+// swept it as dead, with every turn in between waiting on it. Told `pause`, it
+// hands this device's layers to its neighbours within seconds (replaying the
+// conversation into them from its journal), keeps the membership, and places
+// this device again when it re-attaches. So backgrounding is graceful; it is
+// not free -- coming back costs one re-stream (from the IndexedDB cache) and one
+// replay.
+async function pause(why) {
+  if (paused || !running || !peerId) return;
+  paused = true;
+  // Both channels: the socket, if it is still moving, and a beacon, which is
+  // delivered even as the page is suspended.
+  try { if (ws && ws.readyState === 1) ws.send(JSON.stringify({t: 'pause', why})); } catch {}
+  beacon('/pause', {peer_id: peerId, session, why});
+  log(`${why} — told the coordinator to hand my layers on until I am back`);
+}
+
+/** Back in front: re-attach with the session, reconnect, and confirm (or
+ *  re-stream) whatever range the coordinator gives us now. */
+async function resume() {
+  if (!paused) return;
+  paused = false;
+  await keepAwake(true);
+  log('tab active again — re-attaching', 'ok');
+  let j;
+  try { j = await claim(); } catch (e) { log('could not re-attach: ' + e.message, 'bad'); return; }
+  if (j.error) { fatal('could not re-attach after the tab was in the background', j.error, 'Reload to rejoin.'); return; }
+  if (j.wait) { log('the coordinator has not placed this device yet; it will at the next boundary'); }
+  if (!ws || ws.readyState > 1) connect();
+  // The hello that follows gets us the chain message with the range to hold.
+  // If it is the range these layers already are, the coordinator only needs the
+  // confirmation again (it forgot ours when we re-attached); if the socket is
+  // already open, that chain message came while we were away, so confirm now.
+  if (ws && ws.readyState === 1 && j.start === meta.start && j.end === meta.end &&
+      layers && layers.length) sendReady();
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (!running) return;
+  if (document.visibilityState === 'hidden') pause('tab hidden');
+  else if (document.visibilityState === 'visible') resume();
 });
 
-// A closing tab should free its layers rather than wait to age out.
-addEventListener('pagehide', () => {
-  if (!peerId || !running) return;
-  const body = JSON.stringify({peer_id: peerId, why: 'tab closed'});
-  // sendBeacon survives unload; fetch usually does not.
-  if (navigator.sendBeacon) {
-    navigator.sendBeacon('/leave', new Blob([body], {type: 'application/json'}));
-  }
-});
+// A tab being closed or navigated away from fires this too, and a REFRESH fires
+// it as well. Pausing rather than leaving is right for all three: a refresh is
+// back with its session in a second and nothing moves (the coordinator waits a
+// short grace before handing a paused device's layers on); a closed tab's
+// session dies with it and the membership lapses on its own.
+addEventListener('pagehide', () => pause('page hidden or closing'));
 
 $('join').onclick = async () => {
   running = !running;
@@ -905,8 +1008,13 @@ $('join').onclick = async () => {
   $('join').classList.toggle('leave', running);
 
   await keepAwake(running);
-  if (running) { clearProblem(); connect(); }
+  if (running) { clearProblem(); store.set('flock.running', '1'); connect(); }
   else {
+    // Leaving on purpose ends the membership, so the session is worthless: drop
+    // it, or a refresh would present a token the coordinator has revoked.
+    store.del('flock.running');
+    store.del('flock.session');
+    session = null;
     // Say so, rather than just dropping the socket. A closed socket and a refresh
     // look identical to the coordinator, so it waits out the 40s liveness grace
     // period before handing these layers on -- during which the flock is uncovered.
