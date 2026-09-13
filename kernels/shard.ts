@@ -303,17 +303,11 @@ export class ShardedMatvec {
    */
   encode(enc: GPUCommandEncoder) {
     const p = enc.beginComputePass();
-    p.setPipeline(this.matvec);
-    for (let i = 0; i < this.shards.length; i++) {
-      p.setBindGroup(0, this.bgs[i]);
-      p.dispatchWorkgroups(this.shards[i].groups);
-    }
+    this.dispatchShards(p);
     p.end();
     if (this.direction === "col") {
       const p2 = enc.beginComputePass();
-      p2.setPipeline(this.reduce!);
-      p2.setBindGroup(0, this.reduceBg!);
-      p2.dispatchWorkgroups(Math.ceil(this.rows / REDUCE_WG));
+      this.dispatchReduce(p2);
       p2.end();
     }
   }
@@ -321,11 +315,7 @@ export class ShardedMatvec {
   /** Encode ONLY the shard matvecs, no reduction. For isolating the reduce cost. */
   encodeShardsOnly(enc: GPUCommandEncoder) {
     const p = enc.beginComputePass();
-    p.setPipeline(this.matvec);
-    for (let i = 0; i < this.shards.length; i++) {
-      p.setBindGroup(0, this.bgs[i]);
-      p.dispatchWorkgroups(this.shards[i].groups);
-    }
+    this.dispatchShards(p);
     p.end();
   }
 
@@ -333,10 +323,41 @@ export class ShardedMatvec {
   encodeReduceOnly(enc: GPUCommandEncoder) {
     if (this.direction !== "col") throw new Error("row-wise sharding has no reduction");
     const p = enc.beginComputePass();
+    this.dispatchReduce(p);
+    p.end();
+  }
+
+  /**
+   * The N shard dispatches into an EXISTING pass, for a benchmark that wants many
+   * repetitions behind one fence.
+   *
+   * bench.ts's method requires this: a map readback is ~24 ms, so a 20 us matvec
+   * has to be measured as a batch of thousands of dispatches with the fence's cost
+   * subtracted. Putting each repetition in its own pass -- which is what calling
+   * `encode()` in a loop does -- builds thousands of compute passes into one
+   * command buffer, and on this backend that WEDGES: the submit never completes
+   * and mapAsync never resolves, at 0% CPU, which looks exactly like a slow
+   * benchmark rather than a hang. Found by watching a 2000-rep batch sit at
+   * 0.19 s of CPU time indefinitely.
+   *
+   * A benchmark using these is measuring the dispatches and not the pass
+   * boundaries, which is the right unit anyway: a real forward pass encodes one
+   * pass covering many operations, exactly like layer.ts does.
+   */
+  dispatchShards(p: GPUComputePassEncoder) {
+    p.setPipeline(this.matvec);
+    for (let i = 0; i < this.shards.length; i++) {
+      p.setBindGroup(0, this.bgs[i]);
+      p.dispatchWorkgroups(this.shards[i].groups);
+    }
+  }
+
+  /** The reduce dispatch into an existing pass. Column-wise only. */
+  dispatchReduce(p: GPUComputePassEncoder) {
+    if (this.direction !== "col") throw new Error("row-wise sharding has no reduction");
     p.setPipeline(this.reduce!);
     p.setBindGroup(0, this.reduceBg!);
     p.dispatchWorkgroups(Math.ceil(this.rows / REDUCE_WG));
-    p.end();
   }
 
   /** The buffer holding the final y. */

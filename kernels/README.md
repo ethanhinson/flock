@@ -20,12 +20,17 @@ deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_o
 deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_model.ts   # WHOLE MODEL vs the ONNX pipeline
 deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_frombuffers.ts # the bird's constructor == the tested one
 deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_split.ts  # sharded across a cut == unsplit
+deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_shard.ts      # TENSOR-PARALLEL matvec, both directions
+deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_shard_head.ts # tensor-parallel LM head
+deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/test_shard_mem.ts  # per-shard buffers under a limit
 deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/bench.ts        # matvec benchmark
 deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/bench_layer.ts  # layer benchmark
 deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/bench_model.ts  # embedding, head, prefill, token
+deno run --unstable-webgpu --allow-all --config kernels/deno.json kernels/bench_shard.ts  # sharding overhead, incl. the reduction
 ```
 
-189 assertions, all passing, stable across repeated runs.
+189 assertions in the pre-tensor-parallel suite plus 127 in the three shard
+suites, all passing, stable across repeated runs.
 
 ## Status
 
@@ -61,6 +66,10 @@ onnxruntime-node, with the same tokenizer and chat template.
 | Whole layer, prefill | `layer.ts` | CPU ref 2e-7; **bit-identical to N decode steps** |
 | Whole model | `model.ts` | **same token ids as the ONNX pipeline** |
 | Whole model, sharded at a cut | `model.ts` | **bit-identical to the unsplit pass** |
+| Matvec, tensor-parallel row-wise | `q8_shard.wgsl` | unsharded kernel, **bit-identical**, N = 1-4 |
+| Matvec, tensor-parallel column-wise | `q8_shard.wgsl` | FMA-modelled sharded-order CPU ref, **bit-exact** |
+| Partial-sum reduction | `shard_reduce.wgsl` | strict-f32 serial CPU ref, **bit-exact** |
+| LM head, tensor-parallel | `shard.ts` | unsharded engine, **all 151936 logits bit-identical** |
 | Layer from pre-built GPU buffers | `layer.ts` | **bit-identical to `Layer.create`** |
 
 The strongest single piece of evidence is not a tolerance. `encodePrefill(N)` is
@@ -110,6 +119,137 @@ assertions in `test_model.ts`:
   small and the failure is silent (see below).
 - **`unpack4xI8` is still unbenchmarkable here** — Deno's wgpu does not
   implement it, so the fallback path is what all of these numbers describe.
+- **Tensor parallelism is validated but not wired into `Model`.** `shard.ts`
+  holds N shards of one tensor and `ShardedHead` runs a sharded LM head
+  correctly, but `Model` still binds `token_embd` as one buffer. Wiring it in is
+  a `Model` change, and the coordinator/mesh side that would place shards on
+  different devices is owned elsewhere. See "Tensor parallelism" below.
+
+## Tensor parallelism: splitting ONE tensor
+
+Layer-range splitting (`test_split.ts`) has a hard ceiling: **no number of
+devices makes a single tensor smaller.** Qwen3-14B Q4_K_M's `output.weight` is
+**638 MB as one tensor** with `tie_word_embeddings: False`, so it cannot be
+shared with the embedding, and WebGPU's default `maxStorageBufferBindingSize` is
+**128 MiB**. This adapter grants 4295 MB, which is why the 0.6B model works here
+at all; a phone does not.
+
+`q8_shard.wgsl` is `q8_coop.wgsl`'s inner loop plus two uniforms (`out_off`,
+`col_off`). Both split directions are built, because "one is better" is not a
+finding unless the other exists and was measured.
+
+| | row-wise (output-split) | column-wise (input-split) |
+|---|---|---|
+| shard owns | rows `[r0, r1)` | cols `[c0, c1)` of every row |
+| needs | the WHOLE `x` | only `x[c0:c1]` |
+| produces | `y[r0:r1]`, concatenates | a PARTIAL `y`, must be summed |
+| vs unsharded | **bit-identical** | reassociated, 1-3 ULP |
+| the slice is | a contiguous byte range | strided, needs a gather |
+| argmax | max of per-shard pairs, free | needs the full reduction first |
+
+**Row-wise was chosen for the LM head.** Row `r`'s 64 lanes walk the same
+`cols/32` blocks in the same order whether the shard holds 4 rows or 151936 —
+`row` is an address, not an operand — so the result is bit-identical, asserted
+as `=== 0` at N = 1-4 including non-divisible splits. Column-wise **cannot** be:
+N shards partition each row's blocks before the lanes see them, so f32 addition
+reassociates. That is asserted honestly instead — bit-identical to an
+FMA-modelled strict-f32 reference **of the sharded order**, which is strictly
+stronger than a tolerance against the unsharded answer, because a 1e-6 tolerance
+would not notice one wrong block out of 32.
+
+The measured residual of column-wise against unsharded is **7.4e-8 to 1.7e-7**
+of the output scale, across every shape and shard count. For scale: Q8_0
+quantization itself costs **1.34e-2** (measured, `test_onnx.ts`), so
+reassociation is five orders of magnitude smaller than the error the model
+already carries.
+
+### Memory, which is the entire point
+
+| tensor | unsharded | 64MiB | 128MiB | 256MiB | 1GiB |
+|---|---|---|---|---|---|
+| Qwen3-0.6B `token_embd` (Q8_0, tied) | 155.6 MB | 3 | 2 | 1 | 1 |
+| Qwen3-14B `output.weight` (Q6_K) | 638.1 MB | 10 | 5 | 3 | 1 |
+| a 248320-row head (Q8_0, 5120 wide) | 1271.4 MB | 19 | 10 | 5 | 2 |
+
+Shard counts needed to fit one binding. **The 638 MB tensor split 8 ways is
+79.8 MB per binding**, under 128 MiB. Every reported minimum is verified to fit
+*and* one fewer to not fit. The real 155.6 MB tied tensor is uploaded as 5 and 8
+shards under a simulated 32 MiB limit and the answer stays bit-identical.
+
+The limit applies **per binding**, not per shard: `qs` and `scales` are separate
+bindings, so a shard with 130 MB of `qs` and 9 MB of `scales` fails a 128 MiB
+limit on `qs` alone. The check is arithmetic and happens *before* upload, because
+an oversized binding is a validation error that makes a kernel write zeros rather
+than throwing (correctness trap 3).
+
+Capacity relief is the same in both directions — `rows * cols / N` either way —
+so **memory does not choose the direction.** Bit-exactness, contiguity and wire
+traffic do.
+
+### What crosses the wire
+
+Per call at N=4, computed from the shapes:
+
+| | row-wise | column-wise | ratio |
+|---|---|---|---|
+| LM head 151936x1024 | 610 KB | 2378 KB | 3.9x |
+| LM head 248320x5120 | 1050 KB | 3900 KB | 3.7x |
+| ffn_down 1024x3072 | 52 KB | 28 KB | **0.5x** |
+
+Row-wise broadcasts `cols` floats of `x` and collects `rows/N` back per shard;
+column-wise sends `cols/N` and collects a **full-length** partial back from every
+shard. An LM head's output is the whole vocabulary, so column-wise loses badly
+there — but `ffn_down` is wider than it is tall and column-wise wins. **The
+direction is a per-tensor choice, not a global one.**
+
+### What it costs, on ONE device
+
+`bench_shard.ts`. All shards run on the same GPU in the same queue, so **nothing
+here is parallel** — this measures the overhead of splitting, not the speedup of
+N devices, which this machine cannot demonstrate. Sharding on one device is
+expected to be slower; it buys capacity, exactly like pipeline parallelism.
+Map fence 24.25 ms subtracted; the per-dispatch floor is **18.46 us**.
+
+The real tied LM head, 151936 x 1024, us per call:
+
+| dir | N | shards | reduce | total | vs N=1 | GB/s | largest binding |
+|---|---|---|---|---|---|---|---|
+| row | 1 | 732.3 | — | 732.3 | 1.00x | 226 | 155.6 MB |
+| row | 2 | 754.6 | — | 754.6 | **1.03x** | 219 | 77.8 MB |
+| row | 4 | 797.1 | — | 797.1 | **1.09x** | 207 | 38.9 MB |
+| row | 8 | 873.8 | — | 873.8 | **1.19x** | 189 | 19.4 MB |
+| col | 1 | 733.3 | 38.7 | 772.0 | 1.00x | 214 | 155.6 MB |
+| col | 2 | 1590.4 | 23.2 | 1613.6 | **2.09x** | 102 | 77.8 MB |
+| col | 4 | 3158.2 | 30.0 | 3188.2 | **4.13x** | 52 | 38.9 MB |
+| col | 8 | 6322.7 | 31.2 | 6353.9 | **8.23x** | 26 | 19.4 MB |
+
+**Row-wise sharding of the head is nearly free**, and the overhead is accounted
+for rather than asserted: +64.7 us at N=4 against `3 x 18.46 = 55.4 us` of extra
+dispatch floor. An 8-way split of the largest tensor in the model — the one that
+does not fit a default-limits device at all — costs **19%**.
+
+**Column-wise costs a factor of N, and that is not dispatch overhead.** At N=8 it
+is 5582 us slower than unsharded, of which dispatches are 129 us and the
+reduction 31 us; **~5400 us is unexplained by either.** The cause is lane
+starvation and it is structural: `q8_shard.wgsl` gives every row `LANES = 64`
+threads walking that row's `n_cols/32` blocks, and a column shard shrinks the
+block count without shrinking the lane count. At `cols = 1024` a shard has 32
+blocks unsharded (half the lanes already idle) and **4 blocks at N=8, so 60 of 64
+lanes contribute nothing** while still paying a full workgroup and a full 64-wide
+tree reduction. Row-wise keeps every row's full column count, so every lane stays
+fed — the same property that makes it bit-identical, showing up as a performance
+result too.
+
+A column-wise kernel that scaled `LANES` down with `n_cols` and `ROWS_PER_WG` up
+to keep the workgroup full would recover most of this. It is **not written**: the
+head is row-wise, where the problem does not arise.
+
+At layer-sized shapes both directions are ~`N x` the unsharded cost, because a
+1024x1024 matvec is 24 us against an 18.5 us dispatch floor — it *is* the floor,
+so it cannot absorb `N-1` more of them. The reduce dispatch is 18.6-19.7 us at
+every shape and shard count, i.e. **the reduction's arithmetic is free and only
+its dispatch costs anything.** Sharding a layer projection is therefore never
+worth it on capacity grounds alone; the head is the only tensor that needs it.
 
 ## Benchmarks
 
@@ -300,7 +440,7 @@ the WGSL side would be plausible and wrong.
 
 ## The measurement traps
 
-Six of these cost real time. They are documented because each one produced
+Eight of these cost real time. They are documented because each one produced
 confident, plausible, wrong numbers.
 
 **1. `onSubmittedWorkDone()` does not wait.** On Deno 2.1.2's wgpu it returns
@@ -375,6 +515,25 @@ metric built at those positions can discriminate. The assertion now runs at
 This is trap 4's deeper form — before choosing a tolerance, check that the
 quantity has any signal-to-noise margin at all.
 
+**7. Thousands of compute PASSES in one command buffer wedge the backend.**
+Dispatches batch; passes do not. Benchmarking a sharded matvec by calling
+`encode()` 2000 times behind one fence builds 2000 compute passes into one
+command buffer, and the submit never completes — `mapAsync` never resolves, at
+**0% CPU and 0.19 s of total CPU time**. That is indistinguishable from "the
+benchmark is just slow" until you look at the process, which is why it cost a
+full run. `bench_shard.ts` puts the repetitions inside ONE pass
+(`dispatchShards`), which is also the right unit: a real forward pass encodes one
+pass over many operations.
+
+**8. An error whose magnitude does not move with N is not a sharding error.**
+A sharded-head test failed by 5.6 at N = 2, 4 and 8 — the *same* number. The
+cause was upstream of the split entirely: `logits(PROMPT)` then
+`normedState(PROMPT)` on the same `Model` runs the prompt twice, at positions
+16..31, with the first pass's keys still cached, producing a perfectly valid
+hidden state for a different input. Worth stating as a rule because the shape of
+the number localized the bug faster than reading the code did: sharding errors
+scale with the shard count, and anything constant in N is in the input.
+
 ## Device-specific gotchas
 
 - **`unpack4xI8` / `unpack4xU8` / `dot4I8Packed` are not implemented by Deno
@@ -437,6 +596,8 @@ layer.ts          Layer: encode() / encodePrefill(), KV cache, bind-group cache
 layer_ref.ts      CPU reference layer (decode and prefill), from the per-op refs
 model.ts          Model: ids -> embedding -> 28 layers -> norm -> head -> argmax
 real_weights.ts   range-fetch GGUF tensors/layers, or the whole model, in .cache/
+shard.ts          ShardedMatvec / ShardedHead: one tensor across N shards
+shard_ref.ts      shard planning, the slicers, and both directions' CPU refs
 dequant.ts        Q8_0 -> f32, and the quantization-term estimator
 onnx_truth.mjs    runs web/shard0.onnx under Node (native addon, cannot use Deno)
 onnx_full.mjs     runs the WHOLE ONNX pipeline + tokenizer, for the text diff
