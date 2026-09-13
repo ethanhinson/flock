@@ -59,7 +59,7 @@ function mk(tag) {
   return n;
 }
 for (const id of ['sub', 'pipe', 'convo', 'empty', 'ctx', 'diag', 'q',
-                  'send', 'clear', 'f']) {
+                  'send', 'clear', 'f', 'allocbox', 'allocsum', 'alloc']) {
   const n = mk('div'); n.id = id; nodes.set(id, n);
 }
 globalThis.document = {
@@ -111,6 +111,23 @@ check(`coordinator + ${nBirds} bird(s) + ${nBirds} arrow(s) rendered`,
 check('every device shows its layer range',
   flat(pipe).filter(t => /^layers /.test(t)).length === 1 + nBirds);
 check('header reports the flock ready', /layers/.test(sub.innerHTML));
+
+// The allocation panel is the ONLY place a human can see why a device got the share
+// it did, which is a requirement of a speed-weighted split and not a nicety: an
+// unfair-looking assignment and a broken allocator look identical without it.
+const allocSum = nodes.get('allocsum'), alloc = nodes.get('alloc');
+console.log('alloc sum :', (allocSum.innerHTML || allocSum.textContent));
+check(`the allocation summary names the device count and the layer range`,
+  new RegExp(`${nBirds} device`).test(allocSum.innerHTML) &&
+  /layers \d+-\d+/.test(allocSum.innerHTML), allocSum.innerHTML);
+check('the panel explains each device\'s share in bytes',
+  /% of the bird bytes/.test(alloc.innerHTML), alloc.innerHTML.slice(0, 120));
+check('the panel shows what an even split would have cost',
+  /an even split of the same layers/.test(alloc.innerHTML));
+check('the panel shows per-layer sizes, so the byte spread is visible',
+  /per-layer size:/.test(alloc.innerHTML));
+check('the panel reports the last rebalance decision verbatim',
+  /last decision:/.test(alloc.innerHTML));
 
 // --- drive one real turn through the page's own send() ----------------------
 console.log('\nstreaming a turn through the page logic…');

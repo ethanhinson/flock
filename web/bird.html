@@ -114,6 +114,9 @@
 import {pack, unpack} from '/js/wire.mjs';
 import {loadBirdWeights} from '/js/gguf-stream.mjs';
 import {Layer, QWEN3_06B} from '/kernels/layer.ts.js';
+// The SAME probe /check runs, not a second copy. What this device reports at /join
+// is what the allocator plans against, and what a human can read at /check.
+import {probe} from '/js/probe.mjs';
 
 const $ = id => document.getElementById(id);
 const log = (m, cls = '') => {
@@ -207,47 +210,59 @@ function progressDone(msg) {
 // phones joining the same flock get different slices automatically.
 let peerId = localStorage.getItem('flock_peer') || null;
 (async () => {
-  // What can this device actually do? A buffer limit smaller than the shard is
-  // an instant, explainable failure rather than a mysterious OOM.
+  // WHAT CAN THIS DEVICE ACTUALLY DO -- measured, and measured BEFORE joining.
+  //
+  // The coordinator will not give this device a layer whose largest tensor exceeds
+  // its maxStorageBufferBindingSize, so these numbers decide the share. Getting them
+  // first is the difference between "this device cannot hold layer 39, here is the
+  // tensor and the number" and a phone downloading gigabytes and then failing to
+  // allocate a buffer. Same module /check runs -- see /js/probe.mjs.
+  let caps = null;
   if (hasGPU) {
     try {
-      // requestAdapter can hang on some mobile drivers rather than rejecting,
-      // which leaves the page on its initial "checking" text forever. Race it.
-      const ad = await Promise.race([
-        navigator.gpu.requestAdapter(),
-        new Promise((_, rej) => setTimeout(() => rej(new Error(
-          'requestAdapter did not answer within 10s')), 10000)),
-      ]);
-      if (!ad) throw new Error('no GPU adapter (WebGPU present but no device)');
-      const L = ad.limits;
-      const maxBuf = L.maxBufferSize, maxBind = L.maxStorageBufferBindingSize;
-      capability.maxBufferSize = maxBuf;
-      // adapter.info THROWS on Safari unless a flag is set, so it must never be
-      // read outside its own try -- it used to take the whole probe down.
-      let vendor = null, arch = null;
-      try { vendor = ad.info?.vendor; arch = ad.info?.architecture; } catch {}
-      capability.vendor = vendor;
-      log(`gpu limits: buffer ${(maxBuf/1e6).toFixed(0)}MB, ` +
-          `binding ${(maxBind/1e6).toFixed(0)}MB`, 'ok');
-      report('limits', {maxBufferSize: maxBuf,        // not awaited: a slow or
-                        maxStorageBufferBindingSize: maxBind,   // blocked /diag
-                        vendor, arch});                         // must not block
-    } catch (e) {
-      log('could not query gpu limits: ' + e.message, 'bad');
-      report('limits-failed', String(e.message || e));
-    }
+      const p = await probe();
+      caps = p.caps;
+      capability.maxBufferSize = caps.maxBufferSize;
+      capability.vendor = caps.vendor;
+      log(`gpu limits: buffer ${(caps.maxBufferSize/1e6).toFixed(0)}MB, ` +
+          `binding ${(caps.maxStorageBufferBindingSize/1e6).toFixed(0)}MB` +
+          (p.detail.computeOk ? ', a real compute pass ran' : ''), 'ok');
+      await report('limits', caps);
+    } catch (e) { log('could not probe this device: ' + e.message, 'bad'); }
   }
-  const j = await (await fetch('/join', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({peer_id: peerId, label: navigator.platform || 'phone'}),
-  })).json();
+
+  // Ask for a place, and keep asking if the answer is "wait". `wait` means the
+  // coordinator admitted us but a token was in flight, so our layers get assigned at
+  // the next token boundary -- a reassignment mid-token would move K/V cache the
+  // running token is still writing into. That is milliseconds, not a failure.
+  let j = null;
+  for (let attempt = 0; attempt < 40; attempt++) {
+    j = await (await fetch('/join', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({peer_id: peerId, label: navigator.platform || 'phone',
+                            caps}),
+    })).json();
+    if (!j.wait) break;
+    if (attempt === 0) log(j.reason || 'waiting for a layer assignment');
+    peerId = j.peer_id || peerId;
+    await new Promise(r => setTimeout(r, j.retry_ms || 1200));
+  }
   if (j.error) {
-    problem('the flock is full', j.error,
-            'Every layer slot already has a device. Rebuild with more birds, or ' +
-            'wait for one to leave.');
+    // There is no "flock full" any more -- any number of devices is allowed in.
+    // What CAN fail is that the devices present cannot hold the model, and the
+    // coordinator says which tensor on which device and by how much.
+    problem('this flock cannot hold the model', j.error,
+            'Add a device with a bigger maxStorageBufferBindingSize, use a more ' +
+            'quantized model, or open /check on each device to see its limits.');
+    return;
+  }
+  if (j.wait) {
+    problem('the coordinator never assigned any layers', j.reason || 'still waiting',
+            'Reload to try again. If a turn is generating, it will finish first.');
     return;
   }
   meta = j; peerId = j.peer_id;
+  if (j.why) log(`share: ${j.why}`);
   localStorage.setItem('flock_peer', peerId);
   $('layers').textContent = `${meta.start}–${meta.end}`;
   $('of').textContent = `of ${meta.n_total} · ${meta.n_layers} layer` +
@@ -336,12 +351,16 @@ let peerId = localStorage.getItem('flock_peer') || null;
   // avoided. Same kernels either way -- kernels/test_frombuffers.ts asserts the
   // two constructors are bit-identical.
   progress('building layers', 1, 1);
-  layers = [];
+  // Built locally and published in one statement, same as reassign() -- see the note
+  // there. Nothing can arrive here yet (the socket opens only once join is enabled),
+  // but keeping the two paths identical means there is no case to reason about.
+  const built = [];
   for (let i = meta.start; i <= meta.end; i++) {
     const w = got.layers[i];
     if (!w) throw new Error(`the loader returned no tensors for layer ${i}`);
-    layers.push(await Layer.fromBuffers(device, w, QWEN3_06B));
+    built.push(await Layer.fromBuffers(device, w, QWEN3_06B));
   }
+  layers = built;
   progressDone('ready');
   set('backend', capability.backend, 'ok');
   await report('gguf-loaded', {
@@ -373,9 +392,9 @@ let peerId = localStorage.getItem('flock_peer') || null;
     problem('this device ran out of memory',
       'The weights needed more memory than this device would give the browser.\n' +
       m,
-      'Try: close other tabs and apps, then reload. Or split the model across ' +
-      'more devices so each one holds fewer layers (start the coordinator with ' +
-      'FLOCK_BIRDS set higher).');
+      'Try: close other tabs and apps, then reload. Or open /flock on another ' +
+      'device and tap join — the coordinator re-splits the layers across however ' +
+      'many devices are present, so each one holds fewer.');
   } else if (/fetch failed|short read|NetworkError|Load failed/i.test(m)) {
     problem('the download did not finish', m,
       'Check that this device is still on the same wifi as the coordinator, ' +
@@ -412,6 +431,13 @@ function forward(out, m) {
 }
 
 async function runFrame(floats, m) {
+  // A frame that arrives while we are between assignments has nowhere to go.
+  // Throwing names it; computing with a short chain would put the wrong layers at
+  // the right positions and answer plausible garbage.
+  if (!layers || !layers.length) {
+    throw new Error('this device is not holding any layers right now (a ' +
+                    'reassignment is in flight)');
+  }
   // A reset means the conversation restarted, so OUR slice of the K/V cache is
   // stale. Each Layer owns its own, so each one clears it.
   if (m.reset) {
@@ -464,6 +490,84 @@ async function runFrame(floats, m) {
   $('card').classList.add('live');
   setTimeout(() => $('card').classList.remove('live'), 120);
   return {out, ms};
+}
+
+/**
+ * Our range changed: stream the new layers and swap them in.
+ *
+ * Happens when a device joins or leaves, or when the measured timings say this
+ * device should hold more or fewer layers. The old Layers are dropped BEFORE the new
+ * ones are streamed -- holding both sets at once is exactly the peak a phone cannot
+ * afford, and it is the whole reason the loader streams in the first place.
+ *
+ * `L.destroy?.()` is optional on purpose: kernels/layer.ts has no destroy() (that
+ * file belongs to another agent), so today this is a no-op and the GPU buffers are
+ * reclaimed when the Layer objects are collected. Dropping the references first is
+ * what actually matters; the call is here so a real destroy() starts being used the
+ * day one exists, rather than needing this to be found again.
+ *
+ * Layers are NOT reused even where the ranges overlap. They could be, and it would
+ * save a re-download, but a Layer owns its K/V cache and a reassignment has already
+ * cost the conversation its context (the coordinator drops it, because the cache is
+ * sharded by layer and a moved layer leaves its keys behind). Keeping one stale cache
+ * would be the one case that silently disagrees with the rest.
+ */
+async function reassign(m) {
+  const from = meta.start != null ? `${meta.start}–${meta.end}` : 'nothing';
+  log(`reassigned: ${from} → ${m.start}–${m.end}`, 'ok');
+  if (m.start == null) {
+    // Still a member, holding nothing. Can happen between a join and the next token
+    // boundary, and when the flock has more devices than layers.
+    for (const L of layers || []) { try { L.destroy?.(); } catch {} }
+    layers = [];
+    meta = {...meta, start: null, end: null, slot: -1};
+    $('layers').textContent = '—';
+    $('of').textContent = 'no layers assigned';
+    showLink();
+    return;
+  }
+  const prev = layers || [];
+  layers = [];
+  for (const L of prev) { try { L.destroy?.(); } catch {} }
+  meta = {...meta, start: m.start, end: m.end, slot: m.slot,
+          n_layers: m.end - m.start + 1};
+  $('layers').textContent = `${meta.start}–${meta.end}`;
+  $('of').textContent = `of ${meta.n_total} · ${meta.n_layers} layer` +
+                        (meta.n_layers === 1 ? '' : 's');
+  try {
+    progress(`re-streaming layers ${meta.start}–${meta.end}`, 0, 1);
+    const got = await loadBirdWeights(device, meta.gguf, meta.start, meta.end, {
+      onNote: s => log('gguf: ' + s),
+    });
+    // Build into a LOCAL array and publish it in one statement at the end. Pushing
+    // into `layers` directly is a real hazard rather than a style point: every await
+    // here yields to the event loop, so a frame arriving mid-build would find `layers`
+    // holding 1 of N built layers, pass runFrame's non-empty check, and compute over a
+    // partial chain -- the wrong layers at the right positions, which is exactly the
+    // plausible garbage that guard exists to prevent.
+    const next = [];
+    for (let i = meta.start; i <= meta.end; i++) {
+      const w = got.layers[i];
+      if (!w) throw new Error(`the loader returned no tensors for layer ${i}`);
+      next.push(await Layer.fromBuffers(device, w, QWEN3_06B));
+    }
+    layers = next;
+    progressDone('ready');
+    cachedTokens = 0;
+    set('cache', '0 tokens');
+    log(`holding layers ${meta.start}–${meta.end} now`, 'ok');
+    if (m.next_peer && !chan) openRTC(m.next_peer);
+    showLink();
+  } catch (e) {
+    const msg = String(e.message || e);
+    layers = [];
+    log('reassignment failed: ' + msg, 'bad');
+    report('reassign-failed', msg);
+    problem('could not take the new layers', msg,
+      'The coordinator gave this device a different share and the weights did not ' +
+      'load. Reload to rejoin; the coordinator will hand these layers to another ' +
+      'device meanwhile.');
+  }
 }
 
 /** Run one frame and hand the result on; any throw here is fatal to the lap, so
@@ -586,6 +690,13 @@ function connect() {
       if (m.t === 'signal') return onSignal(m.from, m.data);
       if (m.t === 'chain') {
         chain = m;
+        // The coordinator re-splits the layers whenever a device joins or leaves, or
+        // when the timings say this device should hold more or fewer. So a chain
+        // message can carry a DIFFERENT range than the one we loaded -- reload the
+        // weights rather than keep computing the layers we happen to have, which
+        // would put the wrong layers at the right positions and produce text that is
+        // wrong without looking wrong.
+        if (m.start !== meta.start || m.end !== meta.end) return reassign(m);
         if (m.next_peer && !chan) openRTC(m.next_peer);
         showLink();
       }
@@ -639,6 +750,19 @@ $('join').onclick = async () => {
   localStorage.setItem('flock_joined', running ? '1' : '0');
   await keepAwake(running);
   if (running) { clearProblem(); connect(); }
-  else if (ws) { ws.close(); $('card').classList.add('idle'); }
+  else {
+    // Say so, rather than just dropping the socket. A closed socket and a refresh
+    // look identical to the coordinator, so it waits out the 40s liveness grace
+    // period before handing these layers on -- during which the flock is uncovered.
+    // Leaving on purpose gets them reassigned immediately.
+    try {
+      await fetch('/leave', {method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({peer_id: peerId})});
+      log('left the flock — the coordinator is re-splitting the layers', 'ok');
+    } catch (e) { log('could not tell the coordinator we left: ' + e.message); }
+    if (ws) ws.close();
+    $('card').classList.add('idle');
+  }
 };
 </script>

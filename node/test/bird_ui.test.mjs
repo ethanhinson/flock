@@ -98,6 +98,10 @@ const layerURL = new URL('../../kernels/layer.ts', import.meta.url).href;
 
 const rewritten = src
   .replace("from '/js/wire.mjs'", `from '${wireURL}'`)
+  // The REAL probe: it runs against this machine's actual adapter, so the caps this
+  // harness sends at /join are the same ones a phone would send.
+  .replace("from '/js/probe.mjs'",
+           `from '${new URL('../../web/js/probe.mjs', import.meta.url).href}'`)
   .replace("from '/js/gguf-stream.mjs'", `from '${ggufURL}'`)
   .replace("from '/kernels/layer.ts.js'", `from '${layerURL}'`)
   // Same-origin paths -> the coordinator under test.

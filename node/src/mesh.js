@@ -3,6 +3,18 @@
 // Every link is a WebRTC data channel: coordinator <=> bird, and bird <=> bird.
 // The websocket exists ONLY to carry offers/answers/ICE. Once a channel opens,
 // no activation touches it again.
+//
+// MEMBERSHIP IS DYNAMIC. This used to be a fixed array of N slots built from
+// FLOCK_BIRDS at startup: a third phone pointed at a two-slot coordinator got
+// "flock full" and the only way to change N was a restart. Now the flock is a LIST
+// that grows and shrinks, and the layer assignment is recomputed from the devices
+// actually present -- by the allocator in ./allocate.js, weighted by each device's
+// measured speed and constrained by its real GPU limits.
+//
+// `slot` survives as the chain POSITION rather than a reservation: it is an index
+// into the current ordering, reassigned on every membership change, and the bird
+// page and chat page both key their DOM off it. Ordering is join order, which the
+// allocator relies on being stable.
 import nodeDataChannel from 'node-datachannel';
 // Buffer is an implicit global under Node but not under Deno, and the server runs
 // under Deno because the coordinator needs a GPU. Imported rather than replaced:
@@ -10,13 +22,18 @@ import nodeDataChannel from 'node-datachannel';
 // transport keeps using exactly what it used before.
 import {Buffer} from 'node:buffer';
 import {pack, unpack} from '../../web/js/wire.mjs';
+import {allocate, device, Infeasible, explain, DEFAULT_RATE} from './allocate.js';
+import {Rate, shouldRebalance, currentMakespan, MIN_SAMPLES} from './speed.js';
 
 const ICE = ['stun:stun.l.google.com:19302'];
 
 export class Bird {
-  constructor(start, end, slot) {
-    Object.assign(this, {start, end, slot});
-    this.peerId = null; this.label = '?';
+  constructor(peerId, label = '?') {
+    this.peerId = peerId; this.label = label;
+    // No range until the allocator gives one. A bird with start === null is a
+    // member that has been admitted but not yet placed, which is a real state now
+    // that /join no longer hands out a pre-decided slot.
+    this.start = null; this.end = null; this.slot = -1;
     this.lastSeen = 0; this.lastMs = null; this.claimedAt = 0;
     this.frames = 0;
     this.transport = 'none';
@@ -24,37 +41,79 @@ export class Bird {
     this.forwardsDirectly = false;   // set when the bird reports a live peer link
     this.ws = null; this.pc = null; this.chan = null;
     this._waiter = null;
+
+    // What this device said it can do, from the /check probe it runs before
+    // joining. Unknown means unconstrained: a device that did not report is
+    // trusted, because refusing it would be worse than the OOM it might hit, and
+    // the OOM is reported through /diag either way.
+    this.caps = {bind: Infinity, budget: Infinity, cores: null, gpu: null};
+    // Its measured throughput, and the bytes it is currently responsible for --
+    // the pair is what makes a rate rather than a raw time. See ./speed.js.
+    this.rate = new Rate();
+    this.bytes = 0;
+    // Why it got the share it has, in one line, for /status.
+    this.why = 'not placed yet';
   }
 
   alive(grace = 40000) {
     const linked = !!(this.chanOpen() || this.ws);
+    // Latch the fact that this device was once really connected. claimed() needs it
+    // to tell "still arriving over HTTP" (hold it, its layers are on the way) from
+    // "arrived and then went quiet" (let it go, its layers are uncovered).
+    if (linked) this.everLinked = true;
     return linked && (Date.now() - this.lastSeen) < grace;
   }
 
-  /** Is this slot spoken for? Alive, or claimed over HTTP and still connecting.
+  /** Is this device still a member? Alive, or admitted over HTTP and still
+   *  connecting for the first time.
    *
-   *  /join happens over plain HTTP, so a just-claimed slot has no websocket yet
-   *  and so is not yet `alive()`. Without this window the next /join hands out
-   *  the SAME slot and overwrites peerId, which is why several birds joining at
-   *  once all ended up as slot 0 and the flock never covered its layers. */
+   *  /join happens over plain HTTP, so a just-admitted device has no websocket yet
+   *  and so is not yet `alive()`. It still has to be counted as a member, or the
+   *  allocator would give its layers away and take them back a second later, once
+   *  per joining phone. (In the fixed-slot design the same window stopped several
+   *  simultaneous joins from all being handed slot 0.)
+   *
+   *  The window applies ONLY before the device has ever been heard from. A device
+   *  that connected and then went quiet is not "still connecting", and holding it as
+   *  a member on the strength of its /join would keep its layers uncovered for an
+   *  extra 15s on top of the liveness grace period. */
   claimed(hold = 15000) {
-    return this.alive() || (!!this.peerId && Date.now() - this.claimedAt < hold);
+    if (this.alive()) return true;
+    if (this.everLinked) return false;      // it connected once; this is not that window
+    return !!this.peerId && Date.now() - this.claimedAt < hold;
   }
 
   chanOpen() {
     try { return !!(this.chan && this.chan.isOpen()); } catch { return false; }
   }
 
+  /** Does it hold layers right now? A member between reallocations may not. */
+  placed() { return this.start != null && this.end != null; }
+
   info() {
     return {slot: this.slot, start: this.start, end: this.end,
-            n_layers: this.end - this.start + 1,
+            n_layers: this.placed() ? this.end - this.start + 1 : 0,
             alive: this.alive(), last_ms: this.lastMs,
             label: this.label, transport: this.transport,
             frames: this.frames, peer_id: this.peerId,
             // How long since we last heard anything: the UI can say "12s ago"
             // rather than a bare alive/dead flag that hides a stalling device.
             last_seen_ms: this.lastSeen ? Date.now() - this.lastSeen : null,
-            forwards_directly: this.forwardsDirectly};
+            forwards_directly: this.forwardsDirectly,
+            // Why this device got the share it did. The whole point of a
+            // speed-weighted split is that a human can tell an unfair-looking
+            // assignment from a correctly-measured one, and that needs numbers.
+            bytes: this.bytes,
+            mb: +(this.bytes / 1e6).toFixed(1),
+            rate_mb_per_ms: this.rate.value == null
+              ? null : +(this.rate.value / 1e6).toFixed(3),
+            rate_samples: this.rate.samples,
+            rate_trusted: this.rate.trusted(),
+            max_binding_mb: this.caps.bind === Infinity
+              ? null : +(this.caps.bind / 1e6).toFixed(0),
+            budget_mb: this.caps.budget === Infinity
+              ? null : +(this.caps.budget / 1e6).toFixed(0),
+            why: this.why};
   }
 
   /** Push into this bird but wait for `awaitOn` to answer (the chain's tail).
@@ -146,22 +205,297 @@ export class Bird {
   }
 }
 
+
+/**
+ * The flock: a dynamic set of devices, and the layer assignment over them.
+ *
+ * Construct it with the LAYER PLAN (from allocate.layerPlan), not with ranges.
+ * Ranges are an output now -- recomputed from whoever is present -- which is the
+ * whole difference from the fixed-slot version: there is no N to be full at.
+ */
 export class Flock {
-  constructor(ranges) {
-    this.birds = ranges.map(([s, e], i) => new Bird(s, e, i));
+  /**
+   * @param {Array} layers  layer descriptors covering the birds' share of the model
+   * @param {object} opts   `now` for tests, `onPlan` called after every successful
+   *                        reallocation with the new assignment
+   */
+  constructor(layers, {now = () => Date.now(), onPlan = null} = {}) {
+    this.layers = layers;
+    this.birds = [];            // chain order; index === slot
+    this.now = now;
+    this.onPlan = onPlan;
+    // The last reason a reallocation was made or refused, verbatim in /status. A
+    // speed-weighted split whose decisions are invisible is indistinguishable from
+    // a broken one, so this is part of the feature and not debug output.
+    this.decision = {at: 0, moved: false, reason: 'no devices yet', gain: null};
+    this.lastMoveAt = 0;
+    this.makespanMs = null;
+    this.evenMs = null;
+    // Set when the devices present cannot hold the model. Kept rather than thrown
+    // so /status and /chat can both report the same precise reason instead of the
+    // server dying on a phone's join.
+    this.infeasible = null;
+    // Membership changes that arrived mid-token, applied at the next token
+    // boundary. See applyPending().
+    this.pending = false;
+  }
+
+  /**
+   * Devices that count for allocation.
+   *
+   * The set is deliberately WIDER than "answering right now": it is every device the
+   * sweeper has not given up on. A refresh drops the websocket and comes back within a
+   * second or two with the same peer id, so excluding it the moment its socket closes
+   * would reallocate -- and therefore drop the conversation -- for what is about to be
+   * the same device holding the same range. So membership survives a brief silence,
+   * and only sweep() ends it.
+   *
+   * The cost of the wider set is that a genuinely dead device keeps its layers for up
+   * to `grace`, during which ready() is false and /status names the layers nobody is
+   * answering for. Reporting the gap is the right trade: the alternative is thrashing
+   * the whole flock on every phone that locks its screen for a second.
+   */
+  members(grace = 40000) {
+    return this.birds.filter(b => b.claimed() || (Date.now() - b.lastSeen) < grace);
+  }
+
+  /**
+   * Admit a device, or re-admit one that already has this peer id.
+   *
+   * Never refuses. The fixed-slot version answered "flock full" once N devices had
+   * joined, which is exactly the behaviour being removed: a device that turns up is
+   * capacity, and what it changes is the assignment, not whether it is allowed in.
+   *
+   * `caps` is what the device reported from the /check probe: bind is
+   * maxStorageBufferBindingSize, budget is how many weight bytes it will hold.
+   */
+  claim(peerId, label, caps = null) {
+    let b = this.byPeer(peerId);
+    if (!b) {
+      b = new Bird(peerId, label);
+      this.birds.push(b);
+    } else if (label) {
+      b.label = label;
+    }
+    if (caps) this.setCaps(b, caps);
+    // Date.now(), NOT this.now(). The two are the same clock in production, but they
+    // are different CLOCKS: `now` is injectable so a test can fast-forward the
+    // rebalancer's cooldown, while LIVENESS is judged against real wall time by
+    // alive(), claimed() and members(), and by Bird.deliver() when a frame arrives.
+    // Writing this field from the injectable one would give it two writers on
+    // different time bases, and a test that jumps the cooldown forward would also
+    // declare every device either decades stale or impossibly fresh.
+    b.lastSeen = Date.now();
+    b.claimedAt = Date.now();
+    return b;
+  }
+
+  /** Record what a device says it can do, normalising missing fields to unlimited. */
+  setCaps(b, caps) {
+    const num = v => (typeof v === 'number' && v > 0 && Number.isFinite(v)) ? v : null;
+    const bind = num(caps.maxStorageBufferBindingSize ?? caps.bind);
+    const budget = num(caps.budget ?? caps.maxBufferSize);
+    b.caps = {
+      bind: bind ?? Infinity,
+      // A device's whole-weights budget is not a limit WebGPU reports, so it comes
+      // from maxBufferSize when nothing better is offered. That is generous (it is
+      // one buffer's ceiling, not the device's memory) but it is the only number a
+      // browser will tell us, and the alternative -- guessing from the user agent --
+      // was what produced the iPad OOM this design is trying to stop repeating.
+      budget: budget ?? Infinity,
+      cores: num(caps.cores) ?? null,
+      gpu: caps.vendor || caps.gpu || null,
+      secure: caps.secureContext ?? null,
+      compute_ok: caps.computeOk ?? null,
+    };
+    return b;
+  }
+
+  /** Remove a device by peer id. Returns true if it was a member. */
+  release(peerId) {
+    const i = this.birds.findIndex(b => b.peerId === peerId);
+    if (i < 0) return false;
+    try { this.birds[i].teardown(); } catch {}
+    this.birds.splice(i, 1);
+    return true;
+  }
+
+  /** Drop every device we have not heard from inside the grace period.
+   *
+   *  A fixed slot could just go red and wait for its owner to come back. A member
+   *  cannot: it is holding layers nobody is running, so the flock stays uncovered
+   *  until it is actually removed and its layers are given to someone else.
+   *
+   *  The test is LAST HEARD FROM, not "has a link". A refresh drops the websocket and
+   *  comes back within a second or two with the same peer id, and removing it on the
+   *  close would reallocate -- and so drop the conversation -- for what is about to
+   *  be the same device holding the same range. So a device keeps its layers until it
+   *  has been silent for `grace`, whether or not its socket is still there. */
+  sweep(grace = 40000) {
+    // The exact complement of members(), so the two cannot disagree about who is in
+    // the flock -- a device the sweeper keeps but the allocator ignores would hold
+    // layers nobody ever gives away.
+    const keep = new Set(this.members(grace));
+    const gone = this.birds.filter(b => !keep.has(b));
+    if (!gone.length) return [];
+    for (const b of gone) this.release(b.peerId);
+    // Re-plan HERE, not only in the caller. Removing a device leaves its layers
+    // assigned to nobody, so a sweep that does not re-plan leaves the flock not-ready
+    // with a hole in the chain -- correct only for as long as every caller remembers to
+    // rebalance afterwards. Announcing is still the caller's job: it owns the
+    // conversation state that a move invalidates.
+    this.plan({force: true});
+    return gone.map(b => b.peerId);
+  }
+
+  /**
+   * Recompute the assignment for whoever is present.
+   *
+   * `force` skips the gain gate and the cooldown -- used when membership changed,
+   * because then the alternative is not covering some layers at all.
+   *
+   * Returns the decision: {move, reason, gain, moved: [peerIds]}. Never throws for
+   * an unsatisfiable flock; that lands in this.infeasible, where /status and /chat
+   * both read it.
+   */
+  plan({force = false} = {}) {
+    const members = this.members();
+    const current = this.birds.filter(b => b.placed()).map(b => ({
+      id: b.peerId, start: b.start, end: b.end, bytes: b.bytes,
+      rate: b.rate.rate(DEFAULT_RATE),
+    }));
+    if (!members.length) {
+      this.unplaceAll();
+      this.infeasible = null;
+      this.makespanMs = this.evenMs = null;
+      return this.note(false, 'no devices in the flock');
+    }
+
+    let proposed;
+    try {
+      proposed = allocate(this.layers, members.map(b => device({
+        id: b.peerId, label: b.label, bind: b.caps.bind, budget: b.caps.budget,
+        rate: b.rate.rate(DEFAULT_RATE),
+      })));
+      this.infeasible = null;
+    } catch (e) {
+      if (!(e instanceof Infeasible)) throw e;
+      // The devices present cannot hold the model. Take the layers away rather than
+      // leaving a stale assignment that looks covered: /chat must refuse with this
+      // reason, not start a turn against an assignment nobody can serve.
+      this.infeasible = {message: e.message, detail: e.detail || null};
+      this.unplaceAll();
+      this.makespanMs = this.evenMs = null;
+      return this.note(false, e.message);
+    }
+
+    const trusted = members.filter(b => b.rate.trusted()).length;
+    const d = force
+      ? {move: true, reason: 'membership changed', gain: null}
+      : shouldRebalance({
+          current, proposed, now: this.now(), lastMoveAt: this.lastMoveAt,
+          trustedCount: trusted, deviceCount: members.length,
+        });
+    if (!d.move) {
+      // Keep the numbers even when refusing: /status shows what the move WOULD
+      // have bought next to why it was not made, which is the only way a human can
+      // tell "the gate is working" from "the gate is stuck".
+      this.proposedMs = proposed.makespanMs;
+      return this.note(false, d.reason, d.gain);
+    }
+
+    const moved = [];
+    for (const a of proposed.assign) {
+      const b = this.byPeer(a.id);
+      if (!b) continue;
+      if (b.start !== a.start || b.end !== a.end) {
+        moved.push(b.peerId);
+        // A device whose range changed has to re-download the layers it gained and
+        // its K/V cache is stale for the ones it lost, so its old timings describe
+        // work it is no longer doing.
+        b.rate.reset();
+      }
+      b.start = a.start; b.end = a.end;
+      b.bytes = a.bytes;
+      b.why = explain(a);
+    }
+    // Chain order is allocation order, which is join order: index === slot, and the
+    // hidden state passes through the birds in increasing layer order.
+    const order = new Map(proposed.assign.map((a, i) => [a.id, i]));
+    this.birds.sort((x, y) => (order.get(x.peerId) ?? 1e9) - (order.get(y.peerId) ?? 1e9));
+    this.birds.forEach((b, i) => { b.slot = b.placed() ? i : -1; });
+    for (const b of this.birds) if (!order.has(b.peerId)) this.unplace(b);
+
+    this.makespanMs = proposed.makespanMs;
+    this.evenMs = proposed.evenMs;
+    this.proposedMs = proposed.makespanMs;
+    if (moved.length) this.lastMoveAt = this.now();
+    const note = this.note(true, d.reason, d.gain, moved);
+    if (moved.length) this.onPlan?.(proposed, moved);
+    return note;
+  }
+
+  unplace(b) {
+    b.start = null; b.end = null; b.slot = -1; b.bytes = 0;
+    b.why = 'holds no layers';
+  }
+  unplaceAll() { for (const b of this.birds) this.unplace(b); }
+
+  note(moved, reason, gain = null, ids = []) {
+    this.decision = {at: this.now(), moved, reason, gain: gain ?? null,
+                     moved_peers: ids};
+    return {move: moved, reason, gain: gain ?? null, moved: ids};
+  }
+
+  /**
+   * Feed one token's timings back in, and say whether the assignment should move.
+   *
+   * Called at a TOKEN BOUNDARY, never mid-lap: a reallocation invalidates the
+   * sharded K/V cache for every layer that moved, so acting on it halfway through a
+   * token would mix keys computed on two different devices for the same positions
+   * and produce text that is wrong without being obviously wrong.
+   */
+  observe() {
+    for (const b of this.birds) {
+      if (b.lastMs != null && b.bytes > 0) b.rate.observe(b.bytes, b.lastMs);
+    }
+    return this.plan();
+  }
+
+  /** A membership change arrived while a token was in flight. */
+  defer() { this.pending = true; }
+
+  /** Apply a deferred membership change. Returns the decision, or null if none. */
+  applyPending() {
+    if (!this.pending) return null;
+    this.pending = false;
+    return this.plan({force: true});
   }
 
   /** Who each bird forwards to. The last one replies to the coordinator. */
   chainFor(peerId) {
     const b = this.byPeer(peerId);
-    if (!b) return null;
-    const next = this.birds[b.slot + 1] || null;
+    if (!b || !b.placed()) {
+      // Still a member, just not holding layers: tell it so explicitly. Silence
+      // here is what made a bird sit forever showing "waiting for activations"
+      // when it had in fact been reassigned out of the chain.
+      return b ? {t: 'chain', slot: -1, start: null, end: null,
+                  next_peer: null, next_range: null} : null;
+    }
+    const placed = this.chain();
+    const at = placed.indexOf(b);
+    const next = placed[at + 1] || null;
     return {t: 'chain', slot: b.slot, start: b.start, end: b.end,
             next_peer: next ? next.peerId : null,
             next_range: next ? `${next.start}-${next.end}` : null};
   }
 
-  /** Tell every bird its successor — call whenever membership changes. */
+  /** The placed birds in layer order: the actual pipeline. */
+  chain() {
+    return this.birds.filter(b => b.placed()).sort((a, b) => a.start - b.start);
+  }
+
+  /** Tell every bird its range and its successor — call whenever either changes. */
   announce() {
     for (const b of this.birds) {
       if (!b.ws) continue;
@@ -181,32 +515,92 @@ export class Flock {
    *  so we can only await the tail for the longest chained run from the head.
    */
   async lap(floats, seq, hidden, offset) {
+    const chain = this.chain();
+    if (!chain.length) throw new Error('no device holds any layer');
     let flat = floats, i = 0;
-    while (i < this.birds.length) {
+    while (i < chain.length) {
       // How far does the direct chain reach from bird i?
       let j = i;
-      while (j + 1 < this.birds.length && this.birds[j].forwardsDirectly) j++;
-      const {data} = await this.birds[i].sendChained(
-        flat, seq, hidden, offset, this.birds[j]);
-      flat = data;
+      while (j + 1 < chain.length && chain[j].forwardsDirectly) j++;
+      const got = await chain[i].sendChained(flat, seq, hidden, offset, chain[j]);
+      // teardown() resolves a pending waiter with null so the lap does not hang for
+      // the full timeout when a device's socket dies mid-frame. Say what happened:
+      // destructuring the null instead reported "Cannot destructure property 'data'",
+      // which tells the person holding the phone nothing at all.
+      if (!got) {
+        throw new Error(`the device holding layers ${chain[j].start}-${chain[j].end} ` +
+                        `(${chain[j].label}) dropped its connection mid-token`);
+      }
+      flat = got.data;
       i = j + 1;
     }
     return {data: flat};
   }
-  claim(peerId, label) {
-    for (const b of this.birds) if (b.peerId === peerId) {
-      b.lastSeen = Date.now(); b.claimedAt = Date.now(); return b;
-    }
-    for (const b of this.birds) if (!b.claimed()) {
-      b.peerId = peerId; b.label = label;
-      b.lastSeen = Date.now(); b.claimedAt = Date.now();
-      b.frames = 0;
-      return b;
-    }
-    return null;
-  }
+
   byPeer(id) { return this.birds.find(b => b.peerId === id) || null; }
-  ready() { return this.birds.every(b => b.alive()); }
-  missing() { return this.birds.filter(b => !b.alive()).map(b => `${b.start}-${b.end}`); }
+
+  /** Is every bird-side layer covered by a device that is answering? */
+  ready() {
+    if (this.infeasible) return false;
+    const chain = this.chain();
+    if (!chain.length) return false;
+    if (!chain.every(b => b.alive())) return false;
+    // Covered means every layer, contiguously. A gap here would silently skip
+    // layers and produce plausible wrong text, which is the failure this checks
+    // for -- it cannot happen through plan(), but the chain is also filtered by
+    // liveness, and a dead bird in the middle leaves exactly such a gap.
+    let want = this.layers[0].layer;
+    for (const b of chain) {
+      if (b.start !== want) return false;
+      want = b.end + 1;
+    }
+    return want === this.layers[this.layers.length - 1].layer + 1;
+  }
+
+  /** Which layers nobody is answering for, as ranges, for the UI's "waiting for". */
+  missing() {
+    if (!this.layers.length) return [];
+    const live = new Set();
+    for (const b of this.chain()) {
+      if (!b.alive()) continue;
+      for (let i = b.start; i <= b.end; i++) live.add(i);
+    }
+    const out = [];
+    let run = null;
+    for (const l of this.layers) {
+      if (live.has(l.layer)) { if (run) { out.push(run); run = null; } continue; }
+      if (run && run.end === l.layer - 1) run.end = l.layer;
+      else { if (run) out.push(run); run = {start: l.layer, end: l.layer}; }
+    }
+    if (run) out.push(run);
+    return out.map(r => r.start === r.end ? `${r.start}` : `${r.start}-${r.end}`);
+  }
+
   reset() { this.birds.forEach(b => b.reset()); }
+
+  /** Everything a human needs to see why the split is what it is. */
+  allocation() {
+    const members = this.members();
+    return {
+      devices: members.length,
+      layers: this.layers.length,
+      bird_layers: this.layers.length
+        ? `${this.layers[0].layer}-${this.layers[this.layers.length - 1].layer}` : '',
+      bird_bytes: this.layers.reduce((a, l) => a + l.bytes, 0),
+      // The predicted cost of a token with this assignment, and what an even
+      // by-layer-count split would have cost with the same rates. The pair is the
+      // evidence that weighting by bytes and speed bought anything.
+      makespan_ms: this.makespanMs,
+      even_split_ms: this.evenMs,
+      proposed_ms: this.proposedMs ?? null,
+      min_samples: MIN_SAMPLES,
+      decision: this.decision,
+      pending: this.pending,
+      infeasible: this.infeasible,
+      // Per-layer bytes, so the 13% size spread is visible rather than asserted.
+      layer_mb: this.layers.map(l => +(l.bytes / 1e6).toFixed(1)),
+    };
+  }
 }
+
+export {currentMakespan};

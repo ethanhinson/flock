@@ -1,201 +1,125 @@
 <!doctype html>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>flock · device check</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>flock · check this device</title>
 <style>
-  :root{--bg:#0b0d10;--fg:#e6edf3;--dim:#7d8590;--line:#21262d;--ok:#3fb950;--bad:#f85149;--warn:#d29922}
+  :root{
+    --bg:#0b0d10; --panel:#0d1117; --fg:#e6edf3; --dim:#7d8590; --faint:#4d5560;
+    --line:#21262d; --hot:#2f81f7; --ok:#3fb950; --bad:#f85149; --warn:#d29922;
+    --mono:ui-monospace,SFMono-Regular,SF Mono,Menlo,Consolas,monospace;
+  }
   *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--fg);padding:18px;
-       font:15px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace}
-  h1{font-size:17px;margin:0 0 4px}
-  .sub{color:var(--dim);font-size:12px;margin-bottom:16px}
-  .row{display:flex;justify-content:space-between;gap:12px;padding:7px 0;
-       border-bottom:1px solid var(--line);align-items:baseline}
-  .k{color:var(--dim);font-size:12px;flex:0 0 45%}
-  .v{text-align:right;word-break:break-all;font-size:13px}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:14px/1.5 var(--mono);padding:14px;
+       padding-bottom:calc(20px + env(safe-area-inset-bottom));
+       max-width:620px;margin-inline:auto}
+  h1{font-size:14px;margin:0;font-weight:600;letter-spacing:.02em}
+  .sub{color:var(--dim);font-size:11.5px;margin-top:3px}
   .ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}
-  h2{font-size:13px;margin:22px 0 6px;color:var(--dim);text-transform:uppercase;
-     letter-spacing:.08em}
-  #verdict{border:1px solid var(--line);border-radius:10px;padding:14px;margin:16px 0;
-           font-size:14px}
-  pre{background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:10px;
-      overflow-x:auto;font-size:11px;color:var(--dim)}
+  .card{border:1px solid var(--line);border-radius:11px;padding:13px;
+        margin-top:13px;background:var(--panel)}
+  .card h2{font-size:11px;color:var(--dim);text-transform:uppercase;
+           letter-spacing:.08em;margin:0 0 9px;font-weight:600}
+  .row{display:flex;justify-content:space-between;gap:10px;padding:3px 0;
+       font-size:12.5px;align-items:baseline}
+  .row span:first-child{color:var(--dim)}
+  .row span:last-child{font-variant-numeric:tabular-nums;text-align:right}
+  .verdict{font-size:16px;font-weight:600;margin:2px 0 4px}
+  .note{color:var(--dim);font-size:11.5px;margin-top:7px;white-space:pre-wrap}
+  pre{margin:9px 0 0;padding:9px;background:#010409;border:1px solid var(--line);
+      border-radius:8px;font-size:11px;overflow-x:auto;color:var(--dim)}
+  a{color:var(--hot)}
 </style>
 
-<h1>🕊 device check</h1>
-<div class="sub">what this device can and cannot do, and why</div>
+<h1>flock · what can this device do?</h1>
+<div class="sub" id="sub">probing…</div>
 
-<div id="verdict">checking…</div>
-<div id="out"></div>
+<!-- The verdict first. The numbers are for a human who wants to know why, but the
+     answer to "can this be a bird" has to be readable at arm's length on a phone. -->
+<div class="card">
+  <h2>verdict</h2>
+  <div class="verdict" id="verdict">…</div>
+  <div class="note" id="why"></div>
+</div>
 
-<h2>raw report</h2>
-<pre id="raw">…</pre>
+<div class="card">
+  <h2>gpu limits</h2>
+  <div class="row"><span>max storage buffer binding</span><span id="bind">—</span></div>
+  <div class="row"><span>max buffer size</span><span id="buf">—</span></div>
+  <div class="row"><span>max compute workgroup storage</span><span id="wg">—</span></div>
+  <div class="row"><span>max compute invocations / workgroup</span><span id="inv">—</span></div>
+  <div class="row"><span>adapter</span><span id="adapter">—</span></div>
+</div>
+
+<div class="card">
+  <h2>device</h2>
+  <div class="row"><span>logical cores</span><span id="cores">—</span></div>
+  <div class="row"><span>device memory hint</span><span id="mem">—</span></div>
+  <div class="row"><span>secure context</span><span id="secure">—</span></div>
+  <div class="row"><span>platform</span><span id="plat">—</span></div>
+</div>
+
+<div class="card">
+  <h2>a real compute shader</h2>
+  <div class="row"><span>result</span><span id="shader">—</span></div>
+  <div class="row"><span>round trip</span><span id="shaderms">—</span></div>
+  <div class="note">A limits table can be reported by a device that then fails to
+run anything. This dispatches an actual WGSL compute pass and checks the number it
+computes, so "WebGPU works here" is measured rather than advertised.</div>
+</div>
+
+<div class="card">
+  <h2>what the coordinator is told</h2>
+  <pre id="json">…</pre>
+  <div class="note">This exact object is what POST /join sends as <code>caps</code>,
+and it is what the allocator plans against. One probe, one set of numbers: there is
+no second implementation to drift from this one.</div>
+</div>
+
 
 <script type="module">
+// web/inspect.html — the capability probe, as a page. Served at /check.
+//
+// The measuring itself lives in /js/probe.mjs, which web/bird.html imports too. That
+// split is the point: the allocator refuses a device any layer whose largest tensor
+// exceeds its maxStorageBufferBindingSize, so the numbers it plans against must be
+// the real ones, and a second probe would eventually disagree with this one. What a
+// human reads here is literally what POST /join sent.
+import {probe, verdict} from '/js/probe.mjs';
+
 const $ = id => document.getElementById(id);
-const R = {};                                  // everything we learn
-const rows = [];
-const add = (k, v, cls='') => { rows.push(`<div class="row"><span class="k">${k}</span>` +
-  `<span class="v ${cls}">${v}</span></div>`); $('out').innerHTML = rows.join(''); };
-const head = t => { rows.push(`<h2>${t}</h2>`); };
+const set = (id, v, cls) => {
+  const n = $(id);
+  if (!n) return;
+  n.textContent = v;
+  if (cls != null) n.className = cls;
+};
+const mb = n => n == null ? '—' : `${(n / 1e6).toFixed(0)} MB`;
 
-// --- 1. What is this device, per the browser -----------------------------
-head('device');
-R.ua = navigator.userAgent;
-R.platform = navigator.platform;
-R.cores = navigator.hardwareConcurrency;
-R.memGB = navigator.deviceMemory ?? null;
-R.touch = navigator.maxTouchPoints;
+const {caps, detail} = await probe();
+const v = verdict(detail);
+$('verdict').textContent = v.headline;
+$('verdict').className = 'verdict ' + (v.ok ? 'ok' : 'bad');
+$('why').textContent = v.why;
+$('sub').innerHTML = v.ok
+  ? '<span class="ok">probe finished</span> — every number below was measured on ' +
+    'this device just now'
+  : '<span class="bad">probe finished</span> — this device cannot run layers';
 
-// Safari on iPad reports itself as a Mac. Touch points are the tell: a real Mac
-// reports 0, an iPad reports 5. This is the standard way to separate them.
-const looksMac = /Macintosh/.test(R.ua);
-R.likelyIPad = looksMac && R.touch > 0;
-R.device = R.likelyIPad ? 'iPad (Safari reports itself as a Mac)'
-         : /iPhone/.test(R.ua) ? 'iPhone'
-         : looksMac ? 'Mac' : 'other';
-add('best guess', R.device, R.likelyIPad ? 'warn' : '');
-add('touch points', R.touch, '');
-add('cpu cores', R.cores ?? 'unknown');
-
-const m = R.ua.match(/Version\/([0-9.]+).*Safari/);
-R.safari = m ? m[1] : null;
-if (R.safari) {
-  const major = parseInt(R.safari, 10);
-  // WebGPU is on by default from Safari 26. 17.x and 18.x have it behind a flag.
-  const cls = major >= 26 ? 'ok' : 'warn';
-  add('safari version', R.safari, cls);
-  R.webgpuDefaultOn = major >= 26;
-}
-
-// --- 2. Is WebGPU exposed at all? ----------------------------------------
-head('page context');
-R.isSecureContext = isSecureContext;
-R.origin = location.origin;
-add('origin', R.origin);
-add('secure context', R.isSecureContext ? 'yes' : 'NO — plain http on a LAN',
-    R.isSecureContext ? 'ok' : 'warn');
-R.chrome = (R.ua.match(/Chrome\/([0-9]+)/) || [])[1] || null;
-if (R.chrome) add('chrome version', R.chrome);
-
-head('webgpu');
-R.hasNavigatorGpu = !!navigator.gpu;
-add('navigator.gpu', R.hasNavigatorGpu ? 'present' : 'MISSING',
-    R.hasNavigatorGpu ? 'ok' : 'bad');
-
-if (R.hasNavigatorGpu) {
-  try {
-    const ad = await Promise.race([
-      navigator.gpu.requestAdapter(),
-      new Promise((_, rj) => setTimeout(() => rj(new Error('timed out after 10s')), 10000)),
-    ]);
-    R.adapter = !!ad;
-    add('adapter', ad ? 'granted' : 'REFUSED', ad ? 'ok' : 'bad');
-    if (ad) {
-      // adapter.info throws on some Safari builds unless a flag is set.
-      try {
-        R.vendor = ad.info?.vendor; R.arch = ad.info?.architecture;
-        R.desc = ad.info?.description;
-        add('gpu', [R.vendor, R.arch, R.desc].filter(Boolean).join(' ') || 'not disclosed');
-      } catch (e) { add('gpu info', 'blocked: ' + e.message, 'warn'); }
-
-      const L = ad.limits;
-      R.limits = {
-        maxBufferSize: L.maxBufferSize,
-        maxStorageBufferBindingSize: L.maxStorageBufferBindingSize,
-        maxComputeWorkgroupStorageSize: L.maxComputeWorkgroupStorageSize,
-        maxComputeInvocationsPerWorkgroup: L.maxComputeInvocationsPerWorkgroup,
-      };
-      add('max buffer', (L.maxBufferSize/1e6).toFixed(0) + ' MB');
-      add('max storage binding', (L.maxStorageBufferBindingSize/1e6).toFixed(0) + ' MB');
-      add('workgroup storage', L.maxComputeWorkgroupStorageSize + ' B');
-
-      // Does a device come back, and can it actually compile and RUN a shader?
-      const dev = await ad.requestDevice();
-      R.device_ok = !!dev;
-      add('device', 'granted', 'ok');
-
-      // The real test: compile a compute shader and read back a result.
-      const mod = dev.createShaderModule({code: `
-        @group(0) @binding(0) var<storage, read_write> o: array<f32>;
-        @compute @workgroup_size(1)
-        fn main() { o[0] = 6.0 * 7.0; }`});
-      const info = await mod.getCompilationInfo?.();
-      R.shaderErrors = (info?.messages || []).filter(x => x.type === 'error').length;
-      const pipe = dev.createComputePipeline({layout: 'auto',
-        compute: {module: mod, entryPoint: 'main'}});
-      const buf = dev.createBuffer({size: 4,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC});
-      const rd = dev.createBuffer({size: 4,
-        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST});
-      const bg = dev.createBindGroup({layout: pipe.getBindGroupLayout(0),
-        entries: [{binding: 0, resource: {buffer: buf}}]});
-      const enc = dev.createCommandEncoder();
-      const p = enc.beginComputePass();
-      p.setPipeline(pipe); p.setBindGroup(0, bg); p.dispatchWorkgroups(1); p.end();
-      enc.copyBufferToBuffer(buf, 0, rd, 0, 4);
-      dev.queue.submit([enc.finish()]);
-      await rd.mapAsync(GPUMapMode.READ);
-      R.computed = new Float32Array(rd.getMappedRange().slice(0))[0];
-      add('ran a compute shader', R.computed === 42 ? '42 — correct' : 'wrong: ' + R.computed,
-          R.computed === 42 ? 'ok' : 'bad');
-
-      // Features flock's kernels care about.
-      try {
-        dev.createShaderModule({code:
-          `@compute @workgroup_size(1) fn p(){ let v=vec4<f32>(unpack4xI8(1u)); }`});
-        const ci = await dev.createShaderModule({code:
-          `@compute @workgroup_size(1) fn p(){ let v=vec4<f32>(unpack4xI8(1u)); }`})
-          .getCompilationInfo?.();
-        R.unpack4xI8 = !(ci?.messages || []).some(x => x.type === 'error');
-      } catch { R.unpack4xI8 = false; }
-      add('unpack4xI8 (faster path)', R.unpack4xI8 ? 'yes' : 'no (fallback used)',
-          R.unpack4xI8 ? 'ok' : 'warn');
-    }
-  } catch (e) {
-    R.adapterError = String(e.message || e);
-    add('adapter', 'FAILED: ' + R.adapterError, 'bad');
-  }
-}
-
-// --- 3. Verdict ----------------------------------------------------------
-let v, cls;
-if (R.computed === 42) {
-  v = `<span class="ok">This device CAN be a bird.</span> WebGPU works end to end — ` +
-      `it compiled and ran a compute shader correctly.`;
-} else if (!R.hasNavigatorGpu) {
-  const flag = R.safari && !R.webgpuDefaultOn;
-  // Chrome/Edge require a secure context for WebGPU; Safari does not. Over plain
-  // http:// on a LAN that hides the API entirely, which looks like missing
-  // hardware and is not.
-  const chromeInsecure = R.chrome && !R.isSecureContext;
-  v = `<span class="bad">The WebGPU <i>API</i> is not available here.</span> ` +
-      `This says nothing about the GPU itself — every iPad, iPhone and Mac has ` +
-      `one. The browser is simply not exposing the API to this page.` +
-      (chromeInsecure
-        ? `<br><br><b>Most likely cause:</b> Chrome only exposes WebGPU in a ` +
-          `<i>secure context</i>, and this page is plain http on a LAN ` +
-          `(${R.origin}). Safari is more permissive, which is why it can work ` +
-          `where Chrome cannot. Options: use Safari, or reach the coordinator ` +
-          `over https or a localhost tunnel.`
-        : '') +
-      (flag ? `<br><br>Safari ${R.safari} has WebGPU but <b>off by default</b>. Turn it on: ` +
-              `<b>Settings &gt; Apps &gt; Safari &gt; Advanced &gt; Feature Flags &gt; WebGPU</b> ` +
-              `(older iPadOS: Settings &gt; Safari &gt; Advanced &gt; Experimental Features), ` +
-              `then reload this page. If the flag is absent, updating to iPadOS 26 ships it on.`
-            : `<br><br>Try a current Safari, Chrome or Edge.`);
-} else if (!R.adapter) {
-  v = `<span class="bad">WebGPU exists but refused an adapter.</span> ` +
-      `That usually means the browser has it behind a flag that is only half-enabled, ` +
-      `or the GPU is blocklisted for this driver. Detail: ${R.adapterError || 'none given'}`;
-} else {
-  v = `<span class="warn">WebGPU is partly working.</span> An adapter was granted but ` +
-      `the test shader did not produce the right answer, so flock's kernels would be ` +
-      `unreliable here.`;
-}
-$('verdict').innerHTML = v;
-$('raw').textContent = JSON.stringify(R, null, 2);
-
-// Send it to the coordinator too, so it is visible without reading this screen.
-fetch('/diag', {method: 'POST', headers: {'Content-Type': 'application/json'},
-  body: JSON.stringify({stage: 'inspect', detail: R, ua: R.ua})}).catch(() => {});
+const L = detail.limits || {};
+set('bind', mb(L.maxStorageBufferBindingSize));
+set('buf', mb(L.maxBufferSize));
+set('wg', L.maxComputeWorkgroupStorageSize == null ? '—'
+   : `${(L.maxComputeWorkgroupStorageSize / 1024).toFixed(0)} KB`);
+set('inv', L.maxComputeInvocationsPerWorkgroup ?? '—');
+set('adapter', [detail.adapter?.vendor, detail.adapter?.architecture]
+  .filter(Boolean).join(' · ') || 'not reported');
+set('cores', detail.cores ?? 'not reported');
+set('mem', detail.deviceMemoryGb ? `${detail.deviceMemoryGb} GB (hint)` : 'not reported');
+set('secure', detail.secureContext === null ? '—' : (detail.secureContext ? 'yes' : 'no'),
+    detail.secureContext ? 'ok' : 'warn');
+set('plat', detail.platform || 'not reported');
+set('shader', detail.computeOk === null ? 'not run'
+   : (detail.computeOk ? 'correct' : 'WRONG'), detail.computeOk ? 'ok' : 'bad');
+set('shaderms', detail.computeMs == null ? '—' : `${detail.computeMs} ms`);
+$('json').textContent = JSON.stringify(caps, null, 2);
 </script>
