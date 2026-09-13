@@ -8,9 +8,27 @@
 // RUN IT WITH DENO, NOT NODE -- it needs a GPU for the same reason the
 // coordinator does, and Node has no WebGPU:
 //
-//   deno run --unstable-webgpu --allow-all sim_bird.mjs          one free slot
-//   deno run --unstable-webgpu --allow-all sim_bird.mjs solo     every slot
-//   FLOCK_URL=http://host:port                                   a coordinator elsewhere
+//   deno run --unstable-webgpu --allow-all sim_bird.mjs            one device
+//   deno run --unstable-webgpu --allow-all sim_bird.mjs solo       one device, all layers
+//   deno run --unstable-webgpu --allow-all sim_bird.mjs solo 3     three devices
+//   FLOCK_URL=http://host:port                                     a coordinator elsewhere
+//
+// WHY IT CAN LIE ABOUT ITSELF. The allocator weights layers by each device's real
+// limits and measured speed, and there is no way to test that without devices that
+// differ -- which would mean owning a drawer of phones. So a simulated bird can
+// report ARBITRARY capability and speed:
+//
+//   --bind 64MB        maxStorageBufferBindingSize to report at /join
+//   --budget 300MB     how many weight bytes it claims it will hold
+//   --slow 40ms        extra delay per layer per token, to look like a phone
+//   --label iPhone     what /status calls it
+//   --fake             do not touch the GPU at all: echo the hidden state back
+//
+// --fake is what makes the allocation tests runnable anywhere: a fake bird exercises
+// /join, the chain, the timings and the rebalancer without a device and without
+// 67MB of weights, so "a deliberately slow bird ends up with fewer layers" is a
+// test rather than an anecdote. A REAL simulated bird (no --fake) still computes
+// real layers with real kernels, which is what proves the text stays correct.
 //
 // Each simulated bird keeps its own K/V cache, exactly as a real bird does — the
 // point is to exercise the sharded-cache path, not to shortcut it.
@@ -23,31 +41,104 @@
 // Both end up calling the same Layer with the same numbers.
 import WebSocket from 'ws';
 import {pack, unpack} from '../web/js/wire.mjs';
-import {getDevice} from '../kernels/lib.ts';
-import {Layer, QWEN3_06B} from '../kernels/layer.ts';
-import {realModel} from '../kernels/real_weights.ts';
 
 const BASE = process.env.FLOCK_URL || 'http://127.0.0.1:8000';
-const solo = process.argv[2] === 'solo';
-const label = solo ? 'sim' : (process.argv[2] || 'sim');
 
-const dev = await getDevice();
-console.log('reading weights ...');
-const weights = await realModel();
+// --- arguments -------------------------------------------------------------
+const argv = process.argv.slice(2);
+const has = f => argv.includes(f);
+const arg = (f, d) => {
+  const i = argv.indexOf(f);
+  return i >= 0 && argv[i + 1] != null ? argv[i + 1] : d;
+};
+/** "64MB" / "1.5GB" / "134217728" -> bytes. Units because a limit written in bytes
+ *  is a number nobody reads correctly on the command line. */
+function bytes(s) {
+  if (s == null) return null;
+  const m = /^([\d.]+)\s*(k|m|g)?b?$/i.exec(String(s).trim());
+  if (!m) throw new Error(`cannot read a size from "${s}"`);
+  const mult = {k: 1e3, m: 1e6, g: 1e9}[(m[2] || '').toLowerCase()] || 1;
+  return Math.round(+m[1] * mult);
+}
+/** "40ms" / "40" -> ms. */
+const ms = s => s == null ? 0 : +String(s).replace(/ms$/i, '');
 
-/** Claim a slot, build its layers on the GPU, and serve frames until the socket
- *  closes. */
+const FAKE = has('--fake');
+const SOLO = argv[0] === 'solo';
+const N = SOLO ? Math.max(1, +(argv[1] && /^\d+$/.test(argv[1]) ? argv[1] : 1)) : 1;
+const SLOW = ms(arg('--slow', 0));
+const BIND = bytes(arg('--bind', null));
+const BUDGET = bytes(arg('--budget', null));
+const LABEL = arg('--label', null) ||
+  (SOLO ? 'sim' : (argv[0] && !argv[0].startsWith('--') ? argv[0] : 'sim'));
+
+// The GPU and the weights are only loaded when they are actually needed. A fake
+// bird must run where there is no device at all, which is the whole point of it.
+let dev = null, weights = null, Layer = null, QWEN3_06B = null;
+if (!FAKE) {
+  const lib = await import('../kernels/lib.ts');
+  const layerMod = await import('../kernels/layer.ts');
+  const real = await import('../kernels/real_weights.ts');
+  Layer = layerMod.Layer; QWEN3_06B = layerMod.QWEN3_06B;
+  dev = await lib.getDevice();
+  console.log('reading weights ...');
+  weights = await real.realModel();
+}
+
+/** What this device claims about itself. A real bird measures these with
+ *  /js/probe.mjs; a simulated one is told them, which is how a 64MB binding limit
+ *  gets tested without a device that has one. */
+function caps() {
+  const c = {gpu: true, computeOk: true, cores: 8, vendor: FAKE ? 'sim' : 'deno'};
+  if (BIND != null) c.maxStorageBufferBindingSize = BIND;
+  if (BUDGET != null) c.budget = BUDGET;
+  return c;
+}
+
+/** Sleep, to look slower than we are. Per LAYER, not per token: a slow device is
+ *  slow in proportion to the work it holds, which is exactly the relationship the
+ *  allocator is built around, and a flat per-token delay would not test it. */
+const stall = n => n > 0 ? new Promise(r => setTimeout(r, n)) : null;
+
+/**
+ * Claim a place, build the layers we were given, and serve frames until the socket
+ * closes -- re-building them if the coordinator reassigns us.
+ */
 async function bird(tag) {
-  const j = await (await fetch(`${BASE}/join`, {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({label: tag})})).json();
-  if (j.error) throw new Error(j.error);
-
-  const layers = [];
-  for (let i = j.start; i <= j.end; i++) {
-    layers.push(await Layer.create(dev, weights.layers[i], QWEN3_06B));
+  let j = null, pid = null;
+  // The coordinator answers `wait` when a token is in flight: layers are assigned at
+  // the next token boundary, which is milliseconds away. The peer id from that answer
+  // MUST be sent back -- retrying without it is a second /join, and the coordinator
+  // admits a second member with the same label that it then waits forever on.
+  for (let attempt = 0; attempt < 40; attempt++) {
+    j = await (await fetch(`${BASE}/join`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({peer_id: pid, label: tag, caps: caps()})})).json();
+    pid = j.peer_id || pid;
+    if (!j.wait) break;
+    if (attempt === 0) console.log(`${tag}: ${j.reason || 'waiting for layers'}`);
+    await new Promise(r => setTimeout(r, j.retry_ms || 500));
   }
-  console.log(`bird ${j.slot}: layers ${j.start}-${j.end} on the GPU`);
+  if (j.error) throw new Error(j.error);
+  if (j.wait) throw new Error('never got a layer assignment');
+
+  let meta = j;
+  let layers = [];
+
+  /** Build (or rebuild) the layers for the range we currently hold. */
+  async function build() {
+    layers = [];
+    if (meta.start == null) return;
+    if (FAKE) { layers = new Array(meta.end - meta.start + 1).fill(null); return; }
+    for (let i = meta.start; i <= meta.end; i++) {
+      layers.push(await Layer.create(dev, weights.layers[i], QWEN3_06B));
+    }
+  }
+  await build();
+  console.log(`${tag}: layers ${meta.start}-${meta.end}` +
+              (FAKE ? ' (fake, no GPU)' : ' on the GPU') +
+              (SLOW ? ` +${SLOW}ms/layer` : '') +
+              (j.why ? `\n  ${j.why}` : ''));
 
   const ws = new WebSocket(BASE.replace(/^http/, 'ws') + '/ws');
   let beat = null;
@@ -59,52 +150,77 @@ async function bird(tag) {
     beat = setInterval(() => ws.send(JSON.stringify({t: 'ping'})), 4000);
   });
   ws.on('close', () => clearInterval(beat));
-  ws.on('error', e => console.error(`bird ${j.slot} socket: ${e.message}`));
+  ws.on('error', e => console.error(`${tag} socket: ${e.message}`));
   ws.on('message', async (data, isBinary) => {
-    if (!isBinary) return;
+    if (!isBinary) {
+      // A chain message can carry a DIFFERENT range: the coordinator re-splits when
+      // a device joins or leaves, or when the timings say this one should hold more
+      // or fewer. Rebuild rather than keep computing the layers we happen to have,
+      // which would put the wrong layers at the right positions.
+      const m = JSON.parse(data.toString());
+      if (m.t === 'chain' && (m.start !== meta.start || m.end !== meta.end)) {
+        const was = meta.start == null ? 'nothing' : `${meta.start}-${meta.end}`;
+        meta = {...meta, start: m.start, end: m.end, slot: m.slot};
+        await build();
+        console.log(`${tag}: reassigned ${was} -> ` +
+                    (m.start == null ? 'nothing' : `${m.start}-${m.end}`));
+      }
+      return;
+    }
     const ab = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
     const {data: h, meta: m} = unpack(ab);
-    // A reset means the conversation restarted, so OUR shard of the K/V cache is
-    // stale too. Each layer owns its own, so each one clears it.
-    if (m.reset) for (const L of layers) L.reset();
+    if (!layers.length) return;      // reassigned out of the chain mid-flight
 
     const t0 = performance.now();
-    // Chain the layers on the GPU, the way kernels/model.ts chains its 28: layer i
-    // reads what layer i-1 wrote via a device-to-device copy, everything shares
-    // ONE command buffer, and only the shard's final output comes back to the
-    // host. A readback per layer instead would cost ~24 ms each -- measured 20.8x
-    // for this exact difference in bench_layer.ts.
-    const enc = dev.createCommandEncoder();
-    for (let i = 0; i < layers.length; i++) {
-      const L = layers[i];
-      if (i === 0) {
-        // Only the first layer takes the hidden state off the wire.
-        if (m.seq === 1) L.encode(h, enc);
-        else L.encodePrefill(m.seq, h, enc);
-      } else {
-        enc.copyBufferToBuffer(layers[i - 1].outputBuffer(), 0,
-                               L.inputBuffer(), 0, m.seq * j.hidden * 4);
-        // No hidden argument: consume what the copy just put in our own buffer.
-        if (m.seq === 1) L.encode(undefined, enc);
-        else L.encodePrefill(m.seq, undefined, enc);
+    let flat;
+    if (FAKE) {
+      // Echo the hidden state back unchanged. The TEXT will be wrong, and that is
+      // fine and explicit: a fake bird tests the allocation, the chain and the
+      // rebalancer, never the arithmetic. Correctness is what a real simulated bird
+      // and node/test/bird_ui.test.mjs are for.
+      await stall(SLOW * layers.length);
+      flat = h;
+    } else {
+      // A reset means the conversation restarted, so OUR shard of the K/V cache is
+      // stale too. Each layer owns its own, so each one clears it.
+      if (m.reset) for (const L of layers) L.reset();
+      // Chain the layers on the GPU, the way kernels/model.ts chains its 28: layer i
+      // reads what layer i-1 wrote via a device-to-device copy, everything shares
+      // ONE command buffer, and only the shard's final output comes back to the
+      // host. A readback per layer instead would cost ~24 ms each -- measured 20.8x
+      // for this exact difference in bench_layer.ts.
+      const enc = dev.createCommandEncoder();
+      for (let i = 0; i < layers.length; i++) {
+        const L = layers[i];
+        if (i === 0) {
+          // Only the first layer takes the hidden state off the wire.
+          if (m.seq === 1) L.encode(h, enc);
+          else L.encodePrefill(m.seq, h, enc);
+        } else {
+          enc.copyBufferToBuffer(layers[i - 1].outputBuffer(), 0,
+                                 L.inputBuffer(), 0, m.seq * meta.hidden * 4);
+          // No hidden argument: consume what the copy just put in our own buffer.
+          if (m.seq === 1) L.encode(undefined, enc);
+          else L.encodePrefill(m.seq, undefined, enc);
+        }
       }
+      dev.queue.submit([enc.finish()]);
+      flat = await layers[layers.length - 1].readOutput(m.seq);
+      await stall(SLOW * layers.length);
     }
-    dev.queue.submit([enc.finish()]);
-    const flat = await layers[layers.length - 1].readOutput(m.seq);
-    const ms = +(performance.now() - t0).toFixed(1);
+    const took = +(performance.now() - t0).toFixed(1);
 
-    ws.send(pack(flat, {seq: m.seq, hidden: j.hidden, offset: m.offset}));
-    ws.send(JSON.stringify({t: 'stats', ms}));
+    ws.send(pack(flat, {seq: m.seq, hidden: meta.hidden, offset: m.offset}));
+    ws.send(JSON.stringify({t: 'stats', ms: took}));
   });
   return j;
 }
 
-if (!solo) {
-  await bird(label);
+if (!SOLO) {
+  await bird(LABEL);
 } else {
-  // Claim slots until /join says the flock is full. Sequential on purpose: the
-  // coordinator hands out the lowest free slot, so racing would be ambiguous.
-  const {birds} = await (await fetch(`${BASE}/status`)).json();
-  for (let i = 0; i < birds.length; i++) await bird(`sim${i}`);
-  console.log(`solo: holding all ${birds.length} slots`);
+  // N devices in one process. Sequential on purpose: the allocator keeps join order,
+  // so racing would make the assignment depend on which fetch won.
+  for (let i = 0; i < N; i++) await bird(`${LABEL}${i}`);
+  console.log(`solo: ${N} device${N === 1 ? '' : 's'} covering the birds' layers`);
 }

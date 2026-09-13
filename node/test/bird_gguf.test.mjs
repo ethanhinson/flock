@@ -33,14 +33,25 @@ const check = (name, cond, extra = '') => {
 
 // A coordinator just complete enough for the load path: /join and /diag. There are
 // no shard routes to stub any more -- they are gone from the server too.
-function stubCoordinator(gguf) {
+/**
+ * @param gguf    the weights url to hand out
+ * @param join    what /join answers. A function gets the attempt number, so a
+ *                scenario can answer `wait` a few times before assigning layers --
+ *                which is what the coordinator does when a token is in flight, and is
+ *                a branch the page has to survive rather than treat as a refusal.
+ *                Also records what the page SENT, so the caps payload is checkable.
+ */
+function stubCoordinator(gguf, join = null) {
+  const seen = {joins: [], attempts: 0};
   const srv = createServer((req, res) => {
     if (req.url === '/join') {
       let body = '';
       req.on('data', c => body += c);
       req.on('end', () => {
+        try { seen.joins.push(JSON.parse(body)); } catch { seen.joins.push(null); }
+        const n = seen.attempts++;
         res.setHeader('content-type', 'application/json');
-        res.end(JSON.stringify({
+        res.end(JSON.stringify(join ? join(n) : {
           peer_id: 'test', slot: 0, start: 24, end: 27, n_layers: 4,
           hidden: 1024, kv_heads: 8, head_dim: 128, kv_cache: true,
           n_total: 28, model: 'Qwen/Qwen3-0.6B', gguf,
@@ -51,7 +62,7 @@ function stubCoordinator(gguf) {
     if (req.url === '/diag') { res.end('{"ok":true}'); return; }
     res.statusCode = 404; res.end('{}');
   });
-  return new Promise(r => srv.listen(0, '127.0.0.1', () => r(srv)));
+  return new Promise(r => srv.listen(0, '127.0.0.1', () => { srv.seen = seen; r(srv); }));
 }
 
 const mk = () => ({
@@ -76,8 +87,8 @@ const mk = () => ({
  * for kernels/layer.ts, so a scenario can make building the layers throw without
  * needing a real device.
  */
-async function run({gguf, gpu, ggufModule, layerModule}) {
-  const srv = await stubCoordinator(gguf);
+async function run({gguf, gpu, ggufModule, layerModule, join = null}) {
+  const srv = await stubCoordinator(gguf, join);
   const BASE = `http://127.0.0.1:${srv.address().port}`;
   const nodes = new Map();
   for (const id of ['sub', 'card', 'layers', 'of', 'count', 'dl', 'dlwhat', 'dlpct',
@@ -121,6 +132,10 @@ async function run({gguf, gpu, ggufModule, layerModule}) {
 
   const rewritten = src
     .replace("from '/js/wire.mjs'", `from '${new URL('../../web/js/wire.mjs', import.meta.url).href}'`)
+    // The REAL probe, not a stub: it takes navigator.gpu as an argument, so a
+    // scenario's fake adapter drives it exactly as a real one would. That keeps this
+    // test honest about the caps the page actually sends at /join.
+    .replace("from '/js/probe.mjs'", `from '${new URL('../../web/js/probe.mjs', import.meta.url).href}'`)
     .replace("from '/js/gguf-stream.mjs'", `from '${pathToFileURL(ggufPath).href}'`)
     .replace("from '/kernels/layer.ts.js'", `from '${pathToFileURL(layerPath).href}'`)
     .replace(/fetch\('\//g, `fetch('${BASE}/`)
@@ -142,6 +157,7 @@ async function run({gguf, gpu, ggufModule, layerModule}) {
   }
 
   const log = nodes.get('status').children.map(c => c.textContent);
+  const seen = srv.seen;
   srv.close();
   try { unlinkSync(ggufPath); unlinkSync(layerPath); } catch {}
   return {
@@ -151,6 +167,7 @@ async function run({gguf, gpu, ggufModule, layerModule}) {
     detail: nodes.get('pdetail').textContent,
     backend: nodes.get('backend').textContent,
     built: globalThis.__built || 0,
+    joins: seen.joins, attempts: seen.attempts,
   };
 }
 
@@ -199,11 +216,38 @@ export class Layer {
 `;
 
 const GGUF_URL = 'https://example.invalid/model.gguf';
+// A fake adapter, complete enough for the REAL probe in /js/probe.mjs to run its
+// compute pass against -- the page probes this device before it joins, and what the
+// probe reports is what the allocator plans against, so stubbing the probe away would
+// leave the most important number in the whole flow untested here.
+globalThis.GPUBufferUsage = {STORAGE: 1, COPY_SRC: 2, COPY_DST: 4, MAP_READ: 8};
+globalThis.GPUMapMode = {READ: 1};
+const fakeDevice = () => ({
+  createShaderModule: () => ({}),
+  createComputePipeline: () => ({getBindGroupLayout: () => ({})}),
+  createBuffer: ({size}) => ({
+    destroy() {}, unmap() {}, mapAsync: async () => {},
+    // The probe checks that element 63 reads back 63*63; anything else means the
+    // device advertised limits it cannot honour.
+    getMappedRange: () => { const a = new Uint32Array(size / 4); a[63] = 63 * 63;
+                            return a.buffer; },
+  }),
+  createBindGroup: () => ({}),
+  createCommandEncoder: () => ({
+    beginComputePass: () => ({setPipeline() {}, setBindGroup() {},
+                              dispatchWorkgroups() {}, end() {}}),
+    copyBufferToBuffer() {}, finish: () => ({}),
+  }),
+  queue: {submit() {}},
+  destroy() {},
+});
 const fakeGPU = {
   requestAdapter: async () => ({
-    limits: {maxBufferSize: 1 << 30, maxStorageBufferBindingSize: 1 << 28},
+    limits: {maxBufferSize: 1 << 30, maxStorageBufferBindingSize: 1 << 28,
+             maxComputeWorkgroupStorageSize: 16384,
+             maxComputeInvocationsPerWorkgroup: 256},
     info: {vendor: 'test'},
-    requestDevice: async () => ({}),
+    requestDevice: async () => fakeDevice(),
   }),
 };
 
@@ -266,6 +310,62 @@ check('did NOT become ready on a short load', !r.joined);
 check('showed a problem banner', r.problem);
 check('names the layer it did not get', /layer 2[567]/.test(r.detail),
   r.detail.slice(0, 90));
+
+// --- dynamic membership -----------------------------------------------------
+// These four are the behaviours that only exist because FLOCK_BIRDS is gone.
+
+console.log('\nit reports its MEASURED limits at /join, not a guess:');
+globalThis.__built = 0;
+r = await run({gguf: GGUF_URL, gpu: fakeGPU, ggufModule: OK_GGUF, layerModule: OK_LAYER});
+{
+  const caps = r.joins[0]?.caps;
+  check('the join carried a caps object', !!caps, JSON.stringify(caps));
+  check('  with the adapter\'s real maxStorageBufferBindingSize',
+    caps.maxStorageBufferBindingSize === (1 << 28), String(caps.maxStorageBufferBindingSize));
+  check('  and maxBufferSize', caps.maxBufferSize === (1 << 30));
+  // The one the allocator cannot work around, so the one that must not be guessed.
+  check('  and a real compute pass result, not just a limits table',
+    caps.computeOk === true, String(caps.computeOk));
+  check('the page logged the limits where a human can see them',
+    r.log.some(l => /gpu limits: buffer \d+MB, binding \d+MB/.test(l)),
+    r.log.find(l => l.startsWith('gpu limits')) || '(none)');
+}
+
+console.log('\n/join answering "wait" (a token is in flight) -> it retries, not fails:');
+globalThis.__built = 0;
+r = await run({gguf: GGUF_URL, gpu: fakeGPU, ggufModule: OK_GGUF, layerModule: OK_LAYER,
+  // Twice "wait", then the real assignment. This is what the coordinator does when a
+  // device joins mid-generation: the running token finishes against the old topology
+  // and layers are assigned at the next boundary.
+  join: n => n < 2
+    ? {peer_id: 'test', wait: true, retry_ms: 10, gguf: GGUF_URL,
+       reason: 'a token is in flight; layers are assigned at the next token boundary'}
+    : {peer_id: 'test', slot: 0, start: 24, end: 27, n_layers: 4, hidden: 1024,
+       kv_heads: 8, head_dim: 128, kv_cache: true, n_total: 28,
+       model: 'Qwen/Qwen3-0.6B', gguf: GGUF_URL}});
+check('it kept asking rather than giving up', r.attempts === 3, `${r.attempts} attempts`);
+check('and ended up ready with its layers built', r.joined && r.built === 4,
+  `built ${r.built}`);
+check('no problem banner: waiting is not a failure', !r.problem, r.title);
+check('it said what it was waiting for', r.log.some(l => /token is in flight/.test(l)),
+  r.log.find(l => /flight/.test(l)) || '(nothing logged)');
+
+console.log('\na flock that cannot hold the model -> named before anything downloads:');
+globalThis.__built = 0;
+r = await run({gguf: GGUF_URL, gpu: fakeGPU, ggufModule: OK_GGUF, layerModule: OK_LAYER,
+  join: () => ({peer_id: 'test',
+    error: 'no device can hold layer 40: its largest tensor output.weight is ' +
+           '638.0MB, and the roomiest device in the flock (iPhone) allows 134.2MB ' +
+           'per tensor.',
+    detail: {kind: 'tensor', layer: 40, tensor: 'output.weight'}})});
+check('did NOT become ready', !r.joined);
+check('showed a problem banner', r.problem);
+check('the tensor and both numbers reach the UI',
+  /output\.weight/.test(r.detail) && /638\.0MB/.test(r.detail) &&
+  /134\.2MB/.test(r.detail), r.detail.slice(0, 100));
+check('and it is NOT reported as "flock full" any more',
+  !/full/i.test(r.title + r.detail), r.title);
+check('nothing was downloaded and nothing was built', r.built === 0, `built ${r.built}`);
 
 console.log(`\n${fails ? `${fails} failed` : 'all checks passed'}`);
 process.exit(fails ? 1 : 0);

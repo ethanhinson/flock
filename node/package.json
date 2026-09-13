@@ -5,12 +5,14 @@
   "scripts": {
     "start": "deno run --unstable-webgpu --allow-all src/server.js",
     "solo": "deno run --unstable-webgpu --allow-all sim_bird.mjs solo",
+    "fake": "deno run --unstable-webgpu --allow-all sim_bird.mjs --fake",
     "bird": "deno run --unstable-webgpu --allow-all sim_bird.mjs",
     "health": "curl -fsS http://127.0.0.1:${PORT:-8000}/health",
     "status": "curl -fsS http://127.0.0.1:${PORT:-8000}/status",
-    "check": "node check_html.mjs ../web/*.html && node --check src/server.js && node --check src/mesh.js && node --check src/coordinator.js && node --check src/gguf.mjs && node --check sim_bird.mjs && node --check plan.mjs",
-    "test": "npm run check && node test/gguf.test.mjs && node test/gguf_dir.test.mjs && node test/bird_gguf.test.mjs",
+    "check": "node check_html.mjs ../web/*.html && node --check src/server.js && node --check src/mesh.js && node --check src/coordinator.js && node --check src/gguf.mjs && node --check src/allocate.js && node --check src/speed.js && node --check ../web/js/probe.mjs && node --check sim_bird.mjs && node --check plan.mjs && node --check test/membership_e2e.mjs",
+    "test": "npm run check && node test/allocate.test.mjs && node test/flock.test.mjs && node test/probe.test.mjs && node test/gguf.test.mjs && node test/gguf_dir.test.mjs && node test/bird_gguf.test.mjs",
     "test:ui": "node test/chat_ui.test.mjs && deno run --unstable-webgpu --allow-all test/bird_ui.test.mjs",
+    "test:membership": "node test/membership_e2e.mjs",
     "test:gpu": "cd .. && deno run --config kernels/deno.json --unstable-webgpu --allow-all web/js/gguf-stream.test.ts",
     "plan": "node plan.mjs"
   },
