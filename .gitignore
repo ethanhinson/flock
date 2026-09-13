@@ -13,6 +13,11 @@ kernels/.ref
 # tracked; each machine makes its own.
 .certs/
 
+# The coordinator's durable state: the conversation journal (token ids and the
+# f16 activations that left its layers) and the sessions it issued, so a restart
+# resumes the conversation and the devices re-attach. Per machine, never tracked.
+.state/
+
 node_modules/
 .DS_Store
 

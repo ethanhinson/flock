@@ -435,7 +435,7 @@ console.log('\nREADINESS: assigned is not holding, and a lap waits for holding:'
   const b = join(f, 'b');
   f.plan({force: true});
   ok('after a reassignment the moved bird is pending again', !a.isReady() && !f.ready(),
-     `a holds ${a.start}-${a.end}, confirmed ${a.confirmed.start}-${a.confirmed.end}`);
+     `a holds ${a.start}-${a.end}, confirmed ${a.confirmed ? `${a.confirmed.start}-${a.confirmed.end}` : 'nothing (cleared by the move)'}`);
   ok('  and so is the newcomer', !b.isReady());
   a.confirm(a.start, a.end);
   ok('  one confirmation is not enough', !f.ready() && f.pending()[0] === b);

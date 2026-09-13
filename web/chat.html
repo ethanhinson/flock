@@ -256,9 +256,15 @@ function drawAlloc(s) {
   rows.push(`<div>last decision: ${d.moved ? '<b>moved layers</b>' : 'left it alone'}` +
             ` — ${esc(d.reason || '')}</div>`);
   if (s.last_rebalance) {
+    // A move no longer costs the conversation: the coordinator journals what it
+    // fed and replays it into the devices that moved before the next turn.
+    const r = s.last_rebalance;
     rows.push(`<div class="w">the flock last changed shape ` +
-      `${Math.round((Date.now() - s.last_rebalance.at) / 1000)}s ago, which dropped ` +
-      `the conversation context: ${esc(s.last_rebalance.reason)}</div>`);
+      `${Math.round((Date.now() - r.at) / 1000)}s ago: ${esc(r.reason)}` +
+      (r.dropped_context ? ' — the conversation context was dropped'
+        : s.replay_pending ? ` — the ${s.cached_tokens}-token context is replayed into the devices before the next turn`
+        : s.last_replay ? ` — the context was rebuilt from the journal (${s.last_replay.tokens} tokens in ${s.last_replay.ms}ms)`
+        : '') + `</div>`);
   }
   $('alloc').innerHTML = rows.join('');
 }
@@ -380,6 +386,7 @@ async function send(prompt, {reset = false} = {}) {
   const hops = [];
   const t0 = Date.now();
   let text = '';
+  let replayed = null;
   try {
     const res = await fetch('/chat', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -423,6 +430,14 @@ async function send(prompt, {reset = false} = {}) {
             const n = $(`ms${b.slot ?? i}`);
             if (n) n.textContent = fmt(b.ms) + ' ms';
           });
+        } else if (ev.type === 'replay') {
+          // The devices' caches were rebuilt from the journal before this turn:
+          // a device refreshed, moved, paused or the coordinator restarted, and
+          // the conversation went with it rather than being dropped.
+          cur.remove();
+          body.textContent = `rebuilt ${ev.tokens} tokens of context on the devices (${ev.ms}ms)`;
+          body.append(cur);
+          replayed = ev;
         } else if (ev.type === 'rebalanced') {
           // The flock changed shape between two tokens of this answer. The layers
           // that moved took their share of the K/V cache with them, so the
@@ -443,7 +458,8 @@ async function send(prompt, {reset = false} = {}) {
                                    'was dropped'}[ev.stop] ?? '';
           m.append(el('div', 'meta',
             `${ev.tokens} tokens · ${ev.prompt_tokens} prompt · ` +
-            `${wall.toFixed(1)}s · context ${ev.cached}${why}`));
+            `${wall.toFixed(1)}s · context ${ev.cached}${why}` +
+            (replayed ? ` · context rebuilt on the devices first (${replayed.tokens} tokens, ${replayed.ms}ms)` : '')));
           if (hops.length) m.append(statsBlock(hops, wall));
           $('convo').scrollTop = $('convo').scrollHeight;
         }

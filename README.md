@@ -72,6 +72,10 @@ Other things you can set:
 | `FLOCK_BIRD_LAYERS` | all but the coordinator's | an explicit size for the birds' share |
 | `FLOCK_READY_WAIT_MS` | 90000 | how long a turn waits for reassigned devices to finish streaming |
 | `FLOCK_NO_TLS` | | serve plain http even when `.certs/` exists (the test runner uses this) |
+| `FLOCK_STATE_DIR` | `.state/` | where the conversation journal and the sessions are kept, so a restart resumes |
+| `FLOCK_SESSION_TTL_MS` | 600000 | how long a device's session lasts without activity (and how long a paused device is kept) |
+| `FLOCK_PAUSE_GRACE_MS` | 2500 | how long after a device pauses before its layers are handed on (a refresh is back inside this) |
+| `FLOCK_REPLAY_CHUNK` | 64 | tokens per replay frame; 64 keeps a frame under a data channel's 256 KiB message limit |
 | `FLOCK_ONNX_REF` | `kernels/.ref` | where the ONNX reference export lives, for the engine's regression test |
 
 No phone handy? `npm run solo` runs a simulated bird in one process that holds
@@ -96,8 +100,11 @@ If a device is still loading when you send, the reply shows `waiting for iPhone
 to load layers 16-27` until it is not.
 
 In the terminal: one line per join with the device's reported limits, the
-split it produced and the predicted per-token cost, `[ready]` as each device
-confirms its layers, and `[nack]` if a device ever refuses a frame.
+split it produced and the predicted per-token cost (`REATTACH` when it is a
+device coming back with its session), `[ready]` as each device confirms its
+layers, `[pause]` and `[resume]` as a phone goes to the background and returns,
+`[replay]` when the conversation is rebuilt into the devices, and `[nack]` if a
+device ever refuses a frame.
 
 `/status` has all of it as JSON; `/health` answers 200 when a prompt could be
 served right now.
@@ -151,10 +158,11 @@ Two rules keep that from thrashing, and both were learned the hard way:
   re-stream its weights, and holds nothing for the 3-18 seconds that takes, so
   the number of movers is the real cost of a change.
 - **Speed rebalancing never fires during a conversation.** Timings are recorded
-  every token, but acting on them moves layers, and the K/V cache is sharded by
-  layer, so a move drops the conversation. The exact split is only applied when
-  a conversation starts (the clear button, or the first message), and only if
-  it promises at least 15% and the last move was 20 s ago.
+  every token, but acting on them moves layers, and every move costs the moved
+  devices a re-stream and the whole flock a replay of the conversation so far
+  (see below). The exact split is only applied when a conversation starts (the
+  clear button, or the first message), and only if it promises at least 15% and
+  the last move was 20 s ago.
 
 A device that has been assigned layers is not yet holding them. Every bird
 confirms its range once the weights are on its GPU, the coordinator sends
@@ -165,17 +173,62 @@ made the flock usable: before it, one phone joining moved every device, the
 next frame arrived at one that was still streaming, that device left, and the
 leave moved everyone again.
 
+## What survives, and what it costs
+
+Each device caches keys and values for its own layers only, in GPU buffers
+inside a browser tab. A refresh, a reassignment, a phone going to the
+background and a coordinator restart all destroy that cache, and no scheme
+preserves it. It is **rebuilt** instead, and the rebuild is exact:
+
+- **The coordinator journals the conversation** -- the exact token ids it fed,
+  in order, with turn boundaries, and the f16 activation that left its own
+  layers for each one (2 KB per token). Never the text: the chat template
+  scaffolds the current turn differently from past ones, so re-tokenizing the
+  history would diverge from what was actually fed. The journal is append-only
+  on disk under `.state/`.
+- **Any change of who holds what replays the journal.** Before the next turn,
+  the coordinator sends every bird the journaled activations again, in chunks,
+  marked as replay so no bird counts or times them as output. Prefill is
+  bit-identical to decoding the same tokens one at a time, and f16 round-trips
+  exactly, so the rebuilt caches are bit-for-bit what an uninterrupted flock
+  would hold. `test/e2e/session.test.mjs` proves it the strong way: the answer
+  after a refresh, and after a join, is *exactly* the answer a reference run
+  gave. A join used to reset the chat to `turn: 1, cached: 29`; it does not
+  any more.
+- **A refresh re-attaches.** `/join` issues a session token bound to the peer
+  id, the device's limits and its address, which the page keeps in
+  sessionStorage (per tab; it dies with the tab). A refreshed page presents it
+  and gets the same peer id and the same layers back; nobody else moves. A
+  forged, expired or borrowed token is a fresh join, never someone else's
+  membership.
+- **Backgrounding is explicit.** A tab going hidden tells the coordinator
+  (`pause`, plus a beacon that survives the page being suspended). After a
+  short grace -- long enough for a refresh to come back without anything
+  moving -- its layers go to its neighbours and the conversation is replayed
+  into them; when the tab is visible again it re-attaches, is placed again, and
+  is replayed. Be clear about what this does not do: **a browser tab cannot
+  compute while backgrounded on iOS.** JS, sockets and WebGPU are all
+  suspended. The protocol makes backgrounding graceful, not free -- coming back
+  costs one re-stream (from the IndexedDB cache, seconds) and one replay.
+- **A coordinator restart resumes.** On start it reloads the journal and the
+  sessions, recomputes its own K/V by prefilling its layers from the ids,
+  accepts the devices back on the layers they still hold, and replays the
+  journal into them before the next turn. `test/e2e/restart.test.mjs` kills the
+  coordinator between turns 2 and 3 and asserts turn 3 is exactly the reference
+  answer.
+- **A turn that fails mid-way is rewound, not dropped.** A device dying
+  mid-token used to cost the whole conversation; now the journal is truncated to
+  the start of that turn and every cache rebuilt to there.
+
 ## What it cannot do
 
-- **A reassignment drops the conversation.** Each device caches keys and values
-  for its own layers only, so when a layer moves its cache stays behind. The
-  turn after a join or a leave starts from an empty context, and the chat page
-  says so. Re-feeding the history is not an option either: the chat template
-  scaffolds the current turn differently from past ones, so a re-encoded
-  conversation diverges from what was actually fed.
-- **The first turn after a change waits.** A moved device streams its new
-  layers first; a phone takes 3-18 seconds for a few layers, longer for a big
-  share.
+- **The first turn after a change waits, then replays.** A moved device streams
+  its new layers first (a phone takes 3-18 seconds for a few layers, longer for
+  a big share), and then the conversation so far is replayed through the chain
+  (hundreds of milliseconds for a few hundred tokens). The chat page shows both.
+- **A backgrounded phone does no work.** See above: it is handed around
+  gracefully, but while it is in the background it holds nothing and the others
+  carry its share.
 - **It is slower than either device alone.** Pipeline parallelism buys
   capacity, not throughput; one device computes at a time. Adding a device
   lowers tokens per second. What it buys is running a model no single device
@@ -189,8 +242,8 @@ leave moved everyone again.
   The context only grows until it is cleared.
 - **The coordinator's share is fixed at startup.** Its layers are loaded once
   onto its GPU; only the birds' share is divided live.
-- **LAN only.** No authentication and almost no input validation. Do not expose
-  it to the internet.
+- **LAN only.** No authentication beyond the session tokens, and almost no
+  input validation. Do not expose it to the internet.
 
 ## Layout
 
@@ -198,15 +251,19 @@ leave moved everyone again.
 server/    the coordinator: HTTP + websocket signaling + the chat loop
            (server.js), its layers and tokenizer (coordinator.js), the flock
            and the WebRTC links (mesh.js), who holds what (allocate.js),
-           whether the timings justify moving anything (speed.js), and the
-           GGUF directory reader (gguf.mjs)
+           whether the timings justify moving anything (speed.js), the
+           conversation journal that makes replay exact (journal.js), the
+           session tokens that let a device come back as itself (session.js),
+           and the GGUF directory reader (gguf.mjs)
+.state/    the journal and the sessions, on disk, so a restart resumes
 web/       what a device opens: bird.html (a bird), chat.html, inspect.html
            (/check); web/js/ holds the modules the browser and the server share
            -- the f16 wire format, the GGUF streamer, the capability probe
 kernels/   the WGSL engine: nine compute kernels, Layer, Model, and the suite
            that validates them against strict-f32 references and an ONNX export
-tools/     sim_bird.mjs (a bird without a browser), plan.mjs (what each device
-           would fetch), check_html.mjs, cert.sh
+tools/     sim_bird.mjs (a bird without a browser: it keeps a session, takes
+           pause/resume/leave on stdin, and reconnects), plan.mjs (what each
+           device would fetch), check_html.mjs, cert.sh
 test/      unit/ (node, no GPU), e2e/ (need a live coordinator), gpu/ (need a
            device), and run.mjs, which runs all of it
 ```
@@ -224,7 +281,8 @@ that is worth reading on its own.
 ```bash
 npm test               # everything, with a summary table at the end
 npm run test:unit      # node, no GPU: the allocator, the flock, the probe, the
-                       # bird page's load path, both GGUF parsers (network)
+                       # bird page's load path, the journal, the sessions, both
+                       # GGUF parsers (network)
 npm run test:e2e       # starts its own coordinator on a spare port and its own
                        # simulated birds, and kills them all when done
 npm run test:kernels   # the WGSL engine's 13 suites, 316 assertions, on the GPU
@@ -236,10 +294,16 @@ The e2e group is the one that matters for the membership protocol.
 nothing for 2.5 s after every assignment, joins devices between turns and
 mid-turn, and asserts on what each bird *says it holds* and on whether a
 five-turn chat completes -- because the cascade it guards against was
-invisible to every `/status` check. The runner never touches port 8000, where
-a real flock might be, and every simulated bird it starts is in its own
-process group and killed on the way out; stand-ins left holding layers have
-blocked real phones from joining before.
+invisible to every `/status` check. `session.test.mjs` and `restart.test.mjs`
+do the same for durability with real (GPU) stand-ins, because their claim is
+about text: a three-turn conversation is run once uninterrupted as a
+reference, then again with a refresh, a join, a pause/resume, a forged session
+and a coordinator restart in the middle, and the answers are asserted to be
+exactly the reference's. The runner never touches port 8000, where a real
+flock might be, gives its coordinator a throwaway state directory, and every
+simulated bird it starts is in its own process group and killed on the way
+out; stand-ins left holding layers have blocked real phones from joining
+before.
 
 `onnxruntime-node` is a devDependency for one reason: `kernels/test_model.ts`
 diffs the WGSL engine, token for token, against an ONNX export of the same

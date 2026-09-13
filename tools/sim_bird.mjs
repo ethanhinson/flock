@@ -1,8 +1,9 @@
 // A bird without a browser.
 //
 // Runs the same layers a phone would, with the same WGSL kernels, and speaks the
-// same protocol -- join, hello, chain, ready, frames, nack, stats -- so the whole
-// chain can be exercised on one machine with no browser, over ssh, or in a test.
+// same protocol -- join, hello, chain, ready, frames, nack, stats, session, pause
+// -- so the whole chain can be exercised on one machine with no browser, over
+// ssh, or in a test.
 //
 // RUN IT WITH DENO, NOT NODE -- it needs a GPU for the same reason the
 // coordinator does, and Node has no WebGPU:
@@ -32,19 +33,36 @@
 //                          handshake: a frame arriving while it holds no layers
 //                          makes it LEAVE the flock. Kept only so the churn test
 //                          can demonstrate the cascade that handshake prevents.
+//   --session-file f.json  where to keep the session the coordinator issued, so a
+//                          sim that is killed and started again RE-ATTACHES the
+//                          way a refreshed page does (bird.html keeps it in
+//                          sessionStorage; a process has to keep it in a file)
+//
+// IT TAKES ORDERS ON STDIN, one per line, because a test has to make a device do
+// what a phone does without a phone:
+//
+//   pause      what a tab does on visibilitychange -> hidden: tell the
+//              coordinator, then go quiet (the socket is dropped, the way iOS
+//              suspends it). The layers stay built, as a phone's may or may not.
+//   resume     what a tab does when visible again: re-attach with the session,
+//              reconnect, rebuild if the range changed, confirm.
+//   leave      POST /leave and exit.
 //
 // --fake is what makes the membership tests runnable anywhere: a fake bird exercises
 // /join, the chain, the timings, readiness and the rebalancer without a device and
 // without 67MB of weights. A REAL simulated bird (no --fake) still computes real
 // layers with real kernels, which is what proves the text stays correct.
 //
-// WHAT IT PRINTS IS PART OF ITS INTERFACE. test/e2e/churn.test.mjs asserts on what
-// a bird actually holds, not on what /status says it holds -- the cascade was
-// invisible to every /status check -- so each state change is one line:
+// WHAT IT PRINTS IS PART OF ITS INTERFACE. The e2e tests assert on what a bird
+// actually holds and does, not on what /status says -- the cascade the churn test
+// guards against was invisible to every /status check -- so each state change is
+// one line:
 //
 //   <tag> joined 4-15            <tag> loading 4-9         <tag> ready 4-9
 //   <tag> reassigned 4-15 -> 4-9 <tag> nack seq=3 (not-ready: still streaming)
 //   <tag> link webrtc            <tag> left: <reason>
+//   <tag> session <token>        <tag> reattached 4-9      <tag> reconnected
+//   <tag> replay 64@0            <tag> paused              <tag> resumed 4-9
 //
 // WEIGHTS COME FROM THE SAME PLACE A REAL BIRD'S DO: the GGUF file, by byte
 // range, over the network. What differs from bird.html is only HOW they reach the
@@ -52,8 +70,9 @@
 // phone streams its range so the bytes never sit in the JS heap. Both end up
 // calling the same Layer with the same numbers.
 import WebSocket from 'ws';
-import {existsSync} from 'node:fs';
+import {existsSync, readFileSync, writeFileSync} from 'node:fs';
 import {Buffer} from 'node:buffer';
+import {createInterface} from 'node:readline';
 import {pack, unpack} from '../web/js/wire.mjs';
 
 // The coordinator serves https when .certs/ exists (Chrome hides WebGPU outside a
@@ -95,6 +114,7 @@ const BIND = bytes(arg('--bind', null));
 const BUDGET = bytes(arg('--budget', null));
 const NO_RTC = has('--no-rtc');
 const LEAVE_ON_UNREADY = has('--leave-on-unready');
+const SESSION_FILE = arg('--session-file', null);
 const LABEL = arg('--label', null) ||
   (SOLO ? 'sim' : (argv[0] && !argv[0].startsWith('--') ? argv[0] : 'sim'));
 
@@ -120,7 +140,8 @@ if (!NO_RTC) {
 
 /** What this device claims about itself. A real bird measures these with
  *  /js/probe.mjs; a simulated one is told them, which is how a 64MB binding limit
- *  gets tested without a device that has one. */
+ *  gets tested without a device that has one. The same numbers every time, on
+ *  purpose: the session is bound to them. */
 function caps() {
   const c = {gpu: true, computeOk: true, cores: 8, vendor: FAKE ? 'sim' : 'deno'};
   if (BIND != null) c.maxStorageBufferBindingSize = BIND;
@@ -133,35 +154,57 @@ function caps() {
  *  allocator is built around, and a flat per-token delay would not test it. */
 const stall = n => n > 0 ? new Promise(r => setTimeout(r, n)) : null;
 const range = m => m.start == null ? 'nothing' : `${m.start}-${m.end}`;
+const postJson = (p, body) => fetch(`${BASE}/${p}`, {method: 'POST',
+  headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+
+/** Where this bird keeps its session between runs, if anywhere. */
+const sessionFile = i => SESSION_FILE ? (SOLO && N > 1 ? `${SESSION_FILE}.${i}` : SESSION_FILE) : null;
+const readSession = f => {
+  try { return f && existsSync(f) ? JSON.parse(readFileSync(f, 'utf8')) : null; } catch { return null; }
+};
+
+const birds = [];
 
 /**
  * Claim a place, build the layers we were given, confirm them, and serve frames
- * until the socket closes -- re-building and re-confirming when reassigned.
+ * until told to leave -- re-building and re-confirming when reassigned, and
+ * re-attaching with the session when the socket is lost or the tab "comes back".
  */
-async function bird(tag) {
+async function bird(tag, file = null) {
   const say = s => console.log(`${tag} ${s}`);
-  let j = null, pid = null;
-  // The coordinator answers `wait` when a token is in flight: layers are assigned at
-  // the end of the turn. The peer id from that answer MUST be sent back -- retrying
-  // without it is a second /join, and the coordinator admits a second member with
-  // the same label that it then waits forever on.
-  for (let attempt = 0; attempt < 300; attempt++) {
-    j = await (await fetch(`${BASE}/join`, {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({peer_id: pid, label: tag, caps: caps()})})).json();
-    pid = j.peer_id || pid;
-    if (!j.wait) break;
-    if (attempt === 0) say(`waiting: ${j.reason || 'no layers yet'}`);
-    await new Promise(r => setTimeout(r, j.retry_ms || 500));
-  }
-  if (j.error) throw new Error(j.error);
-  if (j.wait) throw new Error('never got a layer assignment');
-
-  let meta = j;
+  let pid = null, session = readSession(file)?.session || null;
+  let meta = null;
   let layers = [];
   let loading = false, pendingChain = null;
-  let ws = null, pc = null, chan = null;
-  say(`joined ${range(meta)}` + (j.why ? `  (${j.why})` : ''));
+  let ws = null, pc = null, chan = null, beat = null;
+  let paused = false, leaving = false, everOpened = false;
+
+  /**
+   * Ask for a place. With a session, the coordinator RE-ATTACHES us to the
+   * membership we had; without one (or with one it refuses) it is a fresh join.
+   * The coordinator answers `wait` when a token is in flight: layers are assigned at
+   * the end of the turn. The peer id from that answer MUST be sent back --
+   * retrying without it is a second /join, and the coordinator admits a second
+   * member with the same label that it then waits forever on.
+   */
+  async function join() {
+    let j = null;
+    for (let attempt = 0; attempt < 300; attempt++) {
+      j = await (await postJson('join', {peer_id: pid, session, label: tag, caps: caps()})).json();
+      pid = j.peer_id || pid;
+      if (j.session && j.session !== session) {
+        session = j.session;
+        say(`session ${session}`);
+      }
+      if (file && session) writeFileSync(file, JSON.stringify({peer_id: pid, session}));
+      if (!j.wait) break;
+      if (attempt === 0) say(`waiting: ${j.reason || 'no layers yet'}`);
+      await new Promise(r => setTimeout(r, j.retry_ms || 500));
+    }
+    if (j.error) throw new Error(j.error);
+    if (j.wait) throw new Error('never got a layer assignment');
+    return j;
+  }
 
   const send = o => { try { ws?.send(JSON.stringify(o)); } catch {} };
 
@@ -231,12 +274,9 @@ async function bird(tag) {
   }
 
   async function leave(why) {
+    leaving = true;
     say(`left: ${why}`);
-    try {
-      await fetch(`${BASE}/leave`, {method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({peer_id: pid, why})});
-    } catch {}
+    try { await postJson('leave', {peer_id: pid, why}); } catch {}
     try { ws?.close(); } catch {}
   }
 
@@ -254,6 +294,7 @@ async function bird(tag) {
       }
       return nack(m, 'not-ready', loading ? 'still streaming' : 'holding no layers');
     }
+    if (m.replay) say(`replay ${m.seq}@${m.offset}${m.reset ? ' (reset)' : ''}`);
     const t0 = performance.now();
     let flat;
     try {
@@ -265,9 +306,18 @@ async function bird(tag) {
         await stall(SLOW * layers.length);
         flat = h;
       } else {
-        // A reset means the conversation restarted, so OUR shard of the K/V cache is
-        // stale too. Each layer owns its own, so each one clears it.
+        // A reset means the conversation restarted (or is being replayed from the
+        // start), so OUR shard of the K/V cache is stale too. Each layer owns its
+        // own, so each one clears it.
         if (m.reset) for (const L of layers) L.reset();
+        // The frame's position must be where our cache ends. If it is not, the
+        // coordinator and this device disagree about the conversation, and
+        // computing anyway would append keys at the wrong positions -- text that
+        // is wrong without looking wrong. Refuse it; the coordinator rewinds and
+        // replays.
+        if (layers[0].nKeys !== m.offset) {
+          return nack(m, 'desync', `cache holds ${layers[0].nKeys} positions, frame is at ${m.offset}`);
+        }
         // Chain the layers on the GPU, the way kernels/model.ts chains its 28: layer i
         // reads what layer i-1 wrote via a device-to-device copy, everything shares
         // ONE command buffer, and only the shard's final output comes back to the
@@ -294,8 +344,14 @@ async function bird(tag) {
       return nack(m, 'failed', String(e.message || e));
     }
     const took = +(performance.now() - t0).toFixed(1);
-    reply(pack(flat, {seq: m.seq, hidden: meta.hidden, offset: m.offset}));
-    send({t: 'stats', ms: took});
+    // The flags travel with the frame: a successor's cache has to see the same
+    // reset this one did.
+    reply(pack(flat, {seq: m.seq, hidden: meta.hidden, offset: m.offset,
+                      reset: m.reset, replay: m.replay}));
+    // A replay frame is journaled history, not conversation output: its timing
+    // would describe a 64-token prefill, not a token, and would skew the rate the
+    // allocator plans on.
+    if (!m.replay) send({t: 'stats', ms: took});
   }
 
   // --- WebRTC: answer the coordinator's offer, so frames skip the socket -----
@@ -330,45 +386,130 @@ async function bird(tag) {
   // build reassigns us, and with no socket open that notice would be lost. It also
   // means the coordinator can see us as a live, loading member -- which is what
   // lets a turn WAIT for us instead of reporting our layers uncovered.
-  ws = new WebSocket(WS_URL, wsOpts);
-  let beat = null;
-  ws.on('open', () => {
-    send({peer_id: pid, label: tag});
-    // Heartbeat, same as a real bird: liveness is judged on lastSeen, so an idle
-    // sim silently ages out of the flock after 40s without this.
-    send({t: 'ping'});
-    beat = setInterval(() => send({t: 'ping'}), 4000);
-    // A build that finished before the socket opened (no --restream) confirmed
-    // into the void; say it again now that someone is listening.
-    if (!loading && layers.length) ready();
-  });
-  ws.on('close', () => { clearInterval(beat); try { pc?.close(); } catch {} });
-  ws.on('error', e => console.error(`${tag} socket: ${e.message}`));
-  ws.on('message', async (data, isBinary) => {
-    if (!isBinary) {
-      const m = JSON.parse(data.toString());
-      if (m.error) { say(`coordinator: ${m.error}`); return; }
-      if (m.t === 'signal' && !m.from) return onSignal(m.data);
-      // A chain message can carry a DIFFERENT range: the coordinator re-splits when
-      // a device joins or leaves, or when the timings say this one should hold more
-      // or fewer. Rebuild rather than keep computing the layers we happen to have,
-      // which would put the wrong layers at the right positions.
-      if (m.t === 'chain' && (m.start !== meta.start || m.end !== meta.end)) {
-        await reassign(m);
+  //
+  // Reconnects when the socket drops -- a coordinator restart, a network blip --
+  // unless we paused or left on purpose. The hello carries the session, which the
+  // coordinator now requires on the socket: a peer id alone is public in /status.
+  function connect() {
+    if (leaving || paused) return;
+    const sock = new WebSocket(WS_URL, wsOpts);
+    ws = sock;
+    sock.on('open', () => {
+      if (everOpened) say('reconnected');
+      everOpened = true;
+      send({peer_id: pid, session, label: tag});
+      // Heartbeat, same as a real bird: liveness is judged on lastSeen, so an idle
+      // sim silently ages out of the flock after 40s without this.
+      send({t: 'ping'});
+      clearInterval(beat);
+      beat = setInterval(() => send({t: 'ping'}), 4000);
+      // A build that finished before the socket opened (no --restream) confirmed
+      // into the void; say it again now that someone is listening.
+      if (!loading && layers.length) ready();
+    });
+    sock.on('close', () => {
+      clearInterval(beat);
+      try { pc?.close(); } catch {}
+      pc = null; chan = null;
+      if (ws === sock && !leaving && !paused) setTimeout(connect, 1000);
+    });
+    sock.on('error', e => { if (!/ECONNREFUSED/.test(e.message)) console.error(`${tag} socket: ${e.message}`); });
+    sock.on('message', async (data, isBinary) => {
+      if (!isBinary) {
+        const m = JSON.parse(data.toString());
+        if (m.error) {
+          say(`coordinator: ${m.error}`);
+          // The coordinator does not know us (it restarted without our session, or
+          // dropped us). Claim a place again -- with the session, in case it does
+          // recognise that -- and rebuild if the range changed.
+          if (/unknown peer/i.test(m.error) && !leaving) {
+            try { sock.close(); } catch {}
+            await rejoin('the coordinator forgot us');
+          }
+          return;
+        }
+        if (m.t === 'signal' && !m.from) return onSignal(m.data);
+        // A chain message can carry a DIFFERENT range: the coordinator re-splits when
+        // a device joins or leaves, or when the timings say this one should hold more
+        // or fewer. Rebuild rather than keep computing the layers we happen to have,
+        // which would put the wrong layers at the right positions.
+        if (m.t === 'chain' && (m.start !== meta.start || m.end !== meta.end)) {
+          await reassign(m);
+        }
+        return;
       }
-      return;
-    }
-    onFrame(data, frame => ws.send(Buffer.from(frame)));
-  });
+      onFrame(data, frame => sock.send(Buffer.from(frame)));
+    });
+  }
+
+  /** /join again, keeping our built layers if the range is unchanged. */
+  async function rejoin(why) {
+    const j = await join();
+    const same = meta && j.start === meta.start && j.end === meta.end;
+    meta = {...meta, ...j};
+    say(`${j.reattached ? 'reattached' : 'joined'} ${range(meta)}  (${why})`);
+    if (!same || !layers.length) await build();
+    // The socket is what carries the confirmation; connect (or reconnect) now.
+    if (!ws || ws.readyState > 1) connect();
+    else ready();
+    return j;
+  }
+
+  // --- orders from stdin -------------------------------------------------------
+  async function pause() {
+    if (paused) return;
+    paused = true;
+    // Say so on the socket AND with the beacon a page sends from pagehide: a
+    // backgrounded phone's socket may already be stalling.
+    send({t: 'pause', why: 'simulated background'});
+    try { await postJson('pause', {peer_id: pid, session, why: 'simulated background'}); } catch {}
+    clearInterval(beat);
+    try { ws?.close(); } catch {}
+    ws = null;
+    say('paused');
+  }
+  async function resume() {
+    if (!paused) return;
+    paused = false;
+    const j = await join();
+    const same = j.start === meta.start && j.end === meta.end;
+    meta = {...meta, ...j};
+    say(`resumed ${range(meta)}${j.reattached ? '' : '  (fresh join)'}`);
+    // Our layers may or may not have survived the background; a phone's often do
+    // not. Rebuild if the range changed, otherwise keep them and just confirm.
+    if (!same || !layers.length) await build();
+    connect();
+  }
+  const b = {tag, pause, resume, leave: () => leave('told to on stdin'), get paused() { return paused; }};
+  birds.push(b);
+
+  // --- first join ----------------------------------------------------------------
+  const j = await join();
+  meta = j;
+  say(`${j.reattached ? 'reattached' : 'joined'} ${range(meta)}` + (j.why ? `  (${j.why})` : ''));
+  connect();
   await build();
   return j;
 }
 
+// Orders on stdin apply to every bird in this process.
+const rl = createInterface({input: process.stdin});
+rl.on('line', line => {
+  const cmd = line.trim();
+  if (!cmd) return;
+  for (const b of birds) {
+    if (cmd === 'pause') b.pause();
+    else if (cmd === 'resume') b.resume();
+    else if (cmd === 'leave') b.leave().then(() => process.exit(0));
+    else console.log(`${b.tag} ?? ${cmd}`);
+  }
+});
+
 if (!SOLO) {
-  await bird(LABEL);
+  await bird(LABEL, sessionFile(0));
 } else {
   // N devices in one process. Sequential on purpose: the allocator keeps join order,
   // so racing would make the assignment depend on which fetch won.
-  for (let i = 0; i < N; i++) await bird(`${LABEL}${i}`);
+  for (let i = 0; i < N; i++) await bird(`${LABEL}${i}`, sessionFile(i));
   console.log(`solo: ${N} device${N === 1 ? '' : 's'} covering the birds' layers`);
 }
