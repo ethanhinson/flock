@@ -125,14 +125,23 @@ async function bird(tag) {
   let meta = j;
   let layers = [];
 
-  /** Build (or rebuild) the layers for the range we currently hold. */
+  /** Build (or rebuild) the layers for the range we currently hold.
+   *
+   *  Built into a local array and published in ONE statement. Pushing into `layers`
+   *  directly is a real hazard rather than a style point: every await yields to the
+   *  event loop, so a frame arriving mid-build would find `layers` holding 1 of N
+   *  layers, pass the non-empty check in the message handler, and compute over a
+   *  partial chain -- the wrong layers at the right positions. */
   async function build() {
     layers = [];
     if (meta.start == null) return;
-    if (FAKE) { layers = new Array(meta.end - meta.start + 1).fill(null); return; }
+    const n = meta.end - meta.start + 1;
+    if (FAKE) { layers = new Array(n).fill(null); return; }
+    const next = [];
     for (let i = meta.start; i <= meta.end; i++) {
-      layers.push(await Layer.create(dev, weights.layers[i], QWEN3_06B));
+      next.push(await Layer.create(dev, weights.layers[i], QWEN3_06B));
     }
+    layers = next;
   }
   await build();
   console.log(`${tag}: layers ${meta.start}-${meta.end}` +

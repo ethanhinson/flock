@@ -326,12 +326,16 @@ let peerId = localStorage.getItem('flock_peer') || null;
   // avoided. Same kernels either way -- kernels/test_frombuffers.ts asserts the
   // two constructors are bit-identical.
   progress('building layers', 1, 1);
-  layers = [];
+  // Built locally and published in one statement, same as reassign() -- see the note
+  // there. Nothing can arrive here yet (the socket opens only once join is enabled),
+  // but keeping the two paths identical means there is no case to reason about.
+  const built = [];
   for (let i = meta.start; i <= meta.end; i++) {
     const w = got.layers[i];
     if (!w) throw new Error(`the loader returned no tensors for layer ${i}`);
-    layers.push(await Layer.fromBuffers(device, w, QWEN3_06B));
+    built.push(await Layer.fromBuffers(device, w, QWEN3_06B));
   }
+  layers = built;
   progressDone('ready');
   set('backend', capability.backend, 'ok');
   await report('gguf-loaded', {
@@ -510,11 +514,19 @@ async function reassign(m) {
     const got = await loadBirdWeights(device, meta.gguf, meta.start, meta.end, {
       onNote: s => log('gguf: ' + s),
     });
+    // Build into a LOCAL array and publish it in one statement at the end. Pushing
+    // into `layers` directly is a real hazard rather than a style point: every await
+    // here yields to the event loop, so a frame arriving mid-build would find `layers`
+    // holding 1 of N built layers, pass runFrame's non-empty check, and compute over a
+    // partial chain -- the wrong layers at the right positions, which is exactly the
+    // plausible garbage that guard exists to prevent.
+    const next = [];
     for (let i = meta.start; i <= meta.end; i++) {
       const w = got.layers[i];
       if (!w) throw new Error(`the loader returned no tensors for layer ${i}`);
-      layers.push(await Layer.fromBuffers(device, w, QWEN3_06B));
+      next.push(await Layer.fromBuffers(device, w, QWEN3_06B));
     }
+    layers = next;
     progressDone('ready');
     cachedTokens = 0;
     set('cache', '0 tokens');
