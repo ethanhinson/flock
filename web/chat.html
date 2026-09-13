@@ -35,6 +35,19 @@
   .link{flex:0 0 auto;align-self:center;color:var(--faint);font-size:11px;padding:0 1px}
   .link.p2p{color:var(--hot)}
 
+  /* ---- why each device got its share ----------------------------------- */
+  #allocbox{margin-top:7px}
+  #allocbox summary{font-size:10.5px;color:var(--dim);cursor:pointer;
+                    list-style:none;display:inline-block;padding:2px 0}
+  #allocbox summary::-webkit-details-marker{display:none}
+  #allocbox summary:before{content:'▸ ';color:var(--faint)}
+  #allocbox[open] summary:before{content:'▾ '}
+  #alloc{font-size:10.5px;color:var(--dim);margin-top:4px;line-height:1.7;
+         font-variant-numeric:tabular-nums}
+  #alloc .w{color:var(--warn)}
+  #alloc .b{color:var(--bad)}
+  #alloc b{color:var(--fg);font-weight:600}
+
   /* ---- conversation ----------------------------------------------------- */
   #convo{flex:1;overflow-y:auto;padding:14px;-webkit-overflow-scrolling:touch}
   .msg{margin:0 0 14px;max-width:62ch}
@@ -99,6 +112,13 @@
     <span id="sub">connecting…</span>
   </div>
   <div id="pipe"></div>
+  <!-- WHY the split is what it is. A speed-weighted allocator whose decisions are
+       invisible cannot be told apart from a broken one, so the reason the
+       coordinator gave is shown verbatim, next to what an even split of the same
+       layers would have cost with the same measured rates. -->
+  <details id="allocbox"><summary id="allocsum"></summary>
+    <div id="alloc"></div>
+  </details>
 </header>
 
 <div id="convo"><div class="empty" id="empty">
@@ -186,6 +206,58 @@ function drawPipe(s) {
   });
 }
 
+// ---- why each device got the share it did -------------------------------
+// The whole claim of a speed-weighted, bytes-weighted split is that it beats an
+// even one. That claim is only checkable if both numbers are visible, so both are:
+// the predicted per-token cost of the current assignment, and what an even
+// by-layer-count split would have cost at the SAME measured rates.
+function drawAlloc(s) {
+  const a = s.allocation;
+  const box = $('allocbox');
+  if (!a || !box) return;
+  const esc = t => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  if (a.infeasible) {
+    $('allocsum').innerHTML = '<span class="bad">the devices present cannot ' +
+      'hold the model</span>';
+    $('alloc').innerHTML = `<span class="b">${esc(a.infeasible.message)}</span>`;
+    box.open = true;
+    return;
+  }
+  const gain = a.makespan_ms && a.even_split_ms
+    ? (a.even_split_ms - a.makespan_ms) / a.even_split_ms : 0;
+  $('allocsum').innerHTML =
+    `${a.devices} device${a.devices === 1 ? '' : 's'} over layers ${a.bird_layers}` +
+    (a.makespan_ms != null
+      ? ` · ~${a.makespan_ms}ms/token predicted` +
+        (gain > 0.005 ? ` · ${(gain * 100).toFixed(0)}% better than an even split` : '')
+      : '') + ' — why?';
+  const rows = s.birds.map(b => {
+    const trust = b.rate_trusted
+      ? `${b.rate_mb_per_ms}MB/ms measured over ${b.rate_samples} tokens`
+      : `<span class="w">assumed speed (${b.rate_samples}/${a.min_samples} ` +
+        `timings so far)</span>`;
+    const lim = b.max_binding_mb == null
+      ? 'no limit reported'
+      : `${b.max_binding_mb}MB per tensor`;
+    return `<div><b>${esc(b.label)}</b> — ${esc(b.why)}<br>&nbsp;&nbsp;${trust} · ` +
+           `${lim}</div>`;
+  });
+  rows.push(`<div>predicted per token: <b>${a.makespan_ms ?? '—'}ms</b>; an even ` +
+            `split of the same layers at the same rates: ${a.even_split_ms ?? '—'}ms` +
+            `</div>`);
+  rows.push(`<div>per-layer size: ${a.layer_mb.join(' / ')} MB — the split weights ` +
+            `by BYTES, not layer count</div>`);
+  const d = a.decision || {};
+  rows.push(`<div>last decision: ${d.moved ? '<b>moved layers</b>' : 'left it alone'}` +
+            ` — ${esc(d.reason || '')}</div>`);
+  if (s.last_rebalance) {
+    rows.push(`<div class="w">the flock last changed shape ` +
+      `${Math.round((Date.now() - s.last_rebalance.at) / 1000)}s ago, which dropped ` +
+      `the conversation context: ${esc(s.last_rebalance.reason)}</div>`);
+  }
+  $('alloc').innerHTML = rows.join('');
+}
+
 function drawHead(s) {
   const devices = s.birds.filter(b => b.alive).length + 1;
   if (s.ready) {
@@ -211,6 +283,7 @@ async function poll() {
     status = s;
     drawPipe(s);
     drawHead(s);
+    drawAlloc(s);
   } catch {
     $('sub').innerHTML = '<span class="bad">coordinator unreachable</span>';
     $('send').disabled = true;
@@ -328,6 +401,12 @@ async function send(prompt, {reset = false} = {}) {
             const n = $(`ms${b.slot ?? i}`);
             if (n) n.textContent = fmt(b.ms) + ' ms';
           });
+        } else if (ev.type === 'rebalanced') {
+          // The flock changed shape between two tokens of this answer. The layers
+          // that moved took their share of the K/V cache with them, so the
+          // conversation context is gone -- said out loud, because a context that
+          // silently returns to zero looks like the model forgetting.
+          shape = '';                 // the topology strip has to be redrawn
         } else if (ev.type === 'error') {
           cur.remove();
           toError(msg, ev.text);
@@ -337,7 +416,9 @@ async function send(prompt, {reset = false} = {}) {
           if (!text) body.textContent = ev.text || '(nothing generated)';
           const wall = (Date.now() - t0) / 1000;
           const why = {eos: '', length: ' · hit the token cap',
-                       aborted: ' · stopped'}[ev.stop] ?? '';
+                       aborted: ' · stopped',
+                       rebalanced: ' · the flock changed shape, so the context ' +
+                                   'was dropped'}[ev.stop] ?? '';
           m.append(el('div', 'meta',
             `${ev.tokens} tokens · ${ev.prompt_tokens} prompt · ` +
             `${wall.toFixed(1)}s · context ${ev.cached}${why}`));
