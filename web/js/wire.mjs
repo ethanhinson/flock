@@ -6,6 +6,16 @@
 //
 // Layout: "FLK1" | seq u32 | hidden u32 | offset u32 | flags u32 | f16 payload
 //
+// Flags, one bit each, defined HERE and nowhere else:
+//   bit 0  reset    the conversation restarted: clear the K/V cache before this
+//                   frame, then append it
+//   bit 1  replay   this frame rebuilds cache the device has lost (a refresh, a
+//                   reassignment, a coordinator restart). It is journaled
+//                   history, not conversation output: compute it and pass it on,
+//                   but do not count it as a token or time it as one
+// A bird that forwards a frame to its successor must forward the flags with it:
+// the successor's cache has to see the same reset the head's did.
+//
 // JS has no Float16Array, so we convert by hand. This is the same trick
 // swarmllm uses (f16-packed Uint16Array): activations are small (|x| < 0.1)
 // and derived from bf16 weights, so f16 costs no real precision while halving
@@ -51,14 +61,17 @@ export function f16to32(h) {
   return sign * (1 + man / 1024) * Math.pow(2, exp - 15);
 }
 
-export function pack(floats, {seq, hidden, offset = 0, reset = false}) {
+export const FLAG_RESET = 1;
+export const FLAG_REPLAY = 2;
+
+export function pack(floats, {seq, hidden, offset = 0, reset = false, replay = false}) {
   const out = new ArrayBuffer(20 + floats.length * 2);
   const dv = new DataView(out);
   dv.setUint32(0, MAGIC, true);
   dv.setUint32(4, seq, true);
   dv.setUint32(8, hidden, true);
   dv.setUint32(12, offset, true);
-  dv.setUint32(16, reset ? 1 : 0, true);
+  dv.setUint32(16, (reset ? FLAG_RESET : 0) | (replay ? FLAG_REPLAY : 0), true);
   for (let i = 0; i < floats.length; i++) {
     dv.setUint16(20 + i * 2, f32to16(floats[i]), true);
   }
@@ -68,9 +81,11 @@ export function pack(floats, {seq, hidden, offset = 0, reset = false}) {
 export function unpack(buf) {
   const dv = new DataView(buf);
   if (dv.getUint32(0, true) !== MAGIC) throw new Error('not a flock frame');
+  const flags = dv.getUint32(16, true);
   const meta = {
     seq: dv.getUint32(4, true), hidden: dv.getUint32(8, true),
-    offset: dv.getUint32(12, true), reset: !!dv.getUint32(16, true),
+    offset: dv.getUint32(12, true),
+    reset: !!(flags & FLAG_RESET), replay: !!(flags & FLAG_REPLAY),
   };
   const n = (buf.byteLength - 20) / 2;
   const out = new Float32Array(n);
