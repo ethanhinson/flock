@@ -1,0 +1,131 @@
+# What CI can and cannot check for flock.
+#
+# A GitHub-hosted runner has no GPU, so it cannot run the WGSL engine's 13 suites
+# (kernels/test_*.ts), the streaming-loader test (test/gpu/) or the e2e group
+# (test/e2e/, which starts a real coordinator that loads 4 layers onto a GPU).
+# Those are the suites that prove the model computes the right text, and they
+# only run locally: `npm test` on a machine with a GPU, see README.md "Tests".
+#
+# What CI does run is everything that needs no device: formatting, lint and
+# type-checking of the kernels (Deno owns that code end to end), `node --check`
+# over every JavaScript module plus the inline page scripts, the pure unit tests
+# (allocator, flock membership, capability probe, the bird page's load path), and
+# -- in their own job, because they leave the runner -- the two unit tests that
+# read the real GGUF header from HuggingFace.
+#
+# Action versions are pinned to commit SHAs (the tag is in the comment) so a
+# retagged action cannot change what runs here.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# A newer push to the same branch supersedes the runs in flight.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # The version the engine was built and benchmarked on (kernels/README.md).
+  # README.md says 2.1 or newer works; this pins the one that is known to.
+  DENO_VERSION: v2.1.2
+  NODE_VERSION: "20"
+
+jobs:
+  check:
+    name: format, lint, types, syntax
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - uses: denoland/setup-deno@e95548e56dfa95d4e1a28d6f422fafe75c4c26fb # v2.0.3
+        with:
+          deno-version: ${{ env.DENO_VERSION }}
+
+      # Deno resolves npm packages out of node_modules (nodeModulesDir "manual" in
+      # deno.json), so `deno check` needs the same install the tests do. What Deno
+      # caches itself -- registry metadata, jsr packages -- keys on the lockfile.
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/.cache/deno
+          key: deno-${{ runner.os }}-${{ env.DENO_VERSION }}-${{ hashFiles('deno.lock') }}
+          restore-keys: deno-${{ runner.os }}-${{ env.DENO_VERSION }}-
+
+      - run: npm ci
+
+      # The fmt and lint scope is kernels/ (see deno.json for why the Node-style
+      # directories are not included); the .ts type check is the one that was
+      # deliberately left out of `npm run check` while the kernels carried errors.
+      - name: deno fmt --check
+        run: deno fmt --check
+      - name: deno lint
+        run: deno lint
+      - name: deno check kernels/*.ts
+        run: deno check kernels/*.ts
+
+      # node --check over server/, tools/, test/, web/js/, and every inline
+      # <script type="module"> in web/*.html pulled out and checked as a module.
+      - name: node --check and inline page scripts
+        run: npm run check
+
+  unit:
+    name: unit tests (no GPU, no network)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+
+      # Each of these is self-contained: the allocator and the speed policy are
+      # pure, the flock test drives mesh.js with an injected clock, the probe test
+      # injects a fake navigator.gpu, and the bird-page test stubs the coordinator
+      # with a local http server. None touches a device or leaves the machine.
+      - run: node test/unit/allocate.test.mjs
+      - run: node test/unit/flock.test.mjs
+      - run: node test/unit/probe.test.mjs
+      - run: node test/unit/bird_gguf.test.mjs
+
+  unit-network:
+    # These two read the REAL Qwen3-0.6B GGUF header from HuggingFace by range
+    # request, on purpose: the claim under test is that range planning works
+    # against a real CDN, which a fixture cannot show. Separate job so a CDN
+    # hiccup is visibly a network failure and not a unit-test failure, and
+    # bounded so a stalled connection cannot hold the runner.
+    name: unit tests (network; real GGUF header on HuggingFace)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: timeout 240 node test/unit/gguf.test.mjs
+      - run: timeout 240 node test/unit/gguf_dir.test.mjs
+
+  gpu-and-e2e:
+    # Deliberately never runs. It exists so the check list says, next to the jobs
+    # that did run, that the suites which prove the model is CORRECT were not
+    # among them. They need a WebGPU device (and, for e2e, a live coordinator on
+    # one) and are run locally with `npm test`, or per group with
+    # `npm run test:kernels`, `npm run test:e2e`, `npm run test:gpu`.
+    name: "SKIPPED: kernels (13 WGSL suites), e2e, gpu -- need a GPU, run `npm test` locally"
+    if: ${{ false }}
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "never reached"
