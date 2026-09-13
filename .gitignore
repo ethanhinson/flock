@@ -13,3 +13,12 @@ node/test/.*-shim-*.mjs
 
 # agent worktrees
 .claude/worktrees/
+
+# ONNX build artifacts. These are GONE from the runtime (the engine is WGSL on
+# streamed GGUF) but kernels/onnx_truth.mjs can still regenerate them as a
+# dev-only reference. They are gigabytes; they must never be committed again --
+# 2.8GB of them in history is why pushes started timing out.
+web/coord/
+web/*.onnx
+web/*.onnx.data
+.certs/
