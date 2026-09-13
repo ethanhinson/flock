@@ -245,8 +245,8 @@ function drawAlloc(s) {
   rows.push(`<div>predicted per token: <b>${a.makespan_ms ?? '—'}ms</b>; an even ` +
             `split of the same layers at the same rates: ${a.even_split_ms ?? '—'}ms` +
             `</div>`);
-  rows.push(`<div>per-layer size: ${a.layer_mb.join(' / ')} MB — the split weights ` +
-            `by BYTES, not layer count</div>`);
+  rows.push(`<div>per-layer size: ${(a.layer_mb || []).join(' / ')} MB — the split ` +
+            `weights by BYTES, not layer count</div>`);
   const d = a.decision || {};
   rows.push(`<div>last decision: ${d.moved ? '<b>moved layers</b>' : 'left it alone'}` +
             ` — ${esc(d.reason || '')}</div>`);
