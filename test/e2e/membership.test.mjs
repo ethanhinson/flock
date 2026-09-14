@@ -18,7 +18,7 @@
 //
 // Needs a coordinator, and no GPU of its own. `npm test` starts one on a spare
 // port; by hand:
-//   FLOCK_NO_TLS=1 PORT=8123 npm start &
+//   FLOCK_NO_TLS=1 FLOCK_NO_MDNS=1 PORT=8123 npm start &
 //   FLOCK_URL=http://127.0.0.1:8123 node test/e2e/membership.test.mjs
 import WebSocket from 'ws';
 import {pack, unpack} from '../../web/js/wire.mjs';

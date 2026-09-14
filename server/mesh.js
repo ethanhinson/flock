@@ -25,7 +25,7 @@ import {pack, unpack} from '../web/js/wire.mjs';
 import {allocate, adjust, device, Infeasible, explain, DEFAULT_RATE} from './allocate.js';
 import {Rate, shouldRebalance, currentMakespan, MIN_SAMPLES} from './speed.js';
 
-const ICE = ['stun:stun.l.google.com:19302'];
+const ICE = [];  // LAN-only: host ICE candidates are directly reachable, no STUN server needed
 
 /** What a device reported about itself, normalised: missing means unlimited.
  *  Exported because the session token is bound to these numbers, so the server

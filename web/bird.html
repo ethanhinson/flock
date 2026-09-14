@@ -780,7 +780,7 @@ async function openRTC(toPeer) {
     log('no WebRTC here — relaying through the coordinator instead');
     return;
   }
-  outRtc = new RTCPeerConnection({iceServers: [{urls: 'stun:stun.l.google.com:19302'}]});
+  outRtc = new RTCPeerConnection({iceServers: []});
   chan = outRtc.createDataChannel('flock', {ordered: true});
   chan.binaryType = 'arraybuffer';
   chan.onopen = () => {
@@ -814,7 +814,7 @@ async function openRTC(toPeer) {
 async function onSignal(from, d) {
   if (typeof RTCPeerConnection !== 'function') return;   // websocket-only device
   if (d.kind === 'offer') {
-    rtc = new RTCPeerConnection({iceServers: [{urls: 'stun:stun.l.google.com:19302'}]});
+    rtc = new RTCPeerConnection({iceServers: []});
     rtc.ondatachannel = e => {
       inChan = e.channel; inChan.binaryType = 'arraybuffer';
       inChan.onopen = () => {

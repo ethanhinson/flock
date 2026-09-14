@@ -35,3 +35,10 @@ test/unit/.*-shim-*.mjs
 web/coord/
 web/*.onnx
 web/*.onnx.data
+
+# trusted-local fuse operator config (machine-scoped, never committed)
+.fuse/
+
+# stale coordinator state dirs left behind by interrupted runs (siblings of
+# .state/, which is already ignored above). Never tracked.
+.state.stale-*/

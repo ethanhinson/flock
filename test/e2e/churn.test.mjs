@@ -24,7 +24,7 @@
 // GPU tests.
 //
 // Needs a coordinator on a port that is NOT a real flock's; `npm test` starts one.
-//   FLOCK_NO_TLS=1 PORT=8123 npm start &
+//   FLOCK_NO_TLS=1 FLOCK_NO_MDNS=1 PORT=8123 npm start &
 //   FLOCK_URL=http://127.0.0.1:8123 node test/e2e/churn.test.mjs
 import {spawn} from 'node:child_process';
 import path from 'node:path';
@@ -130,7 +130,7 @@ async function turn(prompt, max_tokens = 8, reset = false) {
 
 const up = await fetch(`${BASE}/status`).catch(() => null);
 if (!up?.ok) {
-  console.error(`no coordinator at ${BASE} -- start one with FLOCK_NO_TLS=1 PORT=8123 npm start`);
+  console.error(`no coordinator at ${BASE} -- start one with FLOCK_NO_TLS=1 FLOCK_NO_MDNS=1 PORT=8123 npm start`);
   process.exit(2);
 }
 const s0 = await status();

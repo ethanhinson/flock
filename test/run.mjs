@@ -124,7 +124,7 @@ if (pick('e2e')) {
   // neither read a real flock's nor leave its own behind.
   const stateDir = mkdtempSync(path.join(tmpdir(), 'flock-test-state-'));
   const coord = background([...DENO, 'server/server.js'],
-    {PORT: String(port), FLOCK_NO_TLS: '1', FLOCK_BIRD_LAYERS: '8', FLOCK_STATE_DIR: stateDir});
+    {PORT: String(port), FLOCK_NO_TLS: '1', FLOCK_NO_MDNS: '1', FLOCK_BIRD_LAYERS: '8', FLOCK_STATE_DIR: stateDir});
   let coordUp = false;
   try {
     await waitFor(async () => (await fetch(`${BASE}/status`)).ok, 240000,

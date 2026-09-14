@@ -36,7 +36,7 @@ const BASE = `http://127.0.0.1:${PORT}`;
 function coordinator() {
   const p = spawn(DENO[0], [...DENO.slice(1), 'server/server.js'], {cwd: ROOT,
     env: {...process.env, PORT: String(PORT), FLOCK_NO_TLS: '1', FLOCK_BIRD_LAYERS: '8',
-          FLOCK_STATE_DIR: path.join(STATE, 'coord')},
+          FLOCK_STATE_DIR: path.join(STATE, 'coord'), FLOCK_NO_MDNS: '1'},
     detached: true, stdio: ['ignore', 'pipe', 'pipe']});
   p.log = '';
   p.stdout.on('data', d => { p.log += d; if (process.env.SIM_VERBOSE) process.stdout.write(d); });
