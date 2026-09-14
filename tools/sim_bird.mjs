@@ -74,17 +74,39 @@ import {existsSync, readFileSync, writeFileSync} from 'node:fs';
 import {Buffer} from 'node:buffer';
 import {createInterface} from 'node:readline';
 import {pack, unpack} from '../web/js/wire.mjs';
+import {discoverFlock} from './mdns-discover.mjs';
 
-// The coordinator serves https when .certs/ exists (Chrome hides WebGPU outside a
-// secure context), so default to it and fall back to http for a plain run. The
-// cert is self-signed, so verification is off for this client only.
-const BASE = process.env.FLOCK_URL ||
-  (existsSync(new URL('../.certs/cert.pem', import.meta.url))
-    ? 'https://127.0.0.1:8000' : 'http://127.0.0.1:8000');
+// Where the coordinator is. Three sources, in priority order:
+//
+//   1. FLOCK_URL env var — explicit, used by tests and when mDNS is not wanted.
+//   2. mDNS discovery — query _flock._tcp.local on the LAN and use whatever
+//      coordinator answers. This is the default for interactive use: run
+//      `npm start` on one machine, `npm run bird` on another, and the bird
+//      finds it without being told an address.
+//   3. Fallback to localhost — for a solo run on one machine.
+//
+// The coordinator serves https when .certs/ exists (Chrome hides WebGPU outside
+// a secure context), so the fallback checks for the cert. The cert is self-signed,
+// so verification is off for this client only.
+let BASE;
+if (process.env.FLOCK_URL) {
+  BASE = process.env.FLOCK_URL;
+} else {
+  const discovered = await discoverFlock(3000);
+  if (discovered) {
+    BASE = discovered;
+    console.log('(discovered coordinator via mDNS: ' + discovered + ')');
+  } else {
+    BASE = existsSync(new URL('../.certs/cert.pem', import.meta.url))
+      ? 'https://127.0.0.1:8000' : 'http://127.0.0.1:8000';
+    console.log('(no mDNS response; falling back to ' + BASE + ')');
+  }
+}
 const WS_URL = BASE.replace(/^http/, 'ws') + '/ws';
 // Only pass options when there is one to pass: under Deno's node compatibility
 // layer, any options object makes `ws` print a createConnection warning.
 const wsOpts = BASE.startsWith('https') ? {rejectUnauthorized: false} : undefined;
+
 
 // --- arguments -------------------------------------------------------------
 const argv = process.argv.slice(2);
@@ -359,7 +381,7 @@ async function bird(tag, file = null) {
     if (!ndc) return;
     if (d.kind === 'offer') {
       try { pc?.close(); } catch {}
-      pc = new ndc.PeerConnection(tag, {iceServers: ['stun:stun.l.google.com:19302']});
+      pc = new ndc.PeerConnection(tag, {iceServers: []});
       pc.onLocalDescription((sdp, type) =>
         send({t: 'signal', data: {kind: type, sdp: {sdp, type}}}));
       pc.onLocalCandidate((candidate, mid) =>

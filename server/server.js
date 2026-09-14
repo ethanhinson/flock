@@ -38,6 +38,7 @@ import {f32to16} from '../web/js/wire.mjs';
 import {readModel} from './gguf.mjs';
 import {layerPlan, Infeasible} from './allocate.js';
 import {QWEN3_06B} from '../kernels/layer.ts';
+import {startMdns, stopMdns} from "./mdns.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 process.chdir(ROOT);
@@ -1259,3 +1260,11 @@ server.listen(PORT, '0.0.0.0', () => {
     console.log('  (open the URL, accept the warning), then WebGPU works in any browser');
   }
 });
+
+// Advertise the coordinator on mDNS so native tools (sim_bird.mjs) and Bonjour
+// browsing can find it without a hardcoded URL. FLOCK_NO_MDNS=1 disables it.
+startMdns(PORT, {model: META.model});
+
+// Stop advertising on shutdown.
+process.on("SIGINT", () => { stopMdns(); process.exit(0); });
+process.on("SIGTERM", () => { stopMdns(); process.exit(0); });

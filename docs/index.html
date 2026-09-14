@@ -1,0 +1,1039 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>flock — one model, split across your laptop and your phone</title>
+<meta name="description" content="A small, readable distributed inference system: one transformer split across the devices on your wifi, activations crossing as f16 frames over WebRTC.">
+<meta name="theme-color" content="#e6ebf0">
+<style>
+  :root{
+    --paper:#f3efe7; --ink:#25231f; --soft:#5f5a52; --faint:#948e84; --rule:#d9d2c6;
+    --goose:#8e939a; --swallow:#8fa0b3; --finch:#a898b0; --gull:#98a69a; --crow:#a39e98; --nobody:#cfc9be;
+    --swift:#a2a7ad; --heron:#8b9096;
+    --serif:"Iowan Old Style","Palatino Linotype",Palatino,"Book Antiqua",Georgia,serif;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+  body{margin:0;background:var(--paper);color:var(--ink);font:17px/1.6 var(--serif);overflow-x:hidden}
+  a{color:inherit;text-decoration:underline;text-decoration-color:var(--rule);text-underline-offset:3px}
+  a:hover{text-decoration-color:var(--ink)}
+  ::selection{background:#d9cfbc}
+
+  /* the sky --------------------------------------------------------------- */
+  #sky{position:fixed;inset:0;width:100%;height:100%;display:block;z-index:0;touch-action:pan-y}
+
+  /* everything readable floats above the sky ------------------------------- */
+  .page{position:relative;z-index:1;pointer-events:none}
+  .page section,.page footer,.page .hud,.page .brand{pointer-events:auto}
+
+  /* hero -------------------------------------------------------------------- */
+  .hero{min-height:100svh;display:flex;flex-direction:column;justify-content:space-between;
+        padding:26px clamp(18px,5vw,64px);padding-bottom:calc(22px + env(safe-area-inset-bottom))}
+  .brand{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:auto}
+  .brand h1{font-size:18px;font-weight:400;margin:0;letter-spacing:.01em}
+  .brand h1 i{color:var(--soft)}
+  .brand nav a{color:var(--soft);margin-left:18px;font-size:15px;text-decoration:none}
+  .brand nav a:hover{color:var(--ink)}
+
+  .claim{max-width:600px;margin:42vh 0 4vh}
+  @media (max-width:640px){.claim{margin-top:34vh}}
+  .claim h2{font-size:clamp(30px,5vw,52px);line-height:1.1;font-weight:400;margin:0 0 18px;letter-spacing:-.01em}
+  .claim h2 em{font-style:italic}
+  .claim p{color:var(--soft);margin:0;max-width:50ch;font-size:clamp(16px,1.6vw,19px)}
+  .claim p b{color:var(--ink);font-weight:500}
+
+  /* what the flock is doing right now --------------------------------------- */
+  .hud{max-width:420px}
+  .caption{position:fixed;left:min(6vw,80px);top:14vh;width:min(400px,calc(100vw - 48px));
+           padding:16px 22px;pointer-events:none;font-size:19px;line-height:1.55;text-align:left;z-index:2;
+           background:rgba(243,239,231,.94);border:1px solid var(--rule);border-radius:12px;
+           box-shadow:0 8px 28px rgba(37,35,31,.1),0 1px 3px rgba(37,35,31,.06);
+           opacity:var(--scroll-fade,1);transition:opacity .2s linear}
+  @media (max-width:900px){.caption{left:50%;transform:translateX(-50%);top:9vh;font-size:16px;padding:12px 16px;text-align:center}}
+  .caption .p{color:var(--soft);font-style:italic}
+  .caption .o{min-height:1.7em;font-size:1.05em;color:var(--ink)}
+  .caption .o code{font-family:var(--mono);font-size:.85em;background:rgba(0,0,0,.05);padding:.1em .35em;border-radius:4px;white-space:pre-wrap}
+  .caption .o b{font-weight:600}
+  .caption .caret{display:inline-block;width:1px;height:1em;background:var(--ink);vertical-align:-2px;margin-left:2px;
+                  animation:blink 1.1s steps(2) infinite}
+  @keyframes blink{50%{opacity:0}}
+  .caption .note{color:var(--swallow);font-size:13px;margin-top:4px;min-height:1.4em}
+
+  .split{font-size:14px;color:var(--soft);border-top:1px solid var(--rule);padding-top:10px}
+  .strip{display:grid;grid-template-columns:repeat(28,1fr);gap:3px;height:7px;margin:8px 0 10px;width:min(100%,300px)}
+  .strip i{border-radius:4px;background:var(--rule);transition:background .5s}
+  .devs{list-style:none;margin:0;padding:0}
+  .devs li{display:flex;gap:10px;align-items:baseline;white-space:nowrap}
+  .devs .dot{width:8px;height:8px;border-radius:50%;flex:none}
+  .devs .n{color:var(--ink);min-width:12ch}
+  .devs .r{font-variant-numeric:tabular-nums}
+  .devs .s{color:var(--faint);font-style:italic}
+  .btns{margin-top:10px;display:flex;gap:18px;flex-wrap:wrap}
+  button{font:inherit;font-size:14px;color:var(--ink);background:none;border:0;padding:0;cursor:pointer;
+         text-decoration:underline;text-decoration-color:var(--rule);text-underline-offset:3px}
+  button:hover{text-decoration-color:var(--ink)}
+  button:disabled{color:var(--faint);cursor:default;text-decoration:none}
+  .hint{color:var(--faint);font-size:13px;margin-top:8px;font-style:italic}
+  @media (hover:none){.hint .m{display:none}}
+  @media (hover:hover){.hint .t{display:none}}
+
+  /* prose ------------------------------------------------------------------- */
+  main{padding:4vh clamp(18px,5vw,64px) 60px}
+  section{max-width:680px;margin:0 auto 56px;background:rgba(243,239,231,.94);padding:8px 0}
+  section h3{font-size:13px;text-transform:uppercase;letter-spacing:.14em;color:var(--faint);
+             margin:0 0 14px;font-weight:500;font-family:var(--serif)}
+  section p{margin:0 0 14px;max-width:62ch}
+  section p:last-child{margin-bottom:0}
+  section b{font-weight:600}
+  code{font:inherit;font-family:var(--mono);font-size:.82em;background:rgba(0,0,0,.05);padding:1px 5px;border-radius:3px}
+  pre{margin:14px 0;padding:14px 16px;background:rgba(0,0,0,.045);border-radius:6px;overflow-x:auto;
+      font:13.5px/1.55 var(--mono)}
+  pre code{background:none;padding:0;font-size:inherit}
+  .big{font-size:clamp(40px,7vw,68px);line-height:1;margin:0 0 6px;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+  .big small{display:block;font-size:15px;color:var(--soft);margin-top:10px;line-height:1.5;letter-spacing:0}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:22px 28px;margin-top:6px}
+  .card h4{margin:0 0 6px;font-size:17px;font-weight:600}
+  .card p{font-size:15px;color:var(--soft);margin:0}
+  .card p b{color:var(--ink);font-weight:500}
+  table{border-collapse:collapse;width:100%;font-size:15px;margin-top:10px;font-variant-numeric:tabular-nums}
+  th,td{text-align:left;padding:7px 12px 7px 0;border-bottom:1px solid var(--rule);white-space:nowrap}
+  th{color:var(--soft);font-weight:500;font-style:italic}
+  td.n,th.n{text-align:right;padding-right:0}
+  .twrap{overflow-x:auto}
+  ul.lim{padding-left:20px;margin:0}
+  ul.lim li{margin-bottom:10px;max-width:62ch}
+  ul.lim li:last-child{margin-bottom:0}
+  footer{max-width:680px;margin:0 auto;color:var(--faint);font-size:14px;display:flex;gap:18px;flex-wrap:wrap;
+         justify-content:space-between;border-top:1px solid var(--rule);padding-top:14px;
+         padding-bottom:calc(10px + env(safe-area-inset-bottom))}
+  footer a{color:var(--soft)}
+  @media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}.caption .caret{animation:none}}
+</style>
+</head>
+<body>
+<canvas id="sky" aria-hidden="true"></canvas>
+
+<div class="page">
+  <header class="hero">
+    <div class="brand">
+      <h1>flock <i>— a learning prototype</i></h1>
+      <nav>
+        <a href="#idea">idea</a><a href="#numbers">numbers</a><a href="#run">run it</a>
+        <a href="https://github.com/ethanhinson/flock">github</a>
+      </nav>
+    </div>
+
+    <div class="claim">
+      <h2>Run one language model split across your <em>laptop</em> and your <em>phone</em>.</h2>
+      <p>Your phone's GPU actually computes four transformer layers. Activations cross your wifi.
+         It is a real, if small, distributed inference system — <b>about 600 lines you can read in a sitting.</b></p>
+    </div>
+
+    <div class="caption" id="caption" aria-live="polite">
+      <div class="p" id="prompt"></div>
+      <div class="o"><span id="out"></span><span class="caret"></span></div>
+      <div class="note" id="note"></div>
+    </div>
+
+    <div class="hud">
+      <div class="split">
+        <div>Twenty-eight layers. Each bird is one.</div>
+        <div class="strip" id="strip"></div>
+        <ul class="devs" id="devs"></ul>
+        <div class="btns">
+          <button id="join">a device joins</button>
+          <button id="drop">a device leaves</button>
+        </div>
+        <div class="hint">
+          <span class="m">Hover a bird to see which layer it is. Click the sky and another device's birds join.</span>
+          <span class="t">Tap the sky and another device's birds join.</span>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section id="idea">
+      <h3>The idea in one paragraph</h3>
+      <p>A transformer is a stack of identical layers. Token ids become a hidden state of shape
+         <code>[batch, seq, hidden]</code>; each layer reads that tensor and writes one the same
+         shape. So you can cut the stack anywhere, put layers 0–23 on one device and 24–27 on
+         another, and ship the hidden state between them.</p>
+      <p><b>The tensor is kilobytes; the weights are hundreds of megabytes.</b> That asymmetry is
+         the entire trick — it is why a phone can hold a slice of a model it could never download
+         in full.</p>
+      <p>The sky above is the same picture, with five devices on the wifi. Every bird is one layer.
+         The geese are this Mac, flying the first twelve layers in a V; the other sixteen are split
+         by measured speed across the swallows, the swifts, the gulls and the herons, each a
+         different device holding a different share. The dotted line is the pipeline. The small
+         ion running along it is the hidden state, and every time it reaches the head one word is
+         written. Let a device join and the tail is re-split among the flocks. Let one leave and
+         the writing stops, naming the layers nobody holds.</p>
+    </section>
+
+    <section id="numbers">
+      <h3>Measured on real hardware</h3>
+      <p class="big">19.6 <small>tokens per second — an M3 Max and an iPhone on the same wifi, Qwen3-0.6B split 24/4</small></p>
+      <div class="twrap">
+      <table>
+        <tr><th>decode, averaged over 59 tokens</th><th class="n">ms</th></tr>
+        <tr><td>coordinator · 24 layers · Deno + WebGPU</td><td class="n">19.6</td></tr>
+        <tr><td>phone · 4 layers · WGSL in Safari</td><td class="n">15.4</td></tr>
+        <tr><td>roundtrip including the network</td><td class="n">26.4</td></tr>
+        <tr><td>network overhead, WebRTC data channel</td><td class="n">11.0</td></tr>
+        <tr><td>wire per token · f16 binary (21.0 KB as JSON)</td><td class="n">2.0 KB</td></tr>
+      </table>
+      </div>
+      <p style="margin-top:14px">The phone runs 4 of 28 layers and spends nearly as long as the
+         coordinator's 24 — that asymmetry is what real heterogeneous hardware looks like. Under the
+         original long-polling, fp32-JSON design the network cost about 132 ms per token. It is now 11.</p>
+    </section>
+
+    <section>
+      <h3>How it moves</h3>
+      <div class="cards">
+        <div class="card">
+          <h4>f16 frames over WebRTC</h4>
+          <p>The coordinator is itself a WebRTC peer. It offers each bird a data channel over the
+             websocket; once that opens, the socket carries nothing but signaling.
+             <b>One wire format, one file</b>, imported by server and browser alike.</p>
+        </div>
+        <div class="card">
+          <h4>Weights straight from HuggingFace</h4>
+          <p>No build step, no export, nothing on disk. A GGUF's first few megabytes are a directory
+             of byte offsets, so each device <b>range-fetches its own layers</b> — four layers of
+             Qwen3-0.6B is 66.9 MB in one HTTP request.</p>
+        </div>
+        <div class="card">
+          <h4>Streamed into the GPU</h4>
+          <p>Nothing ever holds a tensor in JS. Each 4 MB chunk goes into its GPU buffer as it
+             arrives. Streaming four layers costs <b>less heap than holding one</b>, which is the
+             difference between a phone that joins and an iPad that dies.</p>
+        </div>
+        <div class="card">
+          <h4>The KV cache is sharded too</h4>
+          <p>Each device caches K/V for only its own layers, in GPU memory, never marshalled.
+             Turn two feeds only the new tokens. <b>No single device holds the conversation.</b></p>
+        </div>
+        <div class="card">
+          <h4>Nine WGSL kernels, validated</h4>
+          <p>Q8_0 and Q4_0 matvecs, RMSNorm, RoPE, SwiGLU, attention — bit-exact or within a few ULP
+             of a strict-f32 reference, and the whole model <b>matches ONNX token for token</b>.</p>
+        </div>
+        <div class="card">
+          <h4>The split is decided live</h4>
+          <p>No device count to configure. The coordinator re-splits across whoever is present, by
+             <b>measured speed and real GPU limits</b>, and says in words when a tensor will not
+             fit before anything downloads.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="limits">
+      <h3>Read this before drawing conclusions</h3>
+      <ul class="lim">
+        <li><b>This is slower than either device alone.</b> Pipeline parallelism buys capacity,
+            not throughput. Only one node computes at a time — let a second phone join above and
+            watch the ripple wait behind the slow flock.</li>
+        <li><b>No auth, no TLS, barely any input validation.</b> LAN-only toy. Do not expose it
+            to the internet.</li>
+        <li><b>No re-sharding on peer loss.</b> If a device leaves, generation stops with a message
+            naming the uncovered layers and resumes when some device claims that slot.</li>
+        <li><b>One conversation, no batching, no concurrency.</b> A second simultaneous chat is
+            refused rather than interleaving writes into the same K/V cache.</li>
+      </ul>
+    </section>
+
+    <section id="run">
+      <h3>Run it</h3>
+<pre><code>cd node && npm install && npm start     # runs Deno: the coordinator needs a GPU
+
+# phone       http://&lt;your-ip&gt;:8000/flock    tap "join the flock"
+# any browser http://&lt;your-ip&gt;:8000          chat
+
+npm run solo      # no phone handy? every bird in one process
+npm test          # syntax, range planning, the bird's load path</code></pre>
+      <p>Deno, not Node, and that is a requirement: Node has no WebGPU. Two phones? Open
+         <code>/flock</code> on the second one and tap join. Everything else is decided while it runs.</p>
+      <p>Built to make the ideas behind <a href="https://swarmllm.ai">swarmllm</a> and
+         <a href="https://github.com/exo-explore/exo">exo</a> concrete. It is not production software.</p>
+    </section>
+
+    <footer>
+      <span><a href="https://github.com/ethanhinson/flock">github.com/ethanhinson/flock</a> · MIT</span>
+      <span>prior art:
+        <a href="https://github.com/Nehanth/swarmllm">swarmllm</a> ·
+        <a href="https://github.com/exo-explore/exo">exo</a> ·
+        <a href="https://github.com/bigscience-workshop/petals">Petals</a> ·
+        <a href="https://arxiv.org/pdf/2504.08791">prima.cpp</a>
+      </span>
+    </footer>
+  </main>
+</div>
+
+<script>
+(() => {
+'use strict';
+// ---------------------------------------------------------------------------
+// The model. 28 layers plus an embedding and a head. The coordinator's half is
+// fixed at startup (FLOCK_BIRD_LAYERS=4 -> cut at 24); who covers the tail is
+// decided live, exactly like the real thing.
+// ---------------------------------------------------------------------------
+const LAYERS = 28, BIRD_LAYERS = 16, CUT = LAYERS - BIRD_LAYERS;   // FLOCK_BIRD_LAYERS=16
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+// Species. Every shape fraction is of s, the full wingspan in px at desktop;
+// every bird gets its own slight variation so the flock has depth. +x is forward.
+const SPECIES = {
+  goose:    {size:28, body:[.16,.045], neck:[.20,.034], head:.044, bill:.04, tail:[.09,.05,0],
+             wrist:.50, chord:[.15,.12,.03], le:[.05,.07,-.02], te:[-.10,-.05], round:true,
+             flapHz:2.4, glide:[2.5,6], flapFor:[1.5,3.5], speed:[70,115], turn:0.55, formation:'v'},
+  starling: {size:18, body:[.15,.065], neck:[.04,.05], head:.052, bill:.03, tail:[.12,.07,.02],
+             wrist:.45, chord:[.17,.13,.02], le:[.06,.08,-.12], te:[-.11,-.05],
+             flapHz:4.5, glide:[.6,1.6], flapFor:[.5,1.4], speed:[40,75], turn:2.2, formation:'cloud'},
+  swallow:  {size:14, body:[.14,.05], neck:[.03,.045], head:.048, bill:.02, tail:[.24,.05,.14],
+             wrist:.42, chord:[.13,.09,.01], le:[.06,.07,-.26], te:[-.07,-.02],
+             flapHz:4, glide:[.8,2], flapFor:[.4,1.1], speed:[45,80], turn:2.4, formation:'cloud'},
+  gull:     {size:22, body:[.17,.05], neck:[.08,.04], head:.05, bill:.05, tail:[.10,.07,0],
+             wrist:.55, chord:[.13,.11,.02], le:[.05,.11,-.06], te:[-.08,0],
+             flapHz:2, glide:[2,5], flapFor:[.8,1.6], speed:[45,70], turn:0.7, formation:'line'},
+  finch:    {size:10, body:[.15,.08], neck:[.03,.06], head:.058, bill:.03, tail:[.14,.08,.03],
+             wrist:.45, chord:[.19,.15,.03], le:[.06,.07,-.07], te:[-.13,-.08],
+             flapHz:5.5, glide:[.5,1.2], flapFor:[.3,.8], speed:[40,70], turn:2.5, formation:'cloud'},
+  crow:     {size:20, body:[.16,.06], neck:[.06,.05], head:.05, bill:.05, tail:[.17,.075,0],
+             wrist:.5, chord:[.21,.18,.06], le:[.06,.08,-.04], te:[-.15,-.10], round:true,
+             flapHz:2.8, glide:[1,2.5], flapFor:[1,2.5], speed:[40,70], turn:1.5, formation:'cloud'},
+  swift:    {size:14, body:[.12,.04], neck:[.02,.035], head:.034, bill:.01, tail:[.12,.03,.05],
+             wrist:.38, chord:[.09,.06,.005], le:[.06,.05,-.34], te:[-.03,0],
+             flapHz:5, glide:[1,2.5], flapFor:[.3,.8], speed:[50,90], turn:2.6, formation:'cloud'},
+  heron:    {size:42, body:[.17,.05], neck:[.10,.06], head:.045, bill:.11, tail:[.34,.012,0],
+             wrist:.5, chord:[.22,.2,.06], le:[.06,.06,-.02], te:[-.16,-.14], round:true,
+             flapHz:1.5, glide:[1.5,4], flapFor:[2,5], speed:[55,85], turn:0.5, formation:'line'},
+};
+const MAC = {id:'mac', name:'this Mac', kind:'goose', color:css('--goose'), msPerLayer:19.6/24, band:[.2,.31], cross:true};
+// The other devices on the wifi, each a flock of its own kind with its own
+// patch of sky. The first four are on the wifi when you arrive; the fifth
+// can join. ms/layer is what each reports, so the split is by speed.
+const DEVICES = [
+  {name:'phone a',      kind:'swallow', color:css('--swallow'), ms:3.9, region:{x:[.66,.9],  y:[.52,.68]}},
+  {name:'phone b',      kind:'swift',   color:css('--swift'),   ms:3.2, region:{x:[.38,.58], y:[.1,.2]}},
+  {name:'the iPad',     kind:'gull',    color:css('--gull'),    ms:5.0, region:{x:[.66,.9],  y:[.32,.48]}},
+  {name:'an old laptop',kind:'heron',   color:css('--heron'),   ms:6.5, region:{x:[.68,.9],  y:[.13,.25]}, depth:2, alpha:.9},
+  {name:'phone c',      kind:'crow',    color:css('--crow'),    ms:4.4, region:{x:[.66,.9],  y:[.72,.88]}},
+];
+const UNCOVERED = {id:null, name:'nobody', kind:null, color:css('--nobody'), msPerLayer:0};
+
+const phones = [];                 // joined phones, in join order
+const owner = new Array(LAYERS);   // layer index -> device
+
+function makePhone(i) {
+  return {...DEVICES[i], id:'p'+i, msPerLayer: DEVICES[i].ms};
+}
+
+// Contiguous, roughly proportional to speed, like the allocator: a faster
+// phone gets more of the tail. Phones beyond the layer count wait for a slot.
+function resplit() {
+  for (let l = 0; l < CUT; l++) owner[l] = MAC;
+  for (let l = CUT; l < LAYERS; l++) owner[l] = UNCOVERED;
+  const active = phones.slice(0, BIRD_LAYERS);
+  if (active.length) {
+    const w = active.map(p => 1/p.msPerLayer), W = w.reduce((a,b)=>a+b,0);
+    const exact = w.map(x => x/W*BIRD_LAYERS), shares = exact.map(x => Math.max(1, Math.floor(x)));
+    let left = BIRD_LAYERS - shares.reduce((a,b)=>a+b,0);
+    const byRemainder = exact.map((x, i) => [x - Math.floor(x), i]).sort((a, b) => b[0] - a[0]).map(x => x[1]);
+    for (let k = 0; left > 0; k = (k+1) % byRemainder.length) { shares[byRemainder[k]]++; left--; }
+    while (left < 0) { shares[shares.indexOf(Math.max(...shares))]--; left++; }
+    let l = CUT;
+    active.forEach((p, i) => { for (let k = 0; k < shares[i]; k++) owner[l++] = p; });
+  }
+  // membership and rank within each device, for formations
+  const seen = new Map();
+  for (const b of birds) {
+    b.dev = b.kind === 'layer' ? owner[b.layer] : MAC;
+    const sp = b.dev.kind ? SPECIES[b.dev.kind] : null;
+    b.rank = seen.get(b.dev) || 0; seen.set(b.dev, b.rank + 1);
+    b.size = (sp ? sp.size : 14) * b.vary * SCALE;
+  }
+  assignArms();
+  renderSplit();
+}
+// In the V, pipeline order runs down one arm and back up the other, so the
+// line through the layers traces the V itself. Each bird keeps station on
+// the bird one place ahead in its own arm.
+function assignArms() {
+  const kin = birds.filter(b => b.dev === MAC), n = kin.length - 1, first = Math.ceil(n/2);
+  kin.forEach((b, k) => {
+    if (!k) { b.arm = 0; b.depth = 0; }
+    else if (k <= first) { b.arm = 1; b.depth = k; } else { b.arm = -1; b.depth = n + 1 - k; }
+  });
+  for (const b of kin) b.prev = !b.depth ? null : b.depth === 1 ? kin[0] : kin.find(o => o.arm === b.arm && o.depth === b.depth - 1);
+}
+function rangeOf(dev) {
+  const ls = []; for (let l = 0; l < LAYERS; l++) if (owner[l] === dev) ls.push(l);
+  return ls.length ? (ls.length === 1 ? `layer ${ls[0]}` : `layers ${ls[0]}–${ls[ls.length-1]}`) : 'waiting for a slot';
+}
+function uncovered() {
+  const ls = []; for (let l = 0; l < LAYERS; l++) if (owner[l] === UNCOVERED) ls.push(l);
+  return ls;
+}
+
+// ---------------------------------------------------------------------------
+// The sky.
+// ---------------------------------------------------------------------------
+const cv = document.getElementById('sky'), ctx = cv.getContext('2d');
+// A far, faint hemisphere of land along the bottom of the sky: a horizon, a
+// river winding to it, and scattered trees. Drawn once to its own canvas
+// (it never needs to move) and composited in behind the birds, in front of
+// the sky gradient.
+let W = 0, H = 0, DPR = 1, SCALE = 1, skyGrad = null;
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.round(W*DPR); cv.height = Math.round(H*DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  SCALE = W < 640 ? 0.62 : W < 1000 ? 0.82 : 1;
+  skyGrad = ctx.createLinearGradient(0, 0, 0, H);
+  skyGrad.addColorStop(0, '#e6ebf0'); skyGrad.addColorStop(0.55, '#eeede8'); skyGrad.addColorStop(1, '#f3efe7');
+  if (typeof clouds !== 'undefined') for (const c of clouds) c.y = H*c.fy;
+  for (const b of birds) if (b.dev) b.size = (b.dev.kind ? SPECIES[b.dev.kind].size : 14) * b.vary * SCALE;
+  makeLand();
+}
+let landCanvas = null, landH = 0;
+function makeLand() {
+  landH = Math.max(160, Math.min(300, H*0.26));
+  const c = document.createElement('canvas'); c.width = W; c.height = landH;
+  const g = c.getContext('2d');
+  // Not a landscape: the sky doesn't end at the ground here, it curves away,
+  // the way the world does from a high window. One shallow arc, drawn as a
+  // fill with a soft luminous edge, plus two fainter companions behind it
+  // for depth. No objects, no scale to get wrong against the birds.
+  function arc(riseFrac, sag, alpha) {
+    const cx = W/2, apex = landH*riseFrac, rx = W*1.9, ry = sag;
+    const y = x => { const k = Math.max(-1, Math.min(1, (x-cx)/rx)); return apex + (1-Math.sqrt(Math.max(0,1-k*k)))*ry; };
+    const path = new Path2D();
+    path.moveTo(0, y(0));
+    for (let x = 0; x <= W; x += 24) path.lineTo(x, y(x));
+    path.lineTo(W, landH); path.lineTo(0, landH); path.closePath();
+    const fade = g.createLinearGradient(0, apex, 0, landH*0.9);
+    fade.addColorStop(0, `rgba(70,66,60,${alpha})`); fade.addColorStop(1, 'rgba(70,66,60,0)');
+    g.fillStyle = fade; g.fill(path);
+    // a soft white lift just above the line: the glow that reads as a horizon
+    g.save(); g.clip(path);
+    g.strokeStyle = `rgba(255,255,255,${alpha*1.1})`; g.lineWidth = 8; g.lineCap = 'round';
+    g.beginPath(); for (let x = 0; x <= W; x += 24) x === 0 ? g.moveTo(x, y(x)-2) : g.lineTo(x, y(x)-2); g.stroke();
+    g.strokeStyle = `rgba(70,66,60,${alpha*1.6})`; g.lineWidth = 1.25;
+    g.beginPath(); for (let x = 0; x <= W; x += 24) x === 0 ? g.moveTo(x, y(x)) : g.lineTo(x, y(x)); g.stroke();
+    g.restore();
+  }
+  arc(0.62, landH*0.30, 0.05);
+  arc(0.46, landH*0.34, 0.065);
+  arc(0.30, landH*0.38, 0.09);
+  landCanvas = c;
+}
+const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const TIME = reduced ? 0.4 : 1;
+
+// Clouds: a few soft monochrome shapes, drawn once to their own canvas and
+// drifted across the sky behind everything else.
+function makeCloud(fy, scale, speed) {
+  const puffs = [];
+  const n = 5 + Math.floor(Math.random()*4);
+  for (let i = 0; i < n; i++) puffs.push({dx:(i/(n-1)-0.5)*220 + (Math.random()-0.5)*30, dy:(Math.random()-0.3)*40 - Math.abs(i/(n-1)-0.5)*40, r:45 + Math.random()*40});
+  const pad = 60, w = 340 + pad*2, h = 200 + pad*2;
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const g = c.getContext('2d');
+  g.filter = 'blur(14px)'; g.fillStyle = '#ffffff';
+  for (const p of puffs) { g.beginPath(); g.arc(w/2 + p.dx, h/2 + p.dy, p.r, 0, Math.PI*2); g.fill(); }
+  g.filter = 'blur(6px)'; g.globalAlpha = 0.6;
+  for (const p of puffs) { g.beginPath(); g.arc(w/2 + p.dx, h/2 + p.dy - 10, p.r*0.8, 0, Math.PI*2); g.fill(); }
+  return {
+    img:c, x:Math.random()*W, fy, y:H*fy, scale, speed,
+    baseSpeed: speed, drift: (Math.random()-0.5)*0.3, rot: 0, rotRate: (Math.random()-0.5)*0.02,
+    breathe: Math.random()*Math.PI*2, breatheHz: 0.05 + Math.random()*0.05, wobble: Math.random()*Math.PI*2,
+  };
+}
+const clouds = [makeCloud(0.10, 1.4, 4), makeCloud(0.22, 1.0, 6), makeCloud(0.05, 0.8, 9), makeCloud(0.30, 1.2, 5), makeCloud(0.16, 0.7, 5)];
+function stepClouds(dt, now) {
+  for (const c of clouds) {
+    // each cloud wanders in speed a little, so they drift apart and regroup
+    // rather than crossing the sky in lockstep
+    c.drift += (Math.random()-0.5)*0.4*dt;
+    c.speed = c.baseSpeed + c.drift;
+    c.x += c.speed*dt*TIME;
+    c.rot += c.rotRate*dt*TIME;
+    c.breathe += c.breatheHz*dt*TIME*Math.PI*2;
+    c.wobble += dt*0.15*TIME;
+    const w = c.img.width*c.scale;
+    if (c.x - w/2 > W) c.x = -w/2;
+    if (c.x + w/2 < 0) c.x = W + w/2;
+  }
+}
+function drawClouds() {
+  for (const c of clouds) {
+    const breath = 1 + Math.sin(c.breathe)*0.06;
+    const w = c.img.width*c.scale*breath, h = c.img.height*c.scale*breath;
+    const yy = c.y + Math.sin(c.wobble)*10;
+    ctx.save();
+    ctx.globalAlpha = (0.42 + Math.sin(c.breathe*0.7)*0.1) * skyFade;
+    ctx.translate(c.x, yy); ctx.rotate(c.rot);
+    ctx.drawImage(c.img, -w/2, -h/2, w, h);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+}
+function drawLand() {
+  if (!landCanvas) return;
+  ctx.globalAlpha = 0.6 * skyFade;
+  ctx.drawImage(landCanvas, 0, H - landH);
+  ctx.globalAlpha = 1;
+}
+
+// stages, in pipeline order: embed, layer 0..27, head
+const stages = [{kind:'embed'}];
+for (let l = 0; l < LAYERS; l++) stages.push({kind:'layer', layer:l});
+stages.push({kind:'head'});
+
+const birds = stages.map((s, i) => ({
+  ...s, i, vary: 0.85 + Math.random()*0.3,
+  x: 0, y: 0, vx: 0, vy: 0, heading: 0,
+  phase: Math.random()*Math.PI*2, flapping: true, modeUntil: 0, flurryUntil: 0, dev: null, rank: 0, size: 14,
+}));
+const all = birds;
+addEventListener('resize', resize, {passive:true}); resize();
+
+// Every flock starts already in its formation, on its own band of sky, so
+// there is no scramble at the start. Skeins that cross the sky may begin
+// just outside it and come in.
+function placeFlock(kin, opts = {}) {
+  const dev = kin[0].dev, sp = SPECIES[dev.kind], band = dev.band || [.08, .3];
+  const dir = opts.dir != null ? opts.dir : (Math.random() < 0.5 ? 1 : -1), h = dir > 0 ? 0 : Math.PI;
+  const R = dev.region && W > 640 ? dev.region : null;
+  const y = R ? H*(R.y[0] + (R.y[1]-R.y[0])*(0.3 + Math.random()*0.4)) : H*(band[0] + (band[1]-band[0])*(0.3 + Math.random()*0.4));
+  const x = opts.x != null ? opts.x : R ? W*(R.x[0] + (R.x[1]-R.x[0])*(0.3 + Math.random()*0.4)) : W*(0.45 + Math.random()*0.35);
+  const L = kin[0], s = L.size;
+  L.x = x; L.y = y; L.dir = dir; L.course = h;
+  const dx = Math.cos(h), dy = Math.sin(h);
+  kin.forEach((b, k) => {
+    if (sp.formation === 'v' && k) {
+      const arm = b.arm, depth = b.depth;
+      b.x = L.x - dx*depth*s*0.5 - dy*arm*depth*s*0.22; b.y = L.y - dy*depth*s*0.5 + dx*arm*depth*s*0.22;
+    } else if (sp.formation === 'line' && k) {
+      b.x = L.x - dx*k*s*0.58 - dy*s*0.2*(k&1?1:-1); b.y = L.y - dy*k*s*0.58 + dx*s*0.2*(k&1?1:-1);
+    } else if (sp.formation === 'cloud') {
+      const r = (18 + kin.length*1.8)*SCALE, t = Math.random()*Math.PI*2, rr = Math.sqrt(Math.random())*r;
+      b.x = x + Math.cos(t)*rr; b.y = y + Math.sin(t)*rr*0.6;
+    }
+    b.heading = h; b.vx = dx*sp.speed[0]*(dev.scale || 1); b.vy = dy*sp.speed[0]*(dev.scale || 1);
+    b.phase = Math.random()*Math.PI*2;
+  });
+  if (!dev.cross) { const a = anchorFor(dev); a.x = a.tx = x; a.y = a.ty = y; a.t = 5; }
+}
+
+// each device's flock drifts across its own patch of the sky, keeping to the
+// upper part where the words are not
+const anchors = new Map();
+function anchorFor(dev) {
+  let a = anchors.get(dev.id);
+  if (!a) {
+    const R = dev.region && W > 640 ? dev.region : {x:[.5,.85], y:[.15,.45]};
+    a = {x:W*(R.x[0]+Math.random()*(R.x[1]-R.x[0])), y:H*(R.y[0]+Math.random()*(R.y[1]-R.y[0])), tx:0, ty:0, t:0}; anchors.set(dev.id, a);
+  }
+  return a;
+}
+function stepAnchors(dt) {
+  const live = new Map(); for (const b of all) live.set(b.dev.id, b.dev);
+  for (const [id] of anchors) if (!live.has(id)) anchors.delete(id);
+  const list = [...anchors.entries()];
+  for (const [id, a] of list) {
+    const dev = live.get(id);
+    a.t -= dt;
+    if (a.t <= 0) {
+      a.t = 6 + Math.random()*8;
+      const R = dev.region && W > 640 ? dev.region : {x:[W > 900 ? .52 : .15, .88], y: dev.band || [.05, .35]};
+      a.tx = W*(R.x[0] + Math.random()*(R.x[1]-R.x[0])); a.ty = H*(R.y[0] + Math.random()*(R.y[1]-R.y[0]));
+    }
+    let fx = (a.tx - a.x)*0.18, fy = (a.ty - a.y)*0.18;
+    for (const [oid, o] of list) if (oid !== id) {
+      const dx = a.x-o.x, dy = a.y-o.y, d = Math.hypot(dx,dy) || 1, want = Math.min(W,H)*0.28;
+      if (d < want) { fx += dx/d*(want-d)*0.7; fy += dy/d*(want-d)*0.7; }
+    }
+    a.x += fx*dt; a.y += fy*dt;
+  }
+}
+
+const mouse = {x:-1e4, y:-1e4, on:false};
+function setMouse(x, y) { mouse.x = x; mouse.y = y; mouse.on = true; }
+document.addEventListener('pointermove', e => setMouse(e.clientX, e.clientY), {passive:true});
+document.addEventListener('pointerleave', () => { mouse.on = false; });
+document.addEventListener('touchmove', e => { const t = e.touches[0]; if (t) setMouse(t.clientX, t.clientY); }, {passive:true});
+document.addEventListener('touchend', () => { setTimeout(() => mouse.on = false, 400); }, {passive:true});
+
+// a tap on the sky is a phone joining; a drag is just weather
+let down = null;
+cv.addEventListener('pointerdown', e => { down = {x:e.clientX, y:e.clientY, t:performance.now()}; });
+cv.addEventListener('pointerup', e => {
+  if (!down) return;
+  const moved = Math.hypot(e.clientX-down.x, e.clientY-down.y), dt = performance.now()-down.t;
+  down = null;
+  if (moved < 8 && dt < 400) join(e.clientX, e.clientY);
+});
+
+function join(x, y) {
+  if (phones.length >= DEVICES.length) { flash(`nothing else in the house has a GPU`); return; }
+  const p = makePhone(phones.length);
+  phones.push(p);
+  const a = anchorFor(p);
+
+  onSplitChanged(`${p.name} joined — ${plural(p.kind)}, ${p.msPerLayer.toFixed(1)} ms a layer`);
+  resplit();
+  // the newcomers arrive from just off the edge nearest the tap
+  const ex = x == null ? W + 40 : (x < W/2 ? -40 : W + 40);
+  for (const b of birds) if (b.dev === p) {
+    b.x = ex + (Math.random()-0.5)*60; b.y = (y == null ? H*0.3 : y) + (Math.random()-0.5)*80;
+    b.vx = (ex < 0 ? 1 : -1)*150; b.vy = (Math.random()-0.5)*40; b.heading = Math.atan2(b.vy, b.vx);
+  }
+}
+function drop() {
+  if (!phones.length) return;
+  const p = phones.pop();
+  onSplitChanged(`${p.name} left`);
+  resplit();
+}
+document.getElementById('join').addEventListener('click', () => join());
+document.getElementById('drop').addEventListener('click', drop);
+
+// ---------------------------------------------------------------------------
+// Flight. Every bird steers toward a goal, turns at a species' rate, and
+// keeps a species' pace. Geese hold a V behind their leader; the small birds
+// keep loose company with their own kind; gulls string out in a line. The
+// mouse is only for reading labels.
+// ---------------------------------------------------------------------------
+const perDevice = new Map();
+function wrapAngle(a) { while (a > Math.PI) a -= 2*Math.PI; while (a < -Math.PI) a += 2*Math.PI; return a; }
+function stepBirds(dt, now) {
+  perDevice.clear();
+  for (const b of all) { if (!perDevice.has(b.dev)) perDevice.set(b.dev, []); perDevice.get(b.dev).push(b); }
+  for (const b of all) {
+    const sp = b.dev.kind ? SPECIES[b.dev.kind] : null, grounded = !sp;
+    let gx = 0, gy = 0;                                  // where this bird wants to go
+    let sx = 0, sy = 0;                                  // and who it must not hit
+    const kin = perDevice.get(b.dev);
+    const sepR = b.size*0.62;
+    for (const o of kin) {
+      if (o === b) continue;
+      const dx = o.x-b.x, dy = o.y-b.y, d2 = dx*dx+dy*dy;
+      if (d2 < sepR*sepR && d2 > 0.01) { const d = Math.sqrt(d2); sx -= dx/d*(sepR-d)/sepR; sy -= dy/d*(sepR-d)/sepR; }
+    }
+    if (grounded) {
+      gx = b.x + b.vx; gy = b.y + b.vy;                  // drift, slowing
+    } else if (b.rank === 0 && b.dev.cross) {
+      // a skein's leader flies a shallow, nearly straight crossing of the
+      // sky. It leaves by one edge and the flock comes back in by the other,
+      // a little higher or lower, as a skein passing over would.
+      const wide = W > 900, band = b.dev.band || [.08, .3], y0 = H*band[0], y1 = H*band[1]*(wide ? 1 : 0.7);
+      if (b.course == null) { b.dir = Math.random() < 0.5 ? 1 : -1; b.course = b.dir > 0 ? 0 : Math.PI; }
+      const level = b.dir > 0 ? 0 : Math.PI;
+      const target = b.y < y0 ? level + b.dir*0.45 : b.y > y1 ? level - b.dir*0.45 : level;
+      b.course += wrapAngle(target - b.course)*Math.min(1, dt*0.35) + (Math.random()-0.5)*0.5*dt;
+      gx = b.x + Math.cos(b.course)*600; gy = b.y + Math.sin(b.course)*600;
+    } else if (b.rank === 0) {
+      // a flock that keeps to a patch of sky: its leader mills about it
+      const a = anchorFor(b.dev), r = Math.min(W*0.18, sp.formation === 'cloud' ? 90 : 60)*SCALE;
+      const w = sp.formation === 'cloud' ? 0.00028 : 0.0002;
+      gx = a.x + Math.cos(now*w + b.i)*r; gy = a.y + Math.sin(now*w + b.i)*r*0.5;
+    } else if (sp.formation === 'v') {
+      // each goose keeps station on the bird ahead of it in its own arm,
+      // not on the leader, so a turn travels down the arm as a bend and
+      // every bird flies its own path through it
+      const P = b.prev, arm = b.arm, s = b.size;
+      const dx = Math.cos(P.heading), dy = Math.sin(P.heading);
+      gx = P.x - dx*s*0.5 - dy*arm*s*0.22; gy = P.y - dy*s*0.5 + dx*arm*s*0.22;
+    } else if (sp.formation === 'line') {
+      const P = kin[b.rank-1], dx = Math.cos(P.heading), dy = Math.sin(P.heading), s = b.size;
+      gx = P.x - dx*s*0.58 - dy*s*0.2*(b.rank&1?1:-1); gy = P.y - dy*s*0.58 + dx*s*0.2*(b.rank&1?1:-1);
+    } else {
+      // a cloud: toward the flock's centre, along its mean heading, with a
+      // little of your own mind
+      let cx = 0, cy = 0, hx = 0, hy = 0;
+      for (const o of kin) { cx += o.x; cy += o.y; hx += Math.cos(o.heading); hy += Math.sin(o.heading); }
+      cx /= kin.length; cy /= kin.length;
+      const a = anchorFor(b.dev);
+      const spread = (24 + kin.length*1.3)*SCALE;
+      gx = (cx*0.5 + a.x*0.5) + hx/kin.length*40 + Math.sin(now*0.0005 + b.i*2.1)*spread;
+      gy = (cy*0.5 + a.y*0.5) + hy/kin.length*40 + Math.cos(now*0.0006 + b.i*1.7)*spread*0.7;
+    }
+    const scared = false;
+    const m = 30;                                        // the edges of the sky
+    const crossing = sp && b.dev.cross;
+    const edgeX = crossing ? 0 : (b.x < m ? 1 : 0) - (b.x > W-m ? 1 : 0), edgeY = crossing ? 0 : (b.y < m ? 1 : 0) - (b.y > H-m ? 1 : 0);
+    const inFormation = sp && b.rank > 0 && sp.formation !== 'cloud';
+    if (inFormation) {
+      // station-keeping: a damped spring on velocity toward the slot,
+      // carried along at the pace of the bird ahead, so a slot can be held
+      // to a few pixels. Each bird faces the way it is actually going.
+      const P = sp.formation === 'v' ? b.prev : kin[b.rank-1], hi = sp.speed[1]*(b.dev.scale || 1);
+      let vx = P.vx + (gx-b.x)*2.4 + sx*hi*1.5, vy = P.vy + (gy-b.y)*2.4 + sy*hi*1.5;
+      const vm = Math.hypot(vx,vy), cap = hi*(scared ? 1.6 : 1.25);
+      if (vm > cap) { vx *= cap/vm; vy *= cap/vm; }
+      b.vx += (vx-b.vx)*Math.min(1, dt*5); b.vy += (vy-b.vy)*Math.min(1, dt*5);
+      const face = Math.atan2(b.vy, b.vx);
+      b.heading += wrapAngle(face - b.heading)*Math.min(1, dt*(scared ? 6 : 3));
+    } else {
+      // free flight: turn toward the goal at the species' rate, pushed by
+      // separation, and keep the species' pace
+      let dx = gx-b.x, dy = gy-b.y, d = Math.hypot(dx,dy) || 1;
+      dx = dx/d + sx*2.2 + edgeX*2;
+      dy = dy/d + sy*2.2 + edgeY*2;
+      const want = Math.atan2(dy, dx);
+      const diff = wrapAngle(want - b.heading);
+      const turn = (sp ? sp.turn : 1.2) * (scared ? 3 : 1);
+      b.heading += Math.max(-turn*dt, Math.min(turn*dt, diff));
+      let speed;
+      if (grounded) speed = Math.max(0, Math.hypot(b.vx,b.vy) - 30*dt);
+      else {
+        const pace = b.dev.scale || 1, lo = sp.speed[0]*pace, hi = sp.speed[1]*pace, urge = Math.min(1, d/(b.size*3));
+        speed = lo + (hi-lo)*(scared ? 1 : b.rank === 0 ? 0.15 : urge);
+      }
+      const cur = Math.hypot(b.vx,b.vy);
+      const spd = cur + (speed-cur)*Math.min(1, dt*3);
+      b.vx = Math.cos(b.heading)*spd; b.vy = Math.sin(b.heading)*spd;
+    }
+    b.x += b.vx*dt*TIME; b.y += b.vy*dt*TIME;
+
+    // wings: flap for a while, glide for a while, as the species does
+    if (sp) {
+      if (now > b.modeUntil) {
+        b.flapping = !b.flapping;
+        const [lo, hi] = b.flapping ? sp.flapFor : sp.glide;
+        b.modeUntil = now + (lo + Math.random()*(hi-lo))*1000;
+      }
+      const flurry = now < b.flurryUntil;
+      if (b.flapping || scared || flurry) {
+        b.phase += sp.flapHz*(scared || flurry ? 1.6 : 1)*2*Math.PI*dt;
+      } else {
+        // settle the wings to level as it glides
+        const rest = Math.round(b.phase/(2*Math.PI))*2*Math.PI;
+        b.phase += (rest - b.phase)*Math.min(1, dt*6);
+      }
+    } else b.phase += 2*Math.PI*dt*0.8;
+  }
+  // a skein that has wholly left the sky comes back in by the other edge
+  for (const [dev, kin] of perDevice) {
+    if (!dev.kind || !dev.cross) continue;
+    const L = kin[0]; if (L.dir == null) continue;
+    let lo = Infinity, hi = -Infinity; for (const b of kin) { lo = Math.min(lo, b.x); hi = Math.max(hi, b.x); }
+    const gap = 0;                                       // the head comes in as the tail goes out
+    if (L.dir > 0 && lo > W + 40) { const dy = (Math.random()-0.5)*H*0.3; for (const b of kin) { b.x -= W + 80 + (hi-lo) + gap; b.y += dy; } }
+    if (L.dir < 0 && hi < -40)    { const dy = (Math.random()-0.5)*H*0.3; for (const b of kin) { b.x += W + 80 + (hi-lo) + gap; b.y += dy; } }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The hidden state, running down the flock one bird at a time. When it
+// reaches a bird that bird beats its wings hard; when it reaches the last one,
+// a word is written. One full pass is one token.
+// ---------------------------------------------------------------------------
+const TURNS = [
+  {prompt:'Capital of France?', tokens:['The',' capital',' of',' France',' is',' **Paris**','.']},
+  {prompt:'What is 2 + 2?',     tokens:['2',' +',' 2',' =',' 4','.']},
+  {prompt:'A function to add two numbers, in JS.',
+   tokens:['`function',' add','(a,',' b)',' {\n ',' return',' a',' +',' b;\n',' }`']},
+  {prompt:'A line about the sea.',
+   tokens:['"The',' sea',' is',' everything','.\n',' It',' covers',' seven',' tenths',' of',' the',' globe."']},
+  {prompt:'Split 28 layers across 5 devices.',
+   tokens:['this',' Mac',': 0','–','11',',',' phone',' a',': 12','–','15',',',' ','...',' by',' speed','.']},
+];
+const spark = {stage:0, t:0, dur:1, turn:0, tok:0, shown:0, hold:0, stalled:false, rest:0};
+// two echoes follow the live ion down the same path, a little behind
+const echoes = [{delay:1.1}, {delay:2.2}].map(e => ({...e, stage:0, t:0, dur:1, wait:e.delay, active:false, trail:[]}));
+const flyers = [];                          // finished tokens on their way to the caption
+const promptEl = document.getElementById('prompt'), outEl = document.getElementById('out'),
+      noteEl = document.getElementById('note'), captionEl = document.getElementById('caption');
+let scrollFade = 1, skyFade = 1;
+function updateScrollFade() {
+  const fadeOver = Math.max(200, window.innerHeight*0.5);
+  scrollFade = Math.max(0, 1 - window.scrollY/fadeOver);
+  captionEl.style.setProperty('--scroll-fade', scrollFade);
+  // the sky scene fades slower and further: down to a bare trace of itself
+  // over roughly the height of the whole document, never quite vanishing
+  const docH = Math.max(1, document.documentElement.scrollHeight - window.innerHeight);
+  skyFade = Math.max(0.06, 1 - (window.scrollY/docH)*0.94);
+}
+addEventListener('scroll', updateScrollFade, {passive:true});
+updateScrollFade();
+let noteUntil = 0;
+function flash(msg) { noteEl.textContent = msg; noteUntil = performance.now() + 4500; }
+function formatOut(text) {
+  let html = text
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/`([^`]*)`/g, '<code>$1</code>')     // a closed span becomes code
+    .replace(/`([^`]*)$/g, '<code>$1</code>')     // a still-open span is code too, as it streams in
+    .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
+    .replace(/\n/g, '<br>');
+  return html;
+}
+function showTurn() {
+  const T = TURNS[spark.turn];
+  promptEl.textContent = T.prompt;
+  outEl.innerHTML = formatOut(T.tokens.slice(0, spark.shown).join(''));
+}
+function onSplitChanged(why) {
+  // exactly what the real coordinator does: the token in flight finishes
+  // against the old topology, then the turn ends, because the K/V cache is
+  // sharded by layer and a moved layer leaves its keys behind.
+  const mid = spark.tok > 0 && spark.tok < TURNS[spark.turn].tokens.length;
+  flash(mid ? `${why} — the split changed, so the conversation started over` : why);
+  spark.tok = 0; spark.shown = 0; spark.stage = 0; spark.t = 0; spark.rest = 0.8; spark.stalled = false;
+  flyers.length = 0; launchEchoes();
+  showTurn();
+}
+function launchEchoes() { for (const e of echoes) { e.stage = 0; e.t = 0; e.wait = e.delay; e.active = false; e.trail.length = 0; } }
+function stepEchoes(dt) {
+  for (const e of echoes) {
+    if (!e.active) { e.wait -= dt; if (e.wait <= 0) e.active = true; continue; }
+    const from = birds[e.stage], to = birds[e.stage+1];
+    if (to.dev === UNCOVERED) continue;
+    if (e.t === 0) e.dur = hopDur(from, to);
+    e.t += dt/e.dur;
+    if (e.t >= 1) { e.t = 0; e.stage++; if (e.stage >= birds.length-1) { e.active = false; e.wait = 1e9; } }
+  }
+}
+function stepFlyers(dt) {
+  for (let i = flyers.length-1; i >= 0; i--) {
+    const f = flyers[i]; f.t += dt/0.9;   // the word's own flight time, independent of the ion's pace
+    if (f.t >= 1) { flyers.splice(i, 1); spark.shown++; showTurn(); }
+  }
+}
+function hopDur(from, to) {
+  const wire = from.dev !== to.dev;                    // a hop across devices crosses the wifi
+  const base = to.kind === 'layer' ? 26 + to.dev.msPerLayer*18 : 40;
+  return ((wire ? 260 : 0) + base) / 1000;
+}
+function stepSpark(dt, now) {
+  if (spark.rest > 0) { spark.rest -= dt; return; }
+  const T = TURNS[spark.turn];
+  if (spark.tok >= T.tokens.length) {                 // EOS. Hold, then the next prompt.
+    spark.hold += dt;
+    if (spark.hold > 1.4 && !flyers.length) { spark.hold = 0; spark.tok = 0; spark.shown = 0; spark.turn = (spark.turn+1) % TURNS.length; spark.stage = 0; spark.t = 0; launchEchoes(); showTurn(); }
+    return;
+  }
+  stepEchoes(dt);
+  const from = birds[spark.stage], to = birds[spark.stage+1];
+  if (to.dev === UNCOVERED) {                          // nobody holds the next layer
+    if (!spark.stalled) {
+      const u = uncovered();
+      flash(`layers ${u[0]}–${u[u.length-1]} are uncovered — nothing more is written until a device joins`);
+      spark.stalled = true;
+    }
+    noteUntil = now + 500;
+    return;
+  }
+  if (spark.stalled) { spark.stalled = false; flash(`${to.dev.name} took layer ${to.layer}; writing resumes`); }
+  if (spark.t === 0) { spark.dur = hopDur(from, to); from.flurryUntil = now + 420; }
+  spark.t += dt/spark.dur;
+  if (spark.t >= 1) {
+    spark.t = 0; spark.stage++;
+    if (spark.stage >= birds.length-1) {               // reached the head: a token
+      const head = birds[spark.stage];
+      head.flurryUntil = now + 500;
+      flyers.push({text: T.tokens[spark.tok].replace(/\*\*/g, ''), x0: head.x, y0: head.y, t: 0});
+      spark.stage = 0; spark.tok++; launchEchoes();
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Drawing: silhouettes, seen from below.
+// ---------------------------------------------------------------------------
+function drawBird(b, now) {
+  const sp = b.dev.kind ? SPECIES[b.dev.kind] : SPECIES.starling;
+  const s = b.size, c = Math.cos(b.phase), up = Math.max(0, -c), down = Math.max(0, c);
+  const flurry = now < b.flurryUntil;
+  const lift = flurry ? 1 + 0.15*Math.sin(Math.min(1, (b.flurryUntil-now)/420)*Math.PI) : 1;
+  ctx.save(); ctx.translate(b.x, b.y); ctx.rotate(b.heading); ctx.scale(lift, lift);
+  ctx.fillStyle = b.dev.color; ctx.globalAlpha = (b.dev === UNCOVERED ? 0.8 : b.dev.alpha != null ? b.dev.alpha : 0.85 + 0.15*(b.vary-0.85)/0.3) * skyFade;
+  const [bx, by] = sp.body;
+  // body
+  ctx.beginPath(); ctx.ellipse(0, 0, s*bx, s*by, 0, 0, Math.PI*2); ctx.fill();
+  // neck, head, bill
+  const [nl, nw] = sp.neck, hx = s*(bx*0.9 + nl);
+  ctx.beginPath(); ctx.moveTo(s*bx*0.7, -s*by*0.7); ctx.lineTo(hx, -s*nw*0.5); ctx.lineTo(hx, s*nw*0.5); ctx.lineTo(s*bx*0.7, s*by*0.7); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.arc(hx, 0, s*sp.head, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(hx + s*sp.head*0.6, -s*sp.head*0.45); ctx.lineTo(hx + s*sp.head*0.6 + s*sp.bill, 0); ctx.lineTo(hx + s*sp.head*0.6, s*sp.head*0.45); ctx.closePath(); ctx.fill();
+  // tail, forked or fanned
+  const [tl, tw, fork] = sp.tail, tb = -s*bx*0.8;
+  ctx.beginPath(); ctx.moveTo(tb, -s*by*0.7);
+  if (fork) { ctx.lineTo(tb - s*tl, -s*tw - s*fork*0.3); ctx.lineTo(tb - s*tl + s*fork, -s*tw*0.35); ctx.lineTo(tb - s*tl + s*fork, s*tw*0.35); ctx.lineTo(tb - s*tl, s*tw + s*fork*0.3); }
+  else { ctx.lineTo(tb - s*tl, -s*tw); ctx.quadraticCurveTo(tb - s*tl*1.1, 0, tb - s*tl, s*tw); }
+  ctx.lineTo(tb, s*by*0.7); ctx.closePath(); ctx.fill();
+  // wings: on the upstroke the span shortens and the hand folds back at the
+  // wrist, which is what a wingbeat looks like from below
+  const half = s*0.5*(1 - 0.3*up), wy = half*sp.wrist;
+  const [cr, cw, ct] = sp.chord.map(v => v*s), [lr, lw, lt] = sp.le.map(v => v*s), [tr] = sp.te.map(v => v*s);
+  const foldX = -s*0.12*up + s*0.03*down;
+  for (const side of [-1, 1]) {
+    const rootY = side*s*by*0.8, wristY = side*wy, tipY = side*half;
+    const wristLE = lw + foldX*0.3, tipLE = lt + foldX;
+    const wristTE = wristLE - cw, tipTE = tipLE - ct, rootTE = tr;
+    ctx.beginPath();
+    ctx.moveTo(lr, rootY);
+    ctx.quadraticCurveTo((lr+wristLE)/2 + s*0.02, (rootY+wristY)/2, wristLE, wristY);
+    ctx.quadraticCurveTo((wristLE+tipLE)/2 + s*0.01, (wristY+tipY)/2, tipLE, tipY);
+    if (sp.round) ctx.quadraticCurveTo(tipTE - s*0.02, tipY, tipTE - s*0.01, tipY - side*s*0.03);
+    else ctx.lineTo(tipTE, tipY - side*s*0.01);
+    ctx.quadraticCurveTo((wristTE+tipTE)/2 - s*0.02, (wristY+tipY)/2, wristTE, wristY);
+    ctx.quadraticCurveTo((rootTE+wristTE)/2 - s*0.03, (rootY+wristY)/2, rootTE, rootY);
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+}
+function drawPipeline() {
+  ctx.save();
+  ctx.setLineDash([1.5, 5]); ctx.lineWidth = 1; ctx.lineCap = 'round';
+  for (let i = 0; i < birds.length - 1; i++) {
+    const a = birds[i], b = birds[i+1];
+    ctx.strokeStyle = a.dev === UNCOVERED || b.dev === UNCOVERED ? 'rgba(90,86,80,.18)' : 'rgba(90,86,80,.38)';
+    ctx.globalAlpha = skyFade;
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  }
+  ctx.restore();
+  // a small node at the embedding and the head: the pipeline's two visible ends
+  const embed = birds[0], head = birds[birds.length-1];
+  ctx.globalAlpha = 0.5 * skyFade; ctx.fillStyle = 'rgba(90,86,80,.6)';
+  for (const b of [embed, head]) { ctx.beginPath(); ctx.arc(b.x, b.y, 2.5, 0, Math.PI*2); ctx.fill(); }
+  ctx.globalAlpha = 1;
+}
+function drawFlockLabels() {
+  ctx.font = `italic 13px ${css('--serif')}`;
+  const seen = new Set();
+  for (const b of birds) {
+    const dev = b.dev; if (seen.has(dev)) continue; seen.add(dev);
+    const kin = birds.filter(o => o.dev === dev);
+    let cx = 0, cy = 0, top = Infinity; for (const o of kin) { cx += o.x; cy += o.y; top = Math.min(top, o.y); }
+    cx /= kin.length; cy /= kin.length;
+    const text = dev === UNCOVERED ? `${rangeOf(dev)} · nobody` : `${dev.name} · ${rangeOf(dev)}`;
+    const w = ctx.measureText(text).width;
+    const x = Math.max(8, Math.min(W - w - 8, cx - w/2)), y = Math.max(14, top - 10);
+    // a soft paper halo lifts the label off the sky gradient without a hard box
+    ctx.lineJoin = 'round'; ctx.lineWidth = 4; ctx.strokeStyle = css('--paper'); ctx.globalAlpha = 0.7 * skyFade;
+    ctx.strokeText(text, x, y);
+    ctx.fillStyle = css('--ink'); ctx.globalAlpha = 0.75 * skyFade;
+    ctx.fillText(text, x, y);
+  }
+  ctx.globalAlpha = 1;
+}
+// the activation itself: a small ion that runs the dotted line, bird to bird,
+// with a short tail. One at a time — that is the truth of a pipeline.
+const ionTrail = [];
+function ionPos(st) {
+  const a = birds[st.stage], b = birds[Math.min(st.stage+1, birds.length-1)];
+  const t = Math.min(1, st.t), e = t*t*t*(t*(t*6-15)+10);   // quintic ease: zero velocity AND acceleration at both ends
+  return {x: a.x + (b.x-a.x)*e, y: a.y + (b.y-a.y)*e};
+}
+function drawOneIon(st, trail, live, strength, pulse) {
+  if (live) { const p = ionPos(st); trail.push(p.x, p.y); if (trail.length > 36) trail.splice(0, 2); }
+  else if (trail.length) trail.splice(0, 2);
+  const n = trail.length/2;
+  ctx.fillStyle = '#4f4b45';
+  for (let i = 0; i < n; i++) {
+    const k = (i+1)/n;
+    ctx.globalAlpha = 0.45*k*k*strength*skyFade; ctx.beginPath(); ctx.arc(trail[i*2], trail[i*2+1], 0.6 + 1.6*k, 0, Math.PI*2); ctx.fill();
+  }
+  if (live) {
+    const p = ionPos(st);
+    ctx.globalAlpha = 0.9*pulse*strength*skyFade; ctx.beginPath(); ctx.arc(p.x, p.y, 3, 0, Math.PI*2); ctx.fill();
+    ctx.globalAlpha = 0.25*pulse*strength*skyFade; ctx.beginPath(); ctx.arc(p.x, p.y, 7, 0, Math.PI*2); ctx.fill();
+  }
+}
+function drawIon(now) {
+  const T = TURNS[spark.turn], live = spark.tok < T.tokens.length && spark.rest <= 0;
+  const pulse = spark.stalled ? 0.5 + 0.5*Math.sin(now*0.01) : 1;
+  for (const e of echoes) drawOneIon(e, e.trail, live && e.active, 0.55, pulse);
+  drawOneIon(spark, ionTrail, live, 1, pulse);
+  ctx.globalAlpha = 1;
+}
+// a finished token leaves the head bird and flies to the end of the sentence
+// The caption holds still, centred and translucent, overlaid on the birds
+// rather than chasing any one flock.
+function drawFlyers() {
+  if (!flyers.length || scrollFade <= 0.01) return;
+  const r = outEl.getBoundingClientRect(), tx = r.right + 6, ty = r.top + r.height/2;
+  ctx.font = `italic 16px ${css('--serif')}`; ctx.textBaseline = 'middle';
+  ctx.lineJoin = 'round'; ctx.lineWidth = 5; ctx.strokeStyle = css('--paper');
+  for (const f of flyers) {
+    const t = f.t, e = t < 0.5 ? 2*t*t : 1 - Math.pow(-2*t+2, 2)/2;
+    const x = f.x0 + (tx - f.x0)*e, y = f.y0 + (ty - f.y0)*e - Math.sin(Math.PI*t)*60;
+    ctx.globalAlpha = (t < 0.15 ? t/0.15 : t > 0.9 ? (1-t)/0.1 : 1) * scrollFade;
+    const clean = f.text.trim().replace(/[`*]/g, '').replace(/\n/g, ' ');
+    ctx.strokeText(clean, x, y); ctx.fillStyle = css('--ink'); ctx.fillText(clean, x, y);
+  }
+  ctx.globalAlpha = 1; ctx.textBaseline = 'alphabetic';
+}
+function drawLabel() {
+  if (!mouse.on) return;
+  let best = null, bd = 40*40;
+  for (const b of birds) { const d2 = (b.x-mouse.x)**2 + (b.y-mouse.y)**2; if (d2 < bd) { bd = d2; best = b; } }
+  if (!best) return;
+  const what = best.kind === 'embed' ? 'the embedding' : best.kind === 'head' ? 'output norm and the tied head' : `layer ${best.layer}`;
+  const who = best.dev === UNCOVERED ? 'held by nobody' : `on ${best.dev.name}`;
+  ctx.font = `italic 13px ${css('--serif')}`; ctx.fillStyle = css('--soft'); ctx.globalAlpha = 1;
+  ctx.fillText(`${what}, ${who}`, best.x + best.size*0.6 + 6, best.y + 4);
+}
+
+// ---------------------------------------------------------------------------
+// The caption: the strip of 28 layers and who holds them.
+// ---------------------------------------------------------------------------
+const stripEl = document.getElementById('strip'), devsEl = document.getElementById('devs');
+for (let l = 0; l < LAYERS; l++) stripEl.appendChild(document.createElement('i'));
+const plural = k => k === 'goose' ? 'geese' : k === 'finch' ? 'finches' : k + 's';
+function renderSplit() {
+  [...stripEl.children].forEach((c, l) => { c.style.background = owner[l].color; c.title = `layer ${l} · ${owner[l].name}`; });
+  const rows = [MAC, ...phones];
+  devsEl.innerHTML = rows.map(d =>
+    `<li><span class="dot" style="background:${d.color}"></span><span class="n">${d.name}</span>` +
+    `<span class="r">${rangeOf(d)}</span><span class="s">${plural(d.kind)}</span></li>`
+  ).join('') + (uncovered().length ? `<li><span class="dot" style="background:${UNCOVERED.color}"></span><span class="n">nobody</span><span class="r">${rangeOf(UNCOVERED)}</span></li>` : '');
+  document.getElementById('drop').disabled = !phones.length;
+  document.getElementById('join').disabled = phones.length >= DEVICES.length;
+}
+
+// ---------------------------------------------------------------------------
+// Go. Four devices are already on the wifi when you arrive.
+// ---------------------------------------------------------------------------
+for (let i = 0; i < 4; i++) phones.push(makePhone(i));
+resplit();
+{
+  const groups = new Map();
+  for (const b of all) { if (!groups.has(b.dev)) groups.set(b.dev, []); groups.get(b.dev).push(b); }
+  for (const [dev, kin] of groups) {
+    if (!dev.kind) continue;
+    if (dev === MAC) placeFlock(kin, {dir: -1, x: W*0.55});                 // the geese, mid-sky, heading left
+    else placeFlock(kin);
+  }
+}
+showTurn();
+let last = performance.now();
+function frame(now) {
+  const dt = Math.max(0, Math.min(0.05, (now-last)/1000)); last = now;
+  stepAnchors(dt); stepBirds(dt, now); stepSpark(dt, now); stepFlyers(dt); stepClouds(dt, now);
+  ctx.fillStyle = skyGrad; ctx.fillRect(0, 0, W, H);
+  drawClouds();
+  drawLand();
+  drawPipeline();
+  // the far birds first, so the near ones overlap them
+  const depth = b => b.dev.depth != null ? b.dev.depth : 1;
+  for (const b of [...all].sort((p, q) => depth(p) - depth(q) || p.size - q.size)) drawBird(b, now);
+  drawIon(now);
+  drawFlockLabels();
+  drawLabel();
+  drawFlyers();
+  if (noteEl.textContent && now > noteUntil) noteEl.textContent = '';
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

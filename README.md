@@ -53,6 +53,13 @@ a phone never holds a whole slice in memory), builds the layers, and reports
 **ready**. Tap **join the flock**. Then open `https://<that address>/` anywhere
 and type.
 
+**mDNS discovery.** The coordinator advertises itself as `flock._flock._tcp.local`
+on the local network via mDNS (Bonjour/DNS-SD). `npm run bird` (sim_bird.mjs)
+discovers it automatically when `FLOCK_URL` is not set — no address needed.
+Browsers cannot do mDNS (no Web API), so a phone still needs the printed URL,
+but the WebRTC ICE layer no longer needs an external STUN server: all connections
+use LAN host candidates directly.
+
 **The certificate step, and why.** Chrome and Edge expose WebGPU only to pages
 in a secure context, and `http://192.168.1.20:8000` is not one -- on Chrome a
 bird page over plain http sees no `navigator.gpu` and looks exactly like a
@@ -77,6 +84,7 @@ Other things you can set:
 | `FLOCK_PAUSE_GRACE_MS` | 2500 | how long after a device pauses before its layers are handed on (a refresh is back inside this) |
 | `FLOCK_REPLAY_CHUNK` | 64 | tokens per replay frame; 64 keeps a frame under a data channel's 256 KiB message limit |
 | `FLOCK_ONNX_REF` | `kernels/.ref` | where the ONNX reference export lives, for the engine's regression test |
+| `FLOCK_NO_MDNS` | | set to `1` to disable mDNS advertising (the test runner uses this) |
 
 No phone handy? `npm run solo` runs a simulated bird in one process that holds
 every bird layer, with the same kernels; `npm run solo -- 3` runs three. Both
